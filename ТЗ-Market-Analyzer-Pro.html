@@ -1,0 +1,743 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ТЗ — Market Analyzer Pro v2.0</title>
+<style>
+@media print { body { font-size: 11pt; } .no-print { display: none; } .page-break { page-break-before: always; } }
+:root { --primary: #1a365d; --accent: #2b6cb0; --light: #ebf4ff; --border: #cbd5e0; --text: #1a202c; --muted: #718096; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: 'Segoe UI', 'Helvetica Neue', Arial, sans-serif; color: var(--text); line-height: 1.7; background: #f7fafc; }
+.doc { max-width: 900px; margin: 0 auto; background: #fff; box-shadow: 0 1px 20px rgba(0,0,0,0.08); }
+.cover { background: linear-gradient(135deg, #1a365d 0%, #2b6cb0 100%); color: #fff; padding: 80px 60px; text-align: center; }
+.cover h1 { font-size: 36px; font-weight: 700; margin-bottom: 12px; letter-spacing: -0.5px; }
+.cover .subtitle { font-size: 18px; opacity: 0.85; margin-bottom: 40px; }
+.cover .meta { font-size: 13px; opacity: 0.7; }
+.cover .meta div { margin-bottom: 4px; }
+.cover .version { display: inline-block; background: rgba(255,255,255,0.2); padding: 6px 20px; border-radius: 20px; font-size: 14px; font-weight: 600; margin-top: 24px; }
+.content { padding: 50px 60px; }
+.toc { margin-bottom: 40px; }
+.toc h2 { font-size: 22px; color: var(--primary); margin-bottom: 16px; border-bottom: 2px solid var(--accent); padding-bottom: 8px; }
+.toc ol { counter-reset: toc; list-style: none; }
+.toc > ol > li { counter-increment: toc; margin-bottom: 6px; }
+.toc > ol > li::before { content: counter(toc) "."; color: var(--accent); font-weight: 600; margin-right: 8px; }
+.toc a { color: var(--text); text-decoration: none; border-bottom: 1px dotted var(--border); }
+.toc a:hover { color: var(--accent); }
+.toc .sub { margin-left: 28px; font-size: 14px; color: var(--muted); }
+h2 { font-size: 22px; color: var(--primary); margin: 40px 0 16px; padding-bottom: 8px; border-bottom: 2px solid var(--accent); }
+h3 { font-size: 17px; color: var(--accent); margin: 28px 0 12px; }
+h4 { font-size: 15px; color: var(--primary); margin: 20px 0 8px; }
+p { margin-bottom: 12px; font-size: 15px; }
+ul, ol { margin: 0 0 16px 24px; font-size: 15px; }
+li { margin-bottom: 6px; }
+table { width: 100%; border-collapse: collapse; margin: 16px 0 24px; font-size: 14px; }
+th { background: var(--primary); color: #fff; padding: 10px 14px; text-align: left; font-weight: 600; }
+td { padding: 10px 14px; border-bottom: 1px solid var(--border); }
+tr:nth-child(even) td { background: #f7fafc; }
+.highlight { background: var(--light); border-left: 4px solid var(--accent); padding: 16px 20px; margin: 16px 0; border-radius: 0 8px 8px 0; font-size: 14px; }
+.highlight strong { color: var(--primary); }
+.tag { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 11px; font-weight: 600; margin-right: 4px; }
+.tag.must { background: #fed7d7; color: #c53030; }
+.tag.should { background: #fefcbf; color: #975a16; }
+.tag.could { background: #c6f6d5; color: #276749; }
+.tag.phase1 { background: #bee3f8; color: #2b6cb0; }
+.tag.phase2 { background: #e9d8fd; color: #6b46c1; }
+.tag.phase3 { background: #fbd38d; color: #975a16; }
+code { background: #edf2f7; padding: 2px 6px; border-radius: 4px; font-size: 13px; font-family: 'Fira Code', monospace; }
+pre { background: #1a202c; color: #e2e8f0; padding: 20px; border-radius: 8px; overflow-x: auto; margin: 12px 0 20px; font-size: 13px; line-height: 1.5; }
+.diagram { background: #f7fafc; border: 1px solid var(--border); border-radius: 8px; padding: 24px; margin: 16px 0; font-family: monospace; font-size: 13px; line-height: 1.6; white-space: pre; overflow-x: auto; }
+.priority-table td:first-child { font-weight: 600; white-space: nowrap; }
+.footer { text-align: center; padding: 24px; color: var(--muted); font-size: 12px; border-top: 1px solid var(--border); }
+</style>
+</head>
+<body>
+<div class="doc">
+
+<!-- ======================== ОБЛОЖКА ======================== -->
+<div class="cover">
+  <h1>Market Analyzer Pro</h1>
+  <div class="subtitle">Техническое задание на разработку системы анализа<br>и прогнозирования финансовых рынков</div>
+  <div class="version">Версия 2.0</div>
+  <div class="meta" style="margin-top:40px;">
+    <div>Дата: 16 марта 2026</div>
+    <div>Статус: В разработке</div>
+    <div>Автор: Финансовый аналитик + AI</div>
+  </div>
+</div>
+
+<!-- ======================== СОДЕРЖАНИЕ ======================== -->
+<div class="content">
+
+<div class="toc">
+<h2>Содержание</h2>
+<ol>
+  <li><a href="#s1">Общее описание системы</a></li>
+  <li><a href="#s2">Архитектура и компоненты</a></li>
+  <li><a href="#s3">Модуль сбора данных (Data Collector)</a></li>
+  <li><a href="#s4">Модуль технического анализа (TA Engine)</a></li>
+  <li><a href="#s5">Модуль фундаментального анализа (FA Engine)</a></li>
+  <li><a href="#s6">Модуль геополитического и сентимент-анализа</a></li>
+  <li><a href="#s7">Движок генерации сигналов (Signal Engine)</a></li>
+  <li><a href="#s8">База данных и трекинг сигналов</a></li>
+  <li><a href="#s9">Модуль анализа точности (Accuracy Tracker)</a></li>
+  <li><a href="#s10">Интерактивный дашборд (Frontend)</a></li>
+  <li><a href="#s11">API источники данных</a></li>
+  <li><a href="#s12">Стек технологий</a></li>
+  <li><a href="#s13">Схема базы данных</a></li>
+  <li><a href="#s14">Фазы реализации и роадмап</a></li>
+  <li><a href="#s15">Нефункциональные требования</a></li>
+  <li><a href="#s16">Риски и ограничения</a></li>
+</ol>
+</div>
+
+<!-- ======================== 1. ОБЩЕЕ ОПИСАНИЕ ======================== -->
+<h2 id="s1">1. Общее описание системы</h2>
+
+<h3>1.1. Назначение</h3>
+<p>Market Analyzer Pro — аналитическая платформа для комплексного анализа финансовых рынков и генерации торговых сигналов. Система объединяет технический, фундаментальный, макроэкономический и геополитический анализ для формирования взвешенных торговых рекомендаций с конкретными параметрами позиции.</p>
+
+<h3>1.2. Целевые рынки</h3>
+<table>
+  <tr><th>Рынок</th><th>Инструменты</th><th>Приоритет</th></tr>
+  <tr><td>Форекс</td><td>EUR/USD, GBP/USD, USD/JPY, USD/CHF, AUD/USD, EUR/GBP, NZD/USD + кросс-пары</td><td><span class="tag must">Фаза 1</span></td></tr>
+  <tr><td>Акции US</td><td>S&P 500 компоненты, NASDAQ-100, индексы SPY/QQQ/DIA</td><td><span class="tag must">Фаза 1</span></td></tr>
+  <tr><td>Акции EU</td><td>DAX, FTSE 100, основные blue chips</td><td><span class="tag should">Фаза 2</span></td></tr>
+  <tr><td>Криптовалюты</td><td>BTC, ETH, SOL, XRP, ADA + топ-20 по капитализации</td><td><span class="tag must">Фаза 1</span></td></tr>
+  <tr><td>Commodities</td><td>Золото (XAU), нефть (WTI, Brent), серебро</td><td><span class="tag could">Фаза 3</span></td></tr>
+</table>
+
+<h3>1.3. Горизонты торговли</h3>
+<table>
+  <tr><th>Горизонт</th><th>Таймфрейм</th><th>Характерное время удержания</th><th>Основной тип анализа</th></tr>
+  <tr><td>Скальпинг</td><td>M1, M5, M15</td><td>Минуты — часы</td><td>Технический (90%) + Объём (10%)</td></tr>
+  <tr><td>Дейтрейдинг</td><td>M15, H1</td><td>Часы — 1 день</td><td>Технический (70%) + Новости (30%)</td></tr>
+  <tr><td>Свинг</td><td>H4, D1</td><td>2-14 дней</td><td>Тех. (50%) + Фунд. (30%) + Сентимент (20%)</td></tr>
+  <tr><td>Позиционный</td><td>D1, W1</td><td>Недели — месяцы</td><td>Фунд. (50%) + Макро (30%) + Тех. (20%)</td></tr>
+</table>
+
+<h3>1.4. Ключевые выходные данные</h3>
+<ul>
+  <li><strong>Торговый сигнал:</strong> LONG / SHORT / ВЫЖИДАТЬ</li>
+  <li><strong>Точка входа:</strong> конкретная цена или зона входа</li>
+  <li><strong>Stop Loss:</strong> уровень защитного стопа (на основе ATR и уровней)</li>
+  <li><strong>Take Profit 1 и 2:</strong> целевые уровни фиксации прибыли</li>
+  <li><strong>Risk/Reward Ratio:</strong> соотношение риска к потенциальной прибыли</li>
+  <li><strong>Размер позиции:</strong> рекомендуемый % от депозита</li>
+  <li><strong>Горизонт удержания:</strong> ожидаемое время в позиции</li>
+  <li><strong>Уровень уверенности:</strong> 0-100% (композитная оценка)</li>
+  <li><strong>Ключевые факторы:</strong> обоснование сигнала</li>
+</ul>
+
+<!-- ======================== 2. АРХИТЕКТУРА ======================== -->
+<h2 id="s2">2. Архитектура и компоненты</h2>
+
+<h3>2.1. Общая архитектура</h3>
+<div class="diagram">
+┌─────────────────────────────────────────────────────────────────────┐
+│                        MARKET ANALYZER PRO                         │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │
+│  │  Yahoo Fin.  │  │ Alpha Vantage│  │  Binance API │   ...APIs    │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘              │
+│         └──────────────────┼─────────────────┘                      │
+│                            ▼                                        │
+│  ┌─────────────────────────────────────────────────────────┐       │
+│  │               DATA COLLECTOR (Сбор данных)              │       │
+│  │  Котировки · Макро · Новости · Прогнозы · Геополитика   │       │
+│  └────────────────────────┬────────────────────────────────┘       │
+│                            ▼                                        │
+│  ┌──────────┐  ┌───────────┐  ┌────────────┐  ┌───────────┐       │
+│  │ TA Engine│  │ FA Engine │  │  Sentiment │  │ Geo/Macro │       │
+│  │ RSI MACD │  │ Rates CPI │  │  News NLP  │  │ GDELT     │       │
+│  │ BB ADX   │  │ NFP PMI   │  │  Fear&Greed│  │ Sanctions │       │
+│  └────┬─────┘  └─────┬─────┘  └─────┬──────┘  └─────┬─────┘       │
+│       └───────────────┼──────────────┼───────────────┘              │
+│                       ▼                                             │
+│  ┌─────────────────────────────────────────────────────────┐       │
+│  │            SIGNAL ENGINE (Генератор сигналов)           │       │
+│  │  Взвешенная композитная оценка · Мульти-таймфрейм       │       │
+│  │  Risk Management · Position Sizing                      │       │
+│  └────────────────────────┬────────────────────────────────┘       │
+│                            ▼                                        │
+│         ┌──────────────────┼──────────────────┐                     │
+│         ▼                  ▼                  ▼                     │
+│  ┌────────────┐  ┌─────────────────┐  ┌────────────────┐          │
+│  │  DATABASE  │  │    DASHBOARD    │  │   ACCURACY     │          │
+│  │  Signals   │  │  Интерактивный  │  │   TRACKER      │          │
+│  │  History   │  │  HTML/React     │  │  Верификация   │          │
+│  │  Results   │  │  дашборд        │  │  предсказаний  │          │
+│  └────────────┘  └─────────────────┘  └────────────────┘          │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+</div>
+
+<h3>2.2. Потоки данных</h3>
+<ol>
+  <li><strong>Сбор:</strong> Data Collector по расписанию (cron) опрашивает API-источники, нормализует данные и записывает в БД</li>
+  <li><strong>Анализ:</strong> По триггеру (расписание / запрос пользователя) запускаются модули анализа параллельно</li>
+  <li><strong>Генерация:</strong> Signal Engine объединяет результаты всех модулей с весами и генерирует торговый сигнал</li>
+  <li><strong>Сохранение:</strong> Сигнал с полными параметрами записывается в БД с таймстампом</li>
+  <li><strong>Отображение:</strong> Dashboard отображает сигнал, графики, факторы и рекомендации</li>
+  <li><strong>Верификация:</strong> Accuracy Tracker отслеживает фактическое движение цены после сигнала и записывает результат</li>
+</ol>
+
+<!-- ======================== 3. DATA COLLECTOR ======================== -->
+<h2 id="s3">3. Модуль сбора данных (Data Collector)</h2>
+
+<h3>3.1. Функциональные требования</h3>
+<table>
+  <tr><th>Требование</th><th>Описание</th><th>Приоритет</th></tr>
+  <tr><td>DC-01</td><td>Получение исторических OHLCV-данных за период до 5 лет для всех инструментов</td><td><span class="tag must">MUST</span></td></tr>
+  <tr><td>DC-02</td><td>Получение данных в реальном времени (задержка ≤ 15 сек для форекса, ≤ 1 мин для акций)</td><td><span class="tag must">MUST</span></td></tr>
+  <tr><td>DC-03</td><td>Сбор макроэкономических показателей (ставки ЦБ, CPI, NFP, PMI, GDP, безработица)</td><td><span class="tag must">MUST</span></td></tr>
+  <tr><td>DC-04</td><td>Сбор новостей и заголовков из финансовых источников</td><td><span class="tag must">MUST</span></td></tr>
+  <tr><td>DC-05</td><td>Сбор прогнозов аналитических агентств (consensus estimates)</td><td><span class="tag should">SHOULD</span></td></tr>
+  <tr><td>DC-06</td><td>Сбор on-chain метрик для криптовалют (Glassnode/CryptoQuant)</td><td><span class="tag should">SHOULD</span></td></tr>
+  <tr><td>DC-07</td><td>Экономический календарь событий (earnings, заседания ЦБ, выход статистики)</td><td><span class="tag must">MUST</span></td></tr>
+  <tr><td>DC-08</td><td>Graceful degradation при недоступности API (кэширование, fallback-источники)</td><td><span class="tag must">MUST</span></td></tr>
+  <tr><td>DC-09</td><td>Rate limiting и управление квотами API</td><td><span class="tag must">MUST</span></td></tr>
+  <tr><td>DC-10</td><td>Логирование всех запросов и ошибок</td><td><span class="tag must">MUST</span></td></tr>
+</table>
+
+<h3>3.2. Расписание сбора данных</h3>
+<table>
+  <tr><th>Тип данных</th><th>Частота</th><th>Источник (основной)</th><th>Fallback</th></tr>
+  <tr><td>Котировки (интрадей)</td><td>Каждые 1-15 мин</td><td>Yahoo Finance / Twelve Data</td><td>Alpha Vantage</td></tr>
+  <tr><td>Котировки (дневные)</td><td>1 раз в день 00:05 UTC</td><td>Yahoo Finance</td><td>Twelve Data</td></tr>
+  <tr><td>Крипто котировки</td><td>Каждые 1 мин</td><td>Binance API</td><td>CoinGecko</td></tr>
+  <tr><td>Макроэкономика</td><td>1 раз в день</td><td>FRED API</td><td>World Bank</td></tr>
+  <tr><td>Новости</td><td>Каждые 15 мин</td><td>Finnhub / NewsAPI</td><td>—</td></tr>
+  <tr><td>Прогнозы аналитиков</td><td>1 раз в день</td><td>Finnhub Recommendations</td><td>—</td></tr>
+  <tr><td>Экономический календарь</td><td>1 раз в день + обновления</td><td>Finnhub Calendar</td><td>Investing.com (парсинг)</td></tr>
+  <tr><td>Fear & Greed Index</td><td>1 раз в день</td><td>Alternative.me API</td><td>—</td></tr>
+  <tr><td>Геополитические события</td><td>Каждые 30 мин</td><td>GDELT Project API</td><td>—</td></tr>
+</table>
+
+<!-- ======================== 4. TA ENGINE ======================== -->
+<h2 id="s4">4. Модуль технического анализа (TA Engine)</h2>
+
+<h3>4.1. Индикаторы</h3>
+<table>
+  <tr><th>Категория</th><th>Индикатор</th><th>Параметры по умолчанию</th><th>Генерируемый сигнал</th></tr>
+  <tr><td rowspan="3">Трендовые</td><td>SMA</td><td>20, 50, 200 периодов</td><td>Положение цены vs SMA, кроссоверы</td></tr>
+  <tr><td>EMA</td><td>12, 26 периодов</td><td>Быстрая/медленная EMA пересечения</td></tr>
+  <tr><td>ADX</td><td>14 периодов</td><td>Сила тренда (&lt;20 слабый, &gt;25 сильный, &gt;50 очень сильный)</td></tr>
+  <tr><td rowspan="2">Осцилляторы</td><td>RSI</td><td>14 периодов</td><td>Перекупленность (&gt;70) / Перепроданность (&lt;30) / Дивергенции</td></tr>
+  <tr><td>Stochastic</td><td>K=14, D=3</td><td>Перекупленность (&gt;80) / Перепроданность (&lt;20)</td></tr>
+  <tr><td rowspan="2">Импульс</td><td>MACD</td><td>12, 26, 9</td><td>Пересечение линий, гистограмма, дивергенции</td></tr>
+  <tr><td>Momentum</td><td>10 периодов</td><td>Скорость изменения цены</td></tr>
+  <tr><td rowspan="2">Волатильность</td><td>Bollinger Bands</td><td>20, 2σ</td><td>Касание/пробой полос, сжатие (squeeze)</td></tr>
+  <tr><td>ATR</td><td>14 периодов</td><td>Уровень волатильности, базис для SL/TP</td></tr>
+  <tr><td>Объём</td><td>Volume Profile</td><td>20 периодов</td><td>Подтверждение движения, дивергенции с ценой</td></tr>
+  <tr><td rowspan="2">Уровни</td><td>Support/Resistance</td><td>Автоматическое определение</td><td>Ключевые ценовые уровни</td></tr>
+  <tr><td>Fibonacci</td><td>23.6%, 38.2%, 50%, 61.8%, 78.6%</td><td>Уровни коррекции и расширения</td></tr>
+  <tr><td>Паттерны</td><td>Свечные паттерны</td><td>—</td><td>Doji, Hammer, Engulfing, Evening/Morning Star и др.</td></tr>
+</table>
+
+<h3>4.2. Весовая система TA</h3>
+<div class="highlight">
+<strong>Формула композитного скора TA:</strong><br><br>
+<code>TA_Score = Σ (indicator_signal × indicator_weight × indicator_strength)</code><br><br>
+Где: <code>indicator_signal</code> ∈ [-1, +1], <code>indicator_weight</code> — настраиваемый вес (сумма = 1.0), <code>indicator_strength</code> ∈ [0, 1] — сила сигнала.
+</div>
+
+<table>
+  <tr><th>Индикатор</th><th>Вес (по умолчанию)</th><th>Настраиваемый</th></tr>
+  <tr><td>MACD</td><td>0.20</td><td>Да</td></tr>
+  <tr><td>RSI</td><td>0.15</td><td>Да</td></tr>
+  <tr><td>Bollinger Bands</td><td>0.12</td><td>Да</td></tr>
+  <tr><td>MA Crossovers (SMA20/50/200)</td><td>0.18</td><td>Да</td></tr>
+  <tr><td>ADX (Тренд)</td><td>0.10</td><td>Да</td></tr>
+  <tr><td>Stochastic</td><td>0.08</td><td>Да</td></tr>
+  <tr><td>Volume</td><td>0.07</td><td>Да</td></tr>
+  <tr><td>Support/Resistance</td><td>0.05</td><td>Да</td></tr>
+  <tr><td>Свечные паттерны</td><td>0.05</td><td>Да</td></tr>
+</table>
+
+<!-- ======================== 5. FA ENGINE ======================== -->
+<h2 id="s5">5. Модуль фундаментального анализа (FA Engine)</h2>
+
+<h3>5.1. Факторы для Форекс</h3>
+<table>
+  <tr><th>Фактор</th><th>Источник</th><th>Вес</th><th>Логика</th></tr>
+  <tr><td>Дифференциал процентных ставок</td><td>FRED / ECB</td><td>0.25</td><td>Высокая ставка = сильная валюта. Важен вектор: повышение/понижение</td></tr>
+  <tr><td>Инфляция (CPI)</td><td>FRED / Eurostat</td><td>0.15</td><td>Рост CPI → ожидание ужесточения ДКП → укрепление валюты</td></tr>
+  <tr><td>Рынок труда (NFP, Unemployment)</td><td>FRED</td><td>0.15</td><td>Сильный NFP → сильный USD. Рост безработицы → слабая валюта</td></tr>
+  <tr><td>PMI Manufacturing & Services</td><td>FRED / Markit</td><td>0.10</td><td>&gt;50 = экспансия (позитив), &lt;50 = рецессия (негатив)</td></tr>
+  <tr><td>GDP рост</td><td>FRED / World Bank</td><td>0.10</td><td>Ускорение роста → укрепление валюты</td></tr>
+  <tr><td>Торговый баланс</td><td>FRED</td><td>0.08</td><td>Профицит → спрос на валюту → укрепление</td></tr>
+  <tr><td>Индекс потребительского доверия</td><td>FRED</td><td>0.07</td><td>Рост → позитивный аутлук экономики</td></tr>
+  <tr><td>Риторика ЦБ (Hawkish/Dovish)</td><td>Finnhub / NLP</td><td>0.10</td><td>Ястребиная → укрепление, Голубиная → ослабление</td></tr>
+</table>
+
+<h3>5.2. Факторы для Акций</h3>
+<table>
+  <tr><th>Фактор</th><th>Источник</th><th>Вес</th><th>Логика</th></tr>
+  <tr><td>P/E Ratio (vs сектор и исторический)</td><td>Yahoo Finance</td><td>0.15</td><td>P/E ниже среднего = потенциал роста</td></tr>
+  <tr><td>Earnings (EPS) vs Consensus</td><td>Finnhub</td><td>0.25</td><td>Beat → позитив, Miss → негатив. Важен guidance</td></tr>
+  <tr><td>Revenue рост (YoY, QoQ)</td><td>Yahoo Finance</td><td>0.15</td><td>Ускорение роста → бычий сигнал</td></tr>
+  <tr><td>Процентные ставки ФРС</td><td>FRED</td><td>0.10</td><td>Снижение ставок → рост акций (growth особенно)</td></tr>
+  <tr><td>VIX (индекс волатильности)</td><td>Yahoo Finance (^VIX)</td><td>0.10</td><td>&lt;15 = комфорт, 15-25 = нормально, &gt;25 = страх</td></tr>
+  <tr><td>Analyst Consensus</td><td>Finnhub</td><td>0.10</td><td>Средний target price, количество Buy/Sell/Hold</td></tr>
+  <tr><td>Insider Trading</td><td>Finnhub</td><td>0.08</td><td>Покупки инсайдеров → бычий сигнал</td></tr>
+  <tr><td>Sector Momentum</td><td>Yahoo Finance</td><td>0.07</td><td>Рост сектора поддерживает отдельные акции</td></tr>
+</table>
+
+<h3>5.3. Факторы для Крипто</h3>
+<table>
+  <tr><th>Фактор</th><th>Источник</th><th>Вес</th><th>Логика</th></tr>
+  <tr><td>BTC Halving Cycle</td><td>Расчёт (блокчейн)</td><td>0.15</td><td>Исторически 12-18 мес после halving = бычий рынок</td></tr>
+  <tr><td>ETF приток/отток</td><td>Finnhub / SoSoValue</td><td>0.20</td><td>Приток → институциональный спрос → рост</td></tr>
+  <tr><td>Fear & Greed Index</td><td>Alternative.me</td><td>0.10</td><td>Экстремальный страх = покупка, Экстремальная жадность = осторожность</td></tr>
+  <tr><td>DXY (индекс доллара)</td><td>Yahoo Finance (DX-Y.NYB)</td><td>0.15</td><td>Обратная корреляция: сильный $ → слабое крипто</td></tr>
+  <tr><td>On-chain: Active Addresses</td><td>Glassnode / CryptoQuant</td><td>0.10</td><td>Рост активности → здоровая сеть → бычий</td></tr>
+  <tr><td>Exchange Inflow/Outflow</td><td>CryptoQuant</td><td>0.10</td><td>Отток с бирж → аккумуляция → бычий</td></tr>
+  <tr><td>Регуляторный фон</td><td>GDELT / NewsAPI NLP</td><td>0.10</td><td>Позитивное регулирование → бычий</td></tr>
+  <tr><td>Корреляция с S&P500</td><td>Расчёт</td><td>0.10</td><td>Высокая корреляция → крипто следует за акциями</td></tr>
+</table>
+
+<!-- ======================== 6. SENTIMENT ======================== -->
+<h2 id="s6">6. Модуль геополитического и сентимент-анализа</h2>
+
+<h3>6.1. Источники сентимента</h3>
+<table>
+  <tr><th>Источник</th><th>API</th><th>Что анализируем</th><th>Метод</th></tr>
+  <tr><td>Финансовые новости</td><td>NewsAPI / Finnhub</td><td>Заголовки и текст статей</td><td>NLP sentiment scoring (-1 to +1)</td></tr>
+  <tr><td>Геополитические события</td><td>GDELT Project</td><td>Конфликты, санкции, соглашения</td><td>Goldstein Scale + Event Codes</td></tr>
+  <tr><td>Социальные сети</td><td>Reddit API / Twitter (X)</td><td>Обсуждения тикеров</td><td>Volume + Sentiment NLP</td></tr>
+  <tr><td>Индекс страха</td><td>VIX / Alternative.me</td><td>Рыночный сентимент</td><td>Пороговые значения</td></tr>
+  <tr><td>Прогнозы аналитиков</td><td>Finnhub Recommendations</td><td>Buy/Sell/Hold consensus</td><td>Средневзвешенная оценка</td></tr>
+</table>
+
+<h3>6.2. Геополитические факторы</h3>
+<ul>
+  <li><strong>Военные конфликты:</strong> Влияние на safe-haven валюты (JPY, CHF, золото) и нефть</li>
+  <li><strong>Торговые войны:</strong> Тарифы, санкции — прямое влияние на валютные пары</li>
+  <li><strong>Выборы:</strong> Неопределённость → рост волатильности</li>
+  <li><strong>Регуляторные решения:</strong> Крипто-регулирование, финансовые реформы</li>
+  <li><strong>Природные катастрофы:</strong> Влияние на supply chains и локальные рынки</li>
+</ul>
+
+<h3>6.3. NLP Pipeline для новостей</h3>
+<div class="highlight">
+<strong>Процесс обработки:</strong><br>
+1. Сбор заголовков → 2. Фильтрация по релевантности к инструменту → 3. Sentiment scoring (FinBERT или правила) → 4. Взвешивание по важности источника → 5. Агрегация в единый Sentiment Score [-1, +1]
+</div>
+
+<!-- ======================== 7. SIGNAL ENGINE ======================== -->
+<h2 id="s7">7. Движок генерации сигналов (Signal Engine)</h2>
+
+<h3>7.1. Композитная оценка</h3>
+<div class="highlight">
+<strong>Формула итогового сигнала:</strong><br><br>
+<code>Composite_Score = W_ta × TA_Score + W_fa × FA_Score + W_sent × Sentiment_Score + W_geo × Geo_Score</code><br><br>
+Где веса <code>W_*</code> зависят от горизонта торговли (см. таблицу 1.3) и настраиваются пользователем.<br>
+Диапазон: <strong>[-100, +100]</strong>
+</div>
+
+<h3>7.2. Пороговые значения сигналов</h3>
+<table>
+  <tr><th>Диапазон скора</th><th>Сигнал</th><th>Действие</th></tr>
+  <tr><td>+60 ... +100</td><td>STRONG BUY</td><td>Открытие длинной позиции с полным размером</td></tr>
+  <tr><td>+30 ... +59</td><td>BUY</td><td>Открытие длинной позиции с уменьшенным размером</td></tr>
+  <tr><td>-29 ... +29</td><td>HOLD / WAIT</td><td>Не открывать новых позиций, удерживать существующие</td></tr>
+  <tr><td>-59 ... -30</td><td>SELL</td><td>Открытие короткой позиции с уменьшенным размером</td></tr>
+  <tr><td>-100 ... -60</td><td>STRONG SELL</td><td>Открытие короткой позиции с полным размером</td></tr>
+</table>
+
+<h3>7.3. Risk Management</h3>
+<table>
+  <tr><th>Параметр</th><th>Расчёт</th><th>Описание</th></tr>
+  <tr><td>Stop Loss</td><td><code>Entry ± ATR(14) × SL_Multiplier</code></td><td>SL_Multiplier: 1.5 (по умолчанию), настраиваемый</td></tr>
+  <tr><td>Take Profit 1</td><td><code>Entry ± ATR(14) × TP1_Multiplier</code></td><td>TP1_Multiplier: 2.0 (R:R = 1:1.33)</td></tr>
+  <tr><td>Take Profit 2</td><td><code>Entry ± ATR(14) × TP2_Multiplier</code></td><td>TP2_Multiplier: 3.5 (R:R = 1:2.33)</td></tr>
+  <tr><td>Position Size</td><td><code>Risk% × Account / SL_Distance</code></td><td>Risk% по умолчанию: 1-2% от депозита</td></tr>
+  <tr><td>Max Drawdown Alert</td><td>≥ 5% от депозита</td><td>Уведомление при превышении макс. просадки</td></tr>
+  <tr><td>Correlation Filter</td><td>Pearson correlation &gt; 0.7</td><td>Не открывать однонаправленные позиции по коррелированным инструментам</td></tr>
+</table>
+
+<h3>7.4. Мульти-таймфрейм фильтрация</h3>
+<div class="highlight">
+<strong>Правило:</strong> Сигнал на рабочем таймфрейме подтверждается старшим.<br><br>
+Пример: Сигнал BUY на H4 валиден, если тренд на D1 тоже бычий. Если D1 медвежий — сигнал понижается до HOLD.<br><br>
+<strong>Коэффициенты подтверждения:</strong><br>
+— Совпадение с 2 старшими TF: ×1.2 (усиление)<br>
+— Совпадение с 1 старшим TF: ×1.0 (без изменений)<br>
+— Противоречие с 1 старшим TF: ×0.7 (ослабление)<br>
+— Противоречие с 2 старшими TF: ×0.4 (сильное ослабление)
+</div>
+
+<!-- ======================== 8. БАЗА ДАННЫХ ======================== -->
+<h2 id="s8">8. База данных и трекинг сигналов</h2>
+
+<h3>8.1. Назначение БД</h3>
+<p>База данных является ключевым компонентом системы, обеспечивающим:</p>
+<ul>
+  <li>Хранение всех сгенерированных сигналов с полными параметрами рекомендации</li>
+  <li>Запись фактического движения рынка после сигнала</li>
+  <li>Накопление статистики для анализа точности предсказаний</li>
+  <li>Хранение исторических котировок для быстрого доступа (кэш)</li>
+  <li>Хранение макроэкономических данных</li>
+  <li>Журнал событий и ошибок системы</li>
+</ul>
+
+<h3>8.2. Выбор СУБД</h3>
+<table>
+  <tr><th>Вариант</th><th>Плюсы</th><th>Минусы</th><th>Рекомендация</th></tr>
+  <tr><td><strong>PostgreSQL</strong></td><td>Надёжность, JSON-поддержка, расширения (TimescaleDB), SQL</td><td>Требует сервер</td><td><span class="tag must">Рекомендуется для продакшена</span></td></tr>
+  <tr><td>SQLite</td><td>Без сервера, простота, портативность</td><td>Ограничения при параллельной записи</td><td><span class="tag phase1">Хорош для прототипа</span></td></tr>
+  <tr><td>TimescaleDB</td><td>Оптимизирован для временных рядов</td><td>Расширение PostgreSQL</td><td><span class="tag phase2">Для масштабирования</span></td></tr>
+</table>
+
+<div class="highlight">
+<strong>Стратегия:</strong> Начинаем с SQLite для быстрого прототипирования → мигрируем на PostgreSQL + TimescaleDB при масштабировании. ORM-слой (SQLAlchemy) обеспечит совместимость.
+</div>
+
+<h3>8.3. Жизненный цикл сигнала в БД</h3>
+<div class="diagram">
+  ┌─────────┐     ┌──────────┐     ┌──────────┐     ┌───────────┐     ┌──────────┐
+  │ CREATED │ ──▶ │  ACTIVE  │ ──▶ │ TRACKING │ ──▶ │ COMPLETED │ ──▶ │ ANALYZED │
+  └─────────┘     └──────────┘     └──────────┘     └───────────┘     └──────────┘
+  Сигнал          Цена достигла    Позиция          Достигнут SL      Записан
+  сгенерирован    точки входа      открыта          или TP или        результат,
+  и записан       (или ≤ 1%)       (виртуально)     истёк срок        обновлена
+  в БД                                                                 статистика
+</div>
+
+<!-- ======================== 9. ACCURACY TRACKER ======================== -->
+<h2 id="s9">9. Модуль анализа точности (Accuracy Tracker)</h2>
+
+<h3>9.1. Функциональные требования</h3>
+<table>
+  <tr><th>Требование</th><th>Описание</th><th>Приоритет</th></tr>
+  <tr><td>AT-01</td><td>Автоматическое отслеживание цены после генерации сигнала</td><td><span class="tag must">MUST</span></td></tr>
+  <tr><td>AT-02</td><td>Фиксация момента достижения Entry, SL, TP1, TP2</td><td><span class="tag must">MUST</span></td></tr>
+  <tr><td>AT-03</td><td>Расчёт P&L (Profit/Loss) для каждого сигнала</td><td><span class="tag must">MUST</span></td></tr>
+  <tr><td>AT-04</td><td>Расчёт Win Rate, средний профит, средний убыток</td><td><span class="tag must">MUST</span></td></tr>
+  <tr><td>AT-05</td><td>Разбивка точности по: рынку, инструменту, таймфрейму, типу сигнала</td><td><span class="tag must">MUST</span></td></tr>
+  <tr><td>AT-06</td><td>Profit Factor = Σ Profits / Σ Losses</td><td><span class="tag must">MUST</span></td></tr>
+  <tr><td>AT-07</td><td>Sharpe Ratio для оценки quality сигналов</td><td><span class="tag should">SHOULD</span></td></tr>
+  <tr><td>AT-08</td><td>Максимальная просадка (Max Drawdown) по серии сигналов</td><td><span class="tag should">SHOULD</span></td></tr>
+  <tr><td>AT-09</td><td>Анализ: какие модули (TA/FA/Sentiment) вносят наибольший вклад в точность</td><td><span class="tag should">SHOULD</span></td></tr>
+  <tr><td>AT-10</td><td>Автоматическая коррекция весов на основе исторической точности</td><td><span class="tag could">Фаза 3</span></td></tr>
+</table>
+
+<h3>9.2. Метрики точности</h3>
+<table>
+  <tr><th>Метрика</th><th>Формула</th><th>Целевое значение</th></tr>
+  <tr><td>Win Rate</td><td>Profitable Trades / Total Trades × 100%</td><td>≥ 55%</td></tr>
+  <tr><td>Profit Factor</td><td>Gross Profit / Gross Loss</td><td>≥ 1.5</td></tr>
+  <tr><td>Average R:R Actual</td><td>Avg Win / Avg Loss</td><td>≥ 1.3</td></tr>
+  <tr><td>Sharpe Ratio</td><td>(Mean Return - Risk Free) / Std Dev</td><td>≥ 1.0</td></tr>
+  <tr><td>Max Drawdown</td><td>Максимальное падение equity от пика</td><td>≤ 15%</td></tr>
+  <tr><td>Expectancy</td><td>(Win% × Avg Win) - (Loss% × Avg Loss)</td><td>&gt; 0</td></tr>
+  <tr><td>Signal Accuracy by Module</td><td>Отдельный Win Rate для TA, FA, Sentiment</td><td>Для калибровки весов</td></tr>
+</table>
+
+<h3>9.3. Процесс верификации</h3>
+<ol>
+  <li><strong>Генерация сигнала:</strong> Записывается signal_id, timestamp, instrument, direction, entry, SL, TP1, TP2, composite_score, все под-скоры модулей</li>
+  <li><strong>Мониторинг:</strong> Каждые N минут (зависит от таймфрейма) система проверяет текущую цену vs параметры сигнала</li>
+  <li><strong>Фиксация результата:</strong> При достижении SL, TP или истечении горизонта — запись exit_price, exit_time, PnL, result (win/loss/breakeven)</li>
+  <li><strong>Агрегация:</strong> Обновление rolling-статистики (win rate, profit factor и т.д.)</li>
+  <li><strong>Отчёт:</strong> Еженедельный/ежемесячный отчёт по точности с breakdown по всем срезам</li>
+</ol>
+
+<!-- ======================== 10. DASHBOARD ======================== -->
+<h2 id="s10">10. Интерактивный дашборд (Frontend)</h2>
+
+<h3>10.1. Экраны и компоненты</h3>
+<table>
+  <tr><th>Экран</th><th>Компоненты</th><th>Фаза</th></tr>
+  <tr><td><strong>Главный дашборд</strong></td><td>Список инструментов, ценовой график + BB/MA, RSI, MACD, Volume, панель сигналов, индикаторы, рекомендации</td><td><span class="tag phase1">Фаза 1</span> ✅ Готово</td></tr>
+  <tr><td><strong>История сигналов</strong></td><td>Таблица всех сигналов с фильтрацией, статус (active/completed), P&L, графики точности</td><td><span class="tag phase2">Фаза 2</span></td></tr>
+  <tr><td><strong>Дашборд точности</strong></td><td>Win Rate, Profit Factor, Sharpe, Equity Curve, разбивка по инструментам/TF</td><td><span class="tag phase2">Фаза 2</span></td></tr>
+  <tr><td><strong>Экономический календарь</strong></td><td>Предстоящие события, их ожидаемое влияние, обратный отсчёт</td><td><span class="tag phase2">Фаза 2</span></td></tr>
+  <tr><td><strong>Настройки</strong></td><td>Веса модулей, параметры индикаторов, SL/TP множители, API ключи</td><td><span class="tag phase2">Фаза 2</span></td></tr>
+  <tr><td><strong>Алерты</strong></td><td>Email/Telegram уведомления при новых сигналах, достижении SL/TP</td><td><span class="tag phase3">Фаза 3</span></td></tr>
+</table>
+
+<h3>10.2. Графики и визуализация</h3>
+<ul>
+  <li><strong>Ценовой график:</strong> Candlestick + overlay (BB, MA, уровни) — Chart.js или Lightweight Charts (TradingView)</li>
+  <li><strong>Осцилляторы:</strong> RSI, MACD, Stochastic — отдельные панели под графиком</li>
+  <li><strong>Volume:</strong> Цветные столбцы (зелёный/красный)</li>
+  <li><strong>Equity Curve:</strong> Кумулятивный P&L по серии сигналов</li>
+  <li><strong>Heatmap:</strong> Корреляции между инструментами</li>
+  <li><strong>Pie/Donut:</strong> Распределение сигналов по типам, Win/Loss ratio</li>
+</ul>
+
+<!-- ======================== 11. API ======================== -->
+<h2 id="s11">11. API источники данных</h2>
+
+<h3>11.1. Бесплатные API (Фаза 1)</h3>
+<table>
+  <tr><th>API</th><th>Данные</th><th>Лимиты (free tier)</th><th>Ключ</th></tr>
+  <tr><td><strong>Yahoo Finance (yfinance)</strong></td><td>Котировки акций, форекс, крипто, индексы, финансовая отчётность</td><td>Неофициальный, ~2000 запросов/час</td><td>Не нужен</td></tr>
+  <tr><td><strong>Alpha Vantage</strong></td><td>Котировки, тех. индикаторы, фундаментал</td><td>25 запросов/день (free)</td><td>Бесплатный</td></tr>
+  <tr><td><strong>Twelve Data</strong></td><td>Котировки, тех. индикаторы</td><td>800 запросов/день, 8/мин</td><td>Бесплатный</td></tr>
+  <tr><td><strong>Finnhub</strong></td><td>Котировки, новости, рекомендации, earnings, insider</td><td>60 запросов/мин</td><td>Бесплатный</td></tr>
+  <tr><td><strong>FRED API</strong></td><td>Макроэкономика США (ставки, CPI, GDP, NFP)</td><td>120 запросов/мин</td><td>Бесплатный</td></tr>
+  <tr><td><strong>Binance API</strong></td><td>Крипто котировки, orderbook, trades</td><td>1200 запросов/мин</td><td>Не нужен (public)</td></tr>
+  <tr><td><strong>CoinGecko</strong></td><td>Крипто котировки, market data</td><td>10-30 запросов/мин</td><td>Не нужен (public)</td></tr>
+  <tr><td><strong>NewsAPI</strong></td><td>Новости из 80,000+ источников</td><td>100 запросов/день</td><td>Бесплатный</td></tr>
+  <tr><td><strong>GDELT Project</strong></td><td>Геополитические события, глобальные новости</td><td>Без ограничений</td><td>Не нужен</td></tr>
+  <tr><td><strong>Alternative.me</strong></td><td>Crypto Fear & Greed Index</td><td>Без ограничений</td><td>Не нужен</td></tr>
+  <tr><td><strong>ECB Data Portal</strong></td><td>Процентные ставки ЕЦБ, обменные курсы</td><td>Без ограничений</td><td>Не нужен</td></tr>
+</table>
+
+<h3>11.2. Платные API (Фаза 3, при масштабировании)</h3>
+<table>
+  <tr><th>API</th><th>Данные</th><th>Цена</th></tr>
+  <tr><td>Alpha Vantage Premium</td><td>75 запросов/мин, premium endpoints</td><td>от $49.99/мес</td></tr>
+  <tr><td>Polygon.io</td><td>Real-time котировки, тики, aggregates</td><td>от $29/мес</td></tr>
+  <tr><td>Quandl / Nasdaq Data Link</td><td>Альтернативные данные, фундаментал</td><td>от $49/мес</td></tr>
+  <tr><td>Glassnode</td><td>On-chain метрики BTC/ETH</td><td>от $29/мес</td></tr>
+  <tr><td>TradingView</td><td>Lightweight Charts (бесплатная библиотека для графиков)</td><td>Бесплатно (библиотека)</td></tr>
+</table>
+
+<!-- ======================== 12. СТЕК ======================== -->
+<h2 id="s12">12. Стек технологий</h2>
+
+<table>
+  <tr><th>Компонент</th><th>Технология</th><th>Обоснование</th></tr>
+  <tr><td><strong>Backend</strong></td><td>Python 3.11+</td><td>Богатая экосистема для финансов (pandas, numpy, ta-lib)</td></tr>
+  <tr><td><strong>Фреймворк</strong></td><td>FastAPI</td><td>Async, WebSocket поддержка, автодокументация OpenAPI</td></tr>
+  <tr><td><strong>ORM</strong></td><td>SQLAlchemy 2.0</td><td>Поддержка SQLite и PostgreSQL, миграции через Alembic</td></tr>
+  <tr><td><strong>Task Queue</strong></td><td>Celery + Redis</td><td>Фоновые задачи (сбор данных, мониторинг сигналов)</td></tr>
+  <tr><td><strong>Scheduler</strong></td><td>APScheduler / Celery Beat</td><td>Расписание сбора данных</td></tr>
+  <tr><td><strong>БД (прототип)</strong></td><td>SQLite</td><td>Быстрый старт без инфраструктуры</td></tr>
+  <tr><td><strong>БД (прод)</strong></td><td>PostgreSQL + TimescaleDB</td><td>Временные ряды, масштабирование</td></tr>
+  <tr><td><strong>Кэш</strong></td><td>Redis</td><td>Кэширование котировок, rate limiting</td></tr>
+  <tr><td><strong>Frontend</strong></td><td>HTML/CSS/JS + Chart.js</td><td>Самодостаточный дашборд, без сборки</td></tr>
+  <tr><td><strong>Графики</strong></td><td>Lightweight Charts (TradingView) + Chart.js</td><td>Профессиональные candlestick-графики</td></tr>
+  <tr><td><strong>NLP</strong></td><td>FinBERT / TextBlob (baseline)</td><td>Sentiment analysis новостей</td></tr>
+  <tr><td><strong>Тех. анализ</strong></td><td>pandas-ta / TA-Lib</td><td>130+ индикаторов, оптимизированный расчёт</td></tr>
+  <tr><td><strong>Уведомления</strong></td><td>Telegram Bot API / SMTP</td><td>Алерты по сигналам</td></tr>
+  <tr><td><strong>Контейнеризация</strong></td><td>Docker + docker-compose</td><td>Простое развёртывание</td></tr>
+</table>
+
+<!-- ======================== 13. СХЕМА БД ======================== -->
+<h2 id="s13">13. Схема базы данных</h2>
+
+<h3>13.1. Таблица <code>instruments</code></h3>
+<table>
+  <tr><th>Поле</th><th>Тип</th><th>Описание</th></tr>
+  <tr><td>id</td><td>INTEGER PK</td><td>Уникальный ID</td></tr>
+  <tr><td>symbol</td><td>VARCHAR(20) UNIQUE</td><td>Тикер (EUR/USD, AAPL, BTC/USD)</td></tr>
+  <tr><td>market</td><td>ENUM('forex','stocks','crypto','commodities')</td><td>Тип рынка</td></tr>
+  <tr><td>name</td><td>VARCHAR(100)</td><td>Полное название</td></tr>
+  <tr><td>pip_size</td><td>DECIMAL</td><td>Размер пипса/тика</td></tr>
+  <tr><td>is_active</td><td>BOOLEAN</td><td>Активен ли мониторинг</td></tr>
+  <tr><td>created_at</td><td>TIMESTAMP</td><td>Дата добавления</td></tr>
+</table>
+
+<h3>13.2. Таблица <code>price_data</code> (исторические котировки)</h3>
+<table>
+  <tr><th>Поле</th><th>Тип</th><th>Описание</th></tr>
+  <tr><td>id</td><td>BIGINT PK</td><td>Уникальный ID</td></tr>
+  <tr><td>instrument_id</td><td>INTEGER FK</td><td>Ссылка на instruments</td></tr>
+  <tr><td>timeframe</td><td>VARCHAR(5)</td><td>M1, M5, M15, H1, H4, D1, W1</td></tr>
+  <tr><td>timestamp</td><td>TIMESTAMP</td><td>Время открытия свечи (UTC)</td></tr>
+  <tr><td>open</td><td>DECIMAL(18,8)</td><td>Цена открытия</td></tr>
+  <tr><td>high</td><td>DECIMAL(18,8)</td><td>Максимум</td></tr>
+  <tr><td>low</td><td>DECIMAL(18,8)</td><td>Минимум</td></tr>
+  <tr><td>close</td><td>DECIMAL(18,8)</td><td>Цена закрытия</td></tr>
+  <tr><td>volume</td><td>DECIMAL(18,2)</td><td>Объём</td></tr>
+</table>
+<p><em>Индексы: (instrument_id, timeframe, timestamp) — уникальный составной индекс</em></p>
+
+<h3>13.3. Таблица <code>signals</code> (сигналы)</h3>
+<table>
+  <tr><th>Поле</th><th>Тип</th><th>Описание</th></tr>
+  <tr><td>id</td><td>BIGINT PK</td><td>Уникальный ID сигнала</td></tr>
+  <tr><td>instrument_id</td><td>INTEGER FK</td><td>Инструмент</td></tr>
+  <tr><td>timeframe</td><td>VARCHAR(5)</td><td>Рабочий таймфрейм</td></tr>
+  <tr><td>created_at</td><td>TIMESTAMP</td><td>Время генерации сигнала</td></tr>
+  <tr><td>direction</td><td>ENUM('LONG','SHORT','HOLD')</td><td>Направление</td></tr>
+  <tr><td>entry_price</td><td>DECIMAL(18,8)</td><td>Рекомендуемая точка входа</td></tr>
+  <tr><td>stop_loss</td><td>DECIMAL(18,8)</td><td>Уровень Stop Loss</td></tr>
+  <tr><td>take_profit_1</td><td>DECIMAL(18,8)</td><td>Take Profit 1</td></tr>
+  <tr><td>take_profit_2</td><td>DECIMAL(18,8)</td><td>Take Profit 2</td></tr>
+  <tr><td>risk_reward</td><td>DECIMAL(5,2)</td><td>Соотношение Risk/Reward</td></tr>
+  <tr><td>position_size_pct</td><td>DECIMAL(5,2)</td><td>Рекомендуемый размер позиции (% от депозита)</td></tr>
+  <tr><td>composite_score</td><td>DECIMAL(6,2)</td><td>Итоговый скор [-100, +100]</td></tr>
+  <tr><td>ta_score</td><td>DECIMAL(6,2)</td><td>Скор тех. анализа</td></tr>
+  <tr><td>fa_score</td><td>DECIMAL(6,2)</td><td>Скор фунд. анализа</td></tr>
+  <tr><td>sentiment_score</td><td>DECIMAL(6,2)</td><td>Скор сентимента</td></tr>
+  <tr><td>geo_score</td><td>DECIMAL(6,2)</td><td>Скор геополитики</td></tr>
+  <tr><td>confidence</td><td>DECIMAL(5,2)</td><td>Уровень уверенности (0-100%)</td></tr>
+  <tr><td>horizon</td><td>VARCHAR(50)</td><td>Ожидаемое время удержания</td></tr>
+  <tr><td>reasoning</td><td>TEXT</td><td>JSON с обоснованием (ключевые факторы)</td></tr>
+  <tr><td>indicators_snapshot</td><td>JSON</td><td>Снимок всех индикаторов на момент сигнала</td></tr>
+  <tr><td>status</td><td>ENUM('created','active','tracking','completed','expired','cancelled')</td><td>Статус сигнала</td></tr>
+</table>
+
+<h3>13.4. Таблица <code>signal_results</code> (результаты)</h3>
+<table>
+  <tr><th>Поле</th><th>Тип</th><th>Описание</th></tr>
+  <tr><td>id</td><td>BIGINT PK</td><td>Уникальный ID</td></tr>
+  <tr><td>signal_id</td><td>BIGINT FK UNIQUE</td><td>Ссылка на сигнал (1:1)</td></tr>
+  <tr><td>entry_filled_at</td><td>TIMESTAMP</td><td>Когда цена достигла точки входа</td></tr>
+  <tr><td>entry_actual_price</td><td>DECIMAL(18,8)</td><td>Фактическая цена входа</td></tr>
+  <tr><td>exit_at</td><td>TIMESTAMP</td><td>Время закрытия позиции</td></tr>
+  <tr><td>exit_price</td><td>DECIMAL(18,8)</td><td>Цена выхода</td></tr>
+  <tr><td>exit_reason</td><td>ENUM('sl_hit','tp1_hit','tp2_hit','expired','manual')</td><td>Причина закрытия</td></tr>
+  <tr><td>pnl_pips</td><td>DECIMAL(10,2)</td><td>Profit/Loss в пипсах</td></tr>
+  <tr><td>pnl_percent</td><td>DECIMAL(8,4)</td><td>Profit/Loss в %</td></tr>
+  <tr><td>result</td><td>ENUM('win','loss','breakeven')</td><td>Результат</td></tr>
+  <tr><td>max_favorable_excursion</td><td>DECIMAL(18,8)</td><td>Максимальная прибыль в процессе (MFE)</td></tr>
+  <tr><td>max_adverse_excursion</td><td>DECIMAL(18,8)</td><td>Максимальный убыток в процессе (MAE)</td></tr>
+  <tr><td>price_at_expiry</td><td>DECIMAL(18,8)</td><td>Цена на момент истечения горизонта (для анализа)</td></tr>
+  <tr><td>duration_minutes</td><td>INTEGER</td><td>Длительность удержания в минутах</td></tr>
+</table>
+
+<h3>13.5. Таблица <code>accuracy_stats</code> (агрегированная статистика)</h3>
+<table>
+  <tr><th>Поле</th><th>Тип</th><th>Описание</th></tr>
+  <tr><td>id</td><td>BIGINT PK</td><td>Уникальный ID</td></tr>
+  <tr><td>period</td><td>VARCHAR(20)</td><td>'daily', 'weekly', 'monthly', 'all_time'</td></tr>
+  <tr><td>period_start</td><td>DATE</td><td>Начало периода</td></tr>
+  <tr><td>instrument_id</td><td>INTEGER FK NULL</td><td>NULL = все инструменты</td></tr>
+  <tr><td>market</td><td>VARCHAR(20) NULL</td><td>NULL = все рынки</td></tr>
+  <tr><td>timeframe</td><td>VARCHAR(5) NULL</td><td>NULL = все таймфреймы</td></tr>
+  <tr><td>total_signals</td><td>INTEGER</td><td>Всего сигналов за период</td></tr>
+  <tr><td>wins</td><td>INTEGER</td><td>Количество прибыльных</td></tr>
+  <tr><td>losses</td><td>INTEGER</td><td>Количество убыточных</td></tr>
+  <tr><td>breakevens</td><td>INTEGER</td><td>Количество безубыточных</td></tr>
+  <tr><td>win_rate</td><td>DECIMAL(5,2)</td><td>Win Rate %</td></tr>
+  <tr><td>profit_factor</td><td>DECIMAL(8,2)</td><td>Gross Profit / Gross Loss</td></tr>
+  <tr><td>avg_win_pips</td><td>DECIMAL(10,2)</td><td>Средний профит (пипсы)</td></tr>
+  <tr><td>avg_loss_pips</td><td>DECIMAL(10,2)</td><td>Средний убыток (пипсы)</td></tr>
+  <tr><td>sharpe_ratio</td><td>DECIMAL(6,3)</td><td>Sharpe Ratio</td></tr>
+  <tr><td>max_drawdown_pct</td><td>DECIMAL(6,2)</td><td>Max Drawdown %</td></tr>
+  <tr><td>expectancy</td><td>DECIMAL(10,2)</td><td>Мат. ожидание</td></tr>
+  <tr><td>updated_at</td><td>TIMESTAMP</td><td>Последнее обновление</td></tr>
+</table>
+
+<h3>13.6. Таблица <code>macro_data</code></h3>
+<table>
+  <tr><th>Поле</th><th>Тип</th><th>Описание</th></tr>
+  <tr><td>id</td><td>BIGINT PK</td><td>ID</td></tr>
+  <tr><td>indicator_name</td><td>VARCHAR(100)</td><td>Название (CPI, NFP, FedRate...)</td></tr>
+  <tr><td>country</td><td>VARCHAR(3)</td><td>Код страны (US, EU, GB...)</td></tr>
+  <tr><td>value</td><td>DECIMAL(18,6)</td><td>Значение</td></tr>
+  <tr><td>previous_value</td><td>DECIMAL(18,6)</td><td>Предыдущее значение</td></tr>
+  <tr><td>forecast_value</td><td>DECIMAL(18,6)</td><td>Прогноз (consensus)</td></tr>
+  <tr><td>release_date</td><td>DATE</td><td>Дата публикации</td></tr>
+  <tr><td>source</td><td>VARCHAR(50)</td><td>Источник (FRED, ECB...)</td></tr>
+</table>
+
+<h3>13.7. Таблица <code>news_events</code></h3>
+<table>
+  <tr><th>Поле</th><th>Тип</th><th>Описание</th></tr>
+  <tr><td>id</td><td>BIGINT PK</td><td>ID</td></tr>
+  <tr><td>headline</td><td>TEXT</td><td>Заголовок</td></tr>
+  <tr><td>source</td><td>VARCHAR(100)</td><td>Источник</td></tr>
+  <tr><td>published_at</td><td>TIMESTAMP</td><td>Время публикации</td></tr>
+  <tr><td>sentiment_score</td><td>DECIMAL(4,3)</td><td>NLP оценка [-1, +1]</td></tr>
+  <tr><td>importance</td><td>ENUM('low','medium','high','critical')</td><td>Важность</td></tr>
+  <tr><td>related_instruments</td><td>JSON</td><td>Связанные инструменты</td></tr>
+  <tr><td>category</td><td>VARCHAR(50)</td><td>Категория (macro, earnings, geopolitics...)</td></tr>
+</table>
+
+<h3>13.8. ER-диаграмма (упрощённая)</h3>
+<div class="diagram">
+instruments ──────┐
+  │                │
+  │ 1:N            │ 1:N
+  ▼                ▼
+price_data      signals ──────── signal_results
+                  │    1:1
+                  │
+                  │ N:1 (через instrument_id + timeframe)
+                  ▼
+            accuracy_stats
+
+macro_data (standalone)
+news_events (standalone, linked via related_instruments JSON)
+</div>
+
+<!-- ======================== 14. ФАЗЫ ======================== -->
+<h2 id="s14">14. Фазы реализации и роадмап</h2>
+
+<h3>Фаза 1 — MVP (4-6 недель)</h3>
+<table class="priority-table">
+  <tr><th>Задача</th><th>Описание</th><th>Срок</th></tr>
+  <tr><td>1.1 Структура проекта</td><td>Python-проект, Docker, конфигурация</td><td>2-3 дня</td></tr>
+  <tr><td>1.2 БД (SQLite)</td><td>Создание схемы, миграции, модели SQLAlchemy</td><td>3-4 дня</td></tr>
+  <tr><td>1.3 Data Collector</td><td>Yahoo Finance + Binance + FRED интеграция</td><td>5-7 дней</td></tr>
+  <tr><td>1.4 TA Engine</td><td>Все индикаторы из п.4.1 через pandas-ta</td><td>3-5 дней</td></tr>
+  <tr><td>1.5 Signal Engine</td><td>Композитный скор, пороги, Risk Management</td><td>5-7 дней</td></tr>
+  <tr><td>1.6 Сохранение сигналов</td><td>Запись в БД, базовый мониторинг</td><td>3-4 дня</td></tr>
+  <tr><td>1.7 Дашборд v1</td><td>Улучшение текущего HTML дашборда, подключение к API</td><td>5-7 дней</td></tr>
+</table>
+
+<h3>Фаза 2 — Полный функционал (6-8 недель)</h3>
+<table class="priority-table">
+  <tr><th>Задача</th><th>Описание</th><th>Срок</th></tr>
+  <tr><td>2.1 FA Engine</td><td>Фундаментальный анализ всех рынков</td><td>7-10 дней</td></tr>
+  <tr><td>2.2 Sentiment Engine</td><td>NLP анализ новостей (FinBERT)</td><td>5-7 дней</td></tr>
+  <tr><td>2.3 Accuracy Tracker</td><td>Полный трекинг и верификация сигналов</td><td>7-10 дней</td></tr>
+  <tr><td>2.4 PostgreSQL миграция</td><td>Перевод на PostgreSQL + TimescaleDB</td><td>3-5 дней</td></tr>
+  <tr><td>2.5 Дашборд v2</td><td>История сигналов, дашборд точности, настройки</td><td>7-10 дней</td></tr>
+  <tr><td>2.6 Экономический календарь</td><td>Интеграция Finnhub Calendar</td><td>3-4 дня</td></tr>
+  <tr><td>2.7 Мульти-TF логика</td><td>Полная мульти-таймфрейм фильтрация</td><td>3-5 дней</td></tr>
+</table>
+
+<h3>Фаза 3 — Продвинутые функции (8-12 недель)</h3>
+<table class="priority-table">
+  <tr><th>Задача</th><th>Описание</th><th>Срок</th></tr>
+  <tr><td>3.1 Авто-калибровка весов</td><td>ML-оптимизация весов модулей на исторических данных</td><td>10-14 дней</td></tr>
+  <tr><td>3.2 Telegram Bot</td><td>Уведомления о сигналах, управление подписками</td><td>5-7 дней</td></tr>
+  <tr><td>3.3 Геополитический модуль</td><td>GDELT интеграция, event scoring</td><td>7-10 дней</td></tr>
+  <tr><td>3.4 Backtesting Engine</td><td>Тестирование стратегии на исторических данных</td><td>10-14 дней</td></tr>
+  <tr><td>3.5 Paper Trading</td><td>Виртуальный счёт для симуляции торговли</td><td>7-10 дней</td></tr>
+  <tr><td>3.6 Commodities</td><td>Расширение на золото, нефть, серебро</td><td>5-7 дней</td></tr>
+  <tr><td>3.7 Брокерская интеграция</td><td>API Interactive Brokers / Tinkoff для автоторговли</td><td>14-21 день</td></tr>
+</table>
+
+<!-- ======================== 15. НФТ ======================== -->
+<h2 id="s15">15. Нефункциональные требования</h2>
+
+<table>
+  <tr><th>Требование</th><th>Описание</th><th>Целевой показатель</th></tr>
+  <tr><td><strong>Производительность</strong></td><td>Время генерации полного анализа</td><td>≤ 5 сек (все модули параллельно)</td></tr>
+  <tr><td><strong>Доступность</strong></td><td>Uptime системы</td><td>≥ 99% (с учётом выходных для форекса)</td></tr>
+  <tr><td><strong>Хранение</strong></td><td>Объём исторических данных</td><td>5+ лет дневных данных, 1+ год интрадей</td></tr>
+  <tr><td><strong>Безопасность</strong></td><td>API ключи, персональные данные</td><td>Шифрование ключей, .env файл, HTTPS</td></tr>
+  <tr><td><strong>Масштабируемость</strong></td><td>Количество инструментов</td><td>100+ инструментов одновременно</td></tr>
+  <tr><td><strong>Логирование</strong></td><td>Все действия системы</td><td>Structured logging (JSON), ротация 30 дней</td></tr>
+  <tr><td><strong>Развёртывание</strong></td><td>Docker-контейнеризация</td><td>docker-compose up — и всё работает</td></tr>
+  <tr><td><strong>Тестирование</strong></td><td>Покрытие критических модулей</td><td>≥ 80% coverage для Signal Engine</td></tr>
+</table>
+
+<!-- ======================== 16. РИСКИ ======================== -->
+<h2 id="s16">16. Риски и ограничения</h2>
+
+<table>
+  <tr><th>Риск</th><th>Вероятность</th><th>Влияние</th><th>Митигация</th></tr>
+  <tr><td>Ограничения бесплатных API (rate limits, отключение)</td><td>Высокая</td><td>Среднее</td><td>Множественные fallback-источники, кэширование, graceful degradation</td></tr>
+  <tr><td>Неточность прогнозов (рынок непредсказуем)</td><td>Высокая</td><td>Высокое</td><td>Accuracy Tracker + авто-калибровка весов. Чёткий дисклеймер: система — инструмент, не гарантия</td></tr>
+  <tr><td>Задержка данных (не реалтайм)</td><td>Средняя</td><td>Среднее</td><td>Указание задержки в UI. Для скальпинга — только платные API</td></tr>
+  <tr><td>Overfitting при авто-калибровке</td><td>Средняя</td><td>Высокое</td><td>Walk-forward optimization, out-of-sample тестирование</td></tr>
+  <tr><td>Чёрный лебедь (flash crash, геополитический шок)</td><td>Низкая</td><td>Критическое</td><td>Max Drawdown лимит, автоматическое отключение сигналов при экстремальной волатильности</td></tr>
+  <tr><td>Регуляторные ограничения</td><td>Низкая</td><td>Среднее</td><td>Система для аналитики, не автоторговля. Дисклеймер</td></tr>
+</table>
+
+<div class="highlight" style="margin-top:30px;">
+<strong>⚠️ Дисклеймер:</strong> Market Analyzer Pro является аналитическим инструментом и не является инвестиционной рекомендацией. Прошлая точность прогнозов не гарантирует будущих результатов. Торговля на финансовых рынках сопряжена с риском потери капитала. Пользователь принимает все торговые решения самостоятельно и несёт полную ответственность за результаты.
+</div>
+
+</div><!-- content -->
+
+<div class="footer">
+  Market Analyzer Pro · Техническое задание v2.0 · Март 2026<br>
+  Документ сгенерирован автоматически
+</div>
+
+</div><!-- doc -->
+</body>
+</html>

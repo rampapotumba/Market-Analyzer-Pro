@@ -1,0 +1,45 @@
+version: "3.9"
+
+services:
+  app:
+    build: .
+    container_name: market-analyzer
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data          # SQLite DB persistence
+      - ./frontend:/app/frontend  # Hot-reload frontend
+      - ./.env:/app/.env          # Environment
+    env_file:
+      - .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Phase 2: PostgreSQL + TimescaleDB
+  # postgres:
+  #   image: timescale/timescaledb:latest-pg16
+  #   container_name: market-analyzer-db
+  #   environment:
+  #     POSTGRES_DB: market_analyzer
+  #     POSTGRES_USER: analyzer
+  #     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+  #   ports:
+  #     - "5432:5432"
+  #   volumes:
+  #     - pgdata:/var/lib/postgresql/data
+  #   restart: unless-stopped
+
+  # Phase 3: Redis (cache + Celery broker)
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: market-analyzer-redis
+  #   ports:
+  #     - "6379:6379"
+  #   restart: unless-stopped
+
+# volumes:
+#   pgdata:

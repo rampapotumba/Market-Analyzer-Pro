@@ -1,0 +1,867 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Market Analyzer Pro — Dashboard</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="/assets/style.css">
+    <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+<div class="app-layout">
+
+    <!-- Header -->
+    <header class="app-header">
+        <div class="app-logo">
+            📈 <span>Market Analyzer Pro</span>
+        </div>
+        <nav class="header-nav">
+            <a href="/" class="nav-link active">Dashboard</a>
+            <a href="/signals" class="nav-link">Signals</a>
+            <a href="/accuracy" class="nav-link">Accuracy</a>
+        </nav>
+        <div class="header-status">
+            <div class="status-dot" id="statusDot"></div>
+            <span class="status-label" id="statusLabel">Connecting...</span>
+        </div>
+    </header>
+
+    <!-- Sidebar -->
+    <aside class="sidebar" id="sidebar">
+        <div id="instrumentList">
+            <div class="sidebar-section">
+                <div class="sidebar-title">Loading...</div>
+            </div>
+        </div>
+    </aside>
+
+    <!-- Main Content -->
+    <main class="main-content">
+        <div class="content-area">
+
+            <!-- Symbol Bar -->
+            <div class="symbol-bar">
+                <div class="symbol-bar-left">
+                    <div class="symbol-bar-name" id="selectedSymbol">EUR/USD</div>
+                    <div class="symbol-bar-meta">
+                        <span id="selectedMarket" class="symbol-bar-market">Forex</span>
+                        <span class="symbol-bar-sep">·</span>
+                        <span id="currentPrice" class="symbol-bar-price">—</span>
+                        <span id="priceChange" class="symbol-bar-change">—</span>
+                    </div>
+                </div>
+                <div class="symbol-bar-right">
+                    <div class="chart-toolbar" id="tfToolbar">
+                        <button class="tf-btn" data-tf="M15">M15</button>
+                        <button class="tf-btn active" data-tf="H1">H1</button>
+                        <button class="tf-btn" data-tf="H4">H4</button>
+                        <button class="tf-btn" data-tf="D1">D1</button>
+                        <button class="tf-btn" data-tf="W1">W1</button>
+                        <button class="tf-btn" data-tf="MN1">MN1</button>
+                    </div>
+                    <button class="btn btn-analyze" id="analyzeBtn" onclick="runAnalysis()">
+                        <span id="analyzeSpinner" class="spinner"></span>
+                        Analyze
+                    </button>
+                </div>
+            </div>
+
+            <!-- Chart + Signal -->
+            <div class="grid-2">
+                <!-- Chart -->
+                <div class="card" style="padding: 12px;">
+                    <div class="card-header">
+                        <span class="card-title">Price Chart</span>
+                        <span class="card-subtitle" id="chartTfLabel">H1</span>
+                    </div>
+                    <div id="chart" style="height:340px;"></div>
+                </div>
+
+                <!-- Current Signal -->
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title" id="signalCardTitle">Signal</span>
+                        <span id="signalBadge" class="signal-badge HOLD">HOLD</span>
+                    </div>
+                    <div id="signalPanel">
+                        <div class="empty-state">
+                            <div class="empty-state-icon">📊</div>
+                            <div class="empty-state-text">Click Analyze to generate a signal</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Indicators + Active Signals -->
+            <div class="grid-2">
+                <!-- Technical Indicators -->
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title">Technical Indicators</span>
+                    </div>
+                    <div id="indicatorsPanel">
+                        <div class="empty-state" style="padding: 20px;">
+                            <div class="empty-state-text">No data yet</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Active Signals -->
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title">Active Signals</span>
+                        <button class="btn btn-secondary" style="font-size:11px; padding:4px 8px;" onclick="loadActiveSignals()">Refresh</button>
+                    </div>
+                    <div id="activeSignalsPanel">
+                        <div class="empty-state" style="padding: 20px;">
+                            <div class="empty-state-text">No active signals</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+    </main>
+</div>
+
+<script src="/assets/app.js"></script>
+<script>
+let selectedSymbol = 'EURUSD=X';
+let selectedTf = 'H1';
+let chart = null;
+let candleSeries = null;
+let instruments = [];
+let priceWs = null;       // per-symbol WS for chart updates
+let allPricesWs = null;   // all-symbols WS for sidebar
+let liveCandle = null;
+const livePrices = {};    // symbol → {price, change}
+let calendarData = {};    // symbol → [{event_date, event_name, impact, ...}]
+
+// ── Initialize ────────────────────────────────────────────────────────────
+
+async function init() {
+    await checkHealth();
+    await loadInstruments();
+    loadCalendar();
+    initChart();
+    loadPriceData();
+    loadLatestSignal();
+    loadActiveSignals();
+    connectPriceWs(selectedSymbol);
+    connectAllPricesWs();
+    setInterval(loadActiveSignals, 30000);
+    setInterval(checkHealth, 30000);
+    setInterval(loadLatestSignal, 60000);
+    setInterval(loadCalendar, 5 * 60 * 1000);   // refresh calendar every 5 min
+    setInterval(rerenderCalendarBadges, 60000);  // update countdowns every minute
+}
+
+// ── Economic Calendar ──────────────────────────────────────────────────────
+
+async function loadCalendar() {
+    try {
+        const resp = await fetch('/api/calendar/upcoming?days=7');
+        if (!resp.ok) return;
+        calendarData = await resp.json();
+        rerenderCalendarBadges();
+    } catch (e) {}
+}
+
+function rerenderCalendarBadges() {
+    // Re-render all badge elements in place (no full sidebar repaint)
+    document.querySelectorAll('[data-cal-symbol]').forEach(wrap => {
+        const symbol = wrap.dataset.calSymbol;
+        const badge = buildCalBadge(symbol);
+        wrap.innerHTML = badge;
+    });
+}
+
+function getNextEvents(symbol) {
+    const events = (calendarData[symbol] || []).filter(ev => {
+        return new Date(ev.event_date) > new Date();
+    });
+    if (!events.length) return null;
+    // Sort ascending
+    events.sort((a, b) => new Date(a.event_date) - new Date(b.event_date));
+    // Find the earliest event
+    const earliest = new Date(events[0].event_date);
+    // Group all events at the same minute as earliest
+    const sameTime = events.filter(ev =>
+        Math.abs(new Date(ev.event_date) - earliest) < 60000
+    );
+    return { date: earliest, events: sameTime };
+}
+
+function formatCalTime(eventDate) {
+    const now = new Date();
+    const diffMs = eventDate - now;
+    const diffMin = Math.round(diffMs / 60000);
+
+    if (diffMin < 0) return null;
+    if (diffMin < 60) return `${diffMin}m`;
+    if (diffMin < 1440) { // within 24h
+        const h = Math.floor(diffMin / 60);
+        const m = diffMin % 60;
+        return m > 0 ? `${h}h ${m}m` : `${h}h`;
+    }
+    // more than 24h — show date
+    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    return `${months[eventDate.getUTCMonth()]} ${eventDate.getUTCDate()}`;
+}
+
+function buildCalBadge(symbol) {
+    const next = getNextEvents(symbol);
+    if (!next) return '';
+    const timeStr = formatCalTime(next.date);
+    if (!timeStr) return '';
+
+    // Determine highest impact
+    const impacts = next.events.map(e => e.impact);
+    const topImpact = impacts.includes('high') ? 'high' :
+                      impacts.includes('medium') ? 'medium' : 'low';
+
+    // Build tooltip content (escaped)
+    const tooltipEvents = next.events.map(ev => {
+        const prev = ev.previous !== null && ev.previous !== undefined ? `Prev: ${ev.previous}${ev.unit || ''}` : '';
+        const est  = ev.estimate !== null && ev.estimate !== undefined ? `Est: ${ev.estimate}${ev.unit || ''}` : '';
+        const meta = [prev, est].filter(Boolean).join(' · ');
+        return { name: ev.event_name, country: ev.country, impact: ev.impact, meta };
+    });
+
+    const dataAttr = encodeURIComponent(JSON.stringify({
+        time: next.date.toISOString(),
+        events: tooltipEvents,
+    }));
+
+    return `<span class="cal-badge cal-${topImpact}" data-calinfo="${dataAttr}" onmouseenter="showCalTooltip(this,event)" onmouseleave="hideCalTooltip()">${timeStr}</span>`;
+}
+
+// Global tooltip element (created once)
+let _calTooltip = null;
+
+function getCalTooltip() {
+    if (!_calTooltip) {
+        _calTooltip = document.createElement('div');
+        _calTooltip.className = 'cal-tooltip';
+        document.body.appendChild(_calTooltip);
+    }
+    return _calTooltip;
+}
+
+function showCalTooltip(badgeEl, mouseEvent) {
+    try {
+        const info = JSON.parse(decodeURIComponent(badgeEl.dataset.calinfo));
+        const tip = getCalTooltip();
+
+        // Format date/time header
+        const dt = new Date(info.time);
+        const timeLabel = dt.toUTCString().replace(' GMT', ' UTC').slice(5, 22);
+
+        let html = `<div class="cal-tooltip-title">${timeLabel}</div>`;
+        info.events.forEach(ev => {
+            html += `<div class="cal-tooltip-event">
+                <div class="cal-tooltip-event-name">
+                    <span class="cal-impact-dot ${ev.impact}"></span>${ev.name}
+                </div>`;
+            if (ev.meta) {
+                html += `<div class="cal-tooltip-event-meta">${ev.country} · ${ev.meta}</div>`;
+            } else {
+                html += `<div class="cal-tooltip-event-meta">${ev.country}</div>`;
+            }
+            html += `</div>`;
+        });
+
+        tip.innerHTML = html;
+        positionCalTooltip(tip, mouseEvent);
+        tip.classList.add('visible');
+    } catch (e) {}
+}
+
+function positionCalTooltip(tip, mouseEvent) {
+    tip.style.display = 'block';
+    const tw = tip.offsetWidth || 240;
+    const th = tip.offsetHeight || 80;
+    let x = mouseEvent.clientX + 12;
+    let y = mouseEvent.clientY + 8;
+    if (x + tw > window.innerWidth - 8) x = mouseEvent.clientX - tw - 12;
+    if (y + th > window.innerHeight - 8) y = mouseEvent.clientY - th - 8;
+    tip.style.left = x + 'px';
+    tip.style.top  = y + 'px';
+}
+
+function hideCalTooltip() {
+    const tip = getCalTooltip();
+    tip.classList.remove('visible');
+}
+
+// ── All-symbols price WebSocket (sidebar) ─────────────────────────────────
+
+function connectAllPricesWs() {
+    const wsUrl = `ws://${location.host}/ws/prices`;
+    const ws = new WebSocket(wsUrl);
+    allPricesWs = ws;
+
+    ws.onmessage = (event) => {
+        try {
+            const msg = JSON.parse(event.data);
+            if (msg.type === 'tick' && msg.symbol && msg.price) {
+                const prev = livePrices[msg.symbol]?.price;
+                livePrices[msg.symbol] = { price: msg.price, prev };
+                updateSidebarPrice(msg.symbol, msg.price, prev);
+                // также обновляем chart если это текущий инструмент
+                if (msg.symbol === selectedSymbol) updateLivePrice(msg.price);
+            }
+        } catch (e) {}
+    };
+
+    ws.onclose = () => {
+        if (!ws._intentional) setTimeout(connectAllPricesWs, 3000);
+    };
+    ws.onerror = () => {};
+}
+
+function updateSidebarPrice(symbol, price, prevPrice) {
+    const el = document.querySelector(`[data-price-symbol="${symbol}"]`);
+    if (!el) return;
+    const dec = getPriceDecimals(symbol, price);
+    el.textContent = parseFloat(price).toFixed(dec);
+    if (prevPrice !== undefined && prevPrice !== null) {
+        el.style.color = price >= prevPrice ? 'var(--accent-green)' : 'var(--accent-red)';
+    }
+}
+
+// ── Real-time price WebSocket (chart) ─────────────────────────────────────
+
+function connectPriceWs(symbol) {
+    if (priceWs) {
+        priceWs._intentional = true;
+        priceWs.close();
+        priceWs = null;
+    }
+    const wsUrl = `ws://${location.host}/ws/prices/${encodeURIComponent(symbol)}`;
+    const ws = new WebSocket(wsUrl);
+    priceWs = ws;
+
+    ws.onopen = () => {
+        document.getElementById('statusDot').style.background = 'var(--accent-green)';
+    };
+
+    ws.onmessage = (event) => {
+        try {
+            const msg = JSON.parse(event.data);
+            // chart candle update only — price/sidebar handled by allPricesWs
+            if (msg.type === 'tick' && msg.symbol === selectedSymbol) {
+                updateLiveCandle(msg.price);
+            }
+        } catch (e) {}
+    };
+
+    ws.onclose = () => {
+        document.getElementById('statusDot').style.background = 'var(--text-secondary)';
+        if (!ws._intentional) {
+            setTimeout(() => {
+                if (!priceWs || priceWs === ws) connectPriceWs(selectedSymbol);
+            }, 3000);
+        }
+    };
+
+    ws.onerror = () => {
+        // onclose will fire after onerror and handle reconnect
+    };
+}
+
+function getCandleOpenTime(nowMs, timeframe) {
+    const d = new Date(nowMs);
+    switch (timeframe) {
+        case 'M15': {
+            const m = Math.floor(d.getMinutes() / 15) * 15;
+            d.setMinutes(m, 0, 0); break;
+        }
+        case 'H1':  d.setMinutes(0, 0, 0); break;
+        case 'H4':  d.setHours(Math.floor(d.getHours() / 4) * 4, 0, 0, 0); break;
+        case 'D1':  d.setHours(0, 0, 0, 0); break;
+        case 'W1':  d.setHours(0, 0, 0, 0); d.setDate(d.getDate() - d.getDay()); break;
+        case 'MN1': d.setHours(0, 0, 0, 0); d.setDate(1); break;
+        default:    d.setMinutes(0, 0, 0);
+    }
+    return d.getTime() / 1000;
+}
+
+function updateLiveCandle(price) {
+    if (!candleSeries) return;
+    const candleTime = getCandleOpenTime(Date.now(), selectedTf);
+
+    if (!liveCandle || liveCandle.time < candleTime) {
+        // Новая свеча
+        liveCandle = { time: candleTime, open: price, high: price, low: price, close: price };
+    } else {
+        // Обновляем текущую
+        liveCandle.close = price;
+        liveCandle.high  = Math.max(liveCandle.high, price);
+        liveCandle.low   = Math.min(liveCandle.low,  price);
+    }
+
+    candleSeries.update(liveCandle);
+}
+
+function updateLivePrice(price) {
+    const priceEl = document.getElementById('currentPrice');
+    const prevPrice = parseFloat(priceEl.dataset.raw || price);
+    priceEl.dataset.raw = price;
+    priceEl.textContent = formatPrice(price);
+
+    // Flash green/red on change
+    if (price > prevPrice) {
+        priceEl.style.color = 'var(--accent-green)';
+    } else if (price < prevPrice) {
+        priceEl.style.color = 'var(--accent-red)';
+    }
+    setTimeout(() => { priceEl.style.color = ''; }, 500);
+
+    // Обновляем свечу на графике
+    updateLiveCandle(price);
+
+    // Live dot в header
+    document.getElementById('statusDot').style.background = 'var(--accent-green)';
+    document.getElementById('statusLabel').textContent = `Live · ${new Date().toLocaleTimeString()}`;
+}
+
+// ── Instruments Sidebar ───────────────────────────────────────────────────
+
+async function loadInstruments() {
+    try {
+        instruments = await apiGet('/instruments');
+        renderSidebar(instruments);
+    } catch (e) {
+        console.error('Failed to load instruments:', e);
+    }
+}
+
+function renderSidebar(instruments) {
+    const groups = { forex: [], stocks: [], crypto: [] };
+    instruments.forEach(i => {
+        if (groups[i.market]) groups[i.market].push(i);
+    });
+
+    const titles = { forex: 'Forex', stocks: 'Stocks', crypto: 'Crypto' };
+    let html = '';
+
+    for (const [market, items] of Object.entries(groups)) {
+        if (!items.length) continue;
+        html += `<div class="sidebar-section">
+            <div class="sidebar-title">${titles[market]}</div>`;
+        items.forEach(i => {
+            const active = i.symbol === selectedSymbol ? 'active' : '';
+            const cached = livePrices[i.symbol];
+            const priceStr = cached ? parseFloat(cached.price).toFixed(getPriceDecimals(i.symbol, cached.price)) : '—';
+            const calBadge = buildCalBadge(i.symbol);
+            html += `<div class="instrument-item ${active}" onclick="selectInstrument('${i.symbol}', '${i.market}', '${i.name}')">
+                <div style="flex:1; min-width:0;">
+                    <div class="instrument-symbol">${i.name}</div>
+                    <div class="instrument-name">${i.symbol}</div>
+                </div>
+                <div style="display:flex; flex-direction:column; align-items:flex-end; gap:1px;">
+                    <div data-price-symbol="${i.symbol}" style="font-size:11px; font-family:monospace; font-weight:600; color:var(--text-secondary); white-space:nowrap;">${priceStr}</div>
+                    <div data-cal-symbol="${i.symbol}">${calBadge}</div>
+                </div>
+            </div>`;
+        });
+        html += `</div>`;
+    }
+
+    document.getElementById('instrumentList').innerHTML = html;
+}
+
+function selectInstrument(symbol, market, name) {
+    selectedSymbol = symbol;
+    document.getElementById('selectedSymbol').textContent = name;
+    document.getElementById('selectedMarket').textContent = market.charAt(0).toUpperCase() + market.slice(1);
+    document.getElementById('currentPrice').textContent = '—';
+    document.getElementById('priceChange').textContent = '';
+
+    // Update active state
+    document.querySelectorAll('.instrument-item').forEach(el => el.classList.remove('active'));
+    event.currentTarget.classList.add('active');
+
+    liveCandle = null;
+    loadPriceData();
+    loadLatestSignal();
+    connectPriceWs(symbol);
+}
+
+// ── Chart ─────────────────────────────────────────────────────────────────
+
+function initChart() {
+    const container = document.getElementById('chart');
+    chart = LightweightCharts.createChart(container, {
+        layout: {
+            background: { color: '#1c2128' },
+            textColor: '#8b949e',
+        },
+        grid: {
+            vertLines: { color: '#21262d' },
+            horzLines: { color: '#21262d' },
+        },
+        crosshair: {
+            mode: LightweightCharts.CrosshairMode.Normal,
+        },
+        rightPriceScale: {
+            borderColor: '#30363d',
+        },
+        timeScale: {
+            borderColor: '#30363d',
+            timeVisible: true,
+        },
+        width: container.clientWidth,
+        height: 340,
+    });
+
+    candleSeries = chart.addCandlestickSeries({
+        upColor: '#3fb950',
+        downColor: '#f85149',
+        borderUpColor: '#3fb950',
+        borderDownColor: '#f85149',
+        wickUpColor: '#3fb950',
+        wickDownColor: '#f85149',
+    });
+
+    window.addEventListener('resize', () => {
+        if (chart) chart.applyOptions({ width: container.clientWidth });
+    });
+
+    // Timeframe buttons
+    document.querySelectorAll('.tf-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.querySelectorAll('.tf-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            selectedTf = btn.dataset.tf;
+            liveCandle = null;
+            document.getElementById('chartTfLabel').textContent = selectedTf;
+            loadPriceData();
+            loadLatestSignal();
+        });
+    });
+}
+
+async function loadPriceData() {
+    try {
+        const data = await apiGet(`/prices/${encodeURIComponent(selectedSymbol)}`, { timeframe: selectedTf, limit: 200 });
+        if (!data || !data.length) {
+            clearChart();
+            return;
+        }
+
+        const candles = data.map(d => ({
+            time: new Date(d.timestamp).getTime() / 1000,
+            open: parseFloat(d.open),
+            high: parseFloat(d.high),
+            low: parseFloat(d.low),
+            close: parseFloat(d.close),
+        })).sort((a, b) => a.time - b.time);
+
+        // Настраиваем точность шкалы под инструмент
+        const lastClose = parseFloat(data[data.length - 1].close);
+        const dec = getPriceDecimals(selectedSymbol, lastClose);
+        const minMove = Math.pow(10, -dec);
+        candleSeries.applyOptions({
+            priceFormat: { type: 'price', precision: dec, minMove },
+        });
+
+        candleSeries.setData(candles);
+        chart.timeScale().fitContent();
+
+        // Инициализируем liveCandle из последней исторической свечи
+        if (candles.length) {
+            const last = candles[candles.length - 1];
+            liveCandle = { ...last };
+        }
+
+        // Update current price
+        const last = data[data.length - 1];
+        const prev = data.length > 1 ? data[data.length - 2] : null;
+        document.getElementById('currentPrice').textContent = formatPrice(last.close);
+
+        if (prev) {
+            const change = parseFloat(last.close) - parseFloat(prev.close);
+            const changePct = change / parseFloat(prev.close) * 100;
+            const el = document.getElementById('priceChange');
+            el.textContent = `${change >= 0 ? '+' : ''}${change.toFixed(dec)} (${changePct >= 0 ? '+' : ''}${changePct.toFixed(2)}%)`;
+            el.style.color = change >= 0 ? 'var(--accent-green)' : 'var(--accent-red)';
+        }
+    } catch (e) {
+        console.error('Failed to load price data:', e);
+    }
+}
+
+function clearChart() {
+    if (candleSeries) candleSeries.setData([]);
+}
+
+// ── Latest Signal (auto-load) ──────────────────────────────────────────────
+
+async function loadLatestSignal() {
+    // Запоминаем символ на момент запроса — за время запроса пользователь мог переключиться
+    const symbolAtRequest = selectedSymbol;
+    try {
+        // Без фильтра по таймфрейму — показываем самый свежий сигнал для инструмента
+        const signal = await apiGet(`/signals/latest/${encodeURIComponent(symbolAtRequest)}`, { timeframe: selectedTf });
+        // Если пока шёл запрос инструмент сменился — игнорируем ответ
+        if (symbolAtRequest !== selectedSymbol) return;
+        if (signal) {
+            renderSignalPanel(signal);
+            const age = Math.round((Date.now() - new Date(signal.created_at).getTime()) / 60000);
+            const ageLabel = age < 60 ? `${age}m ago` : `${Math.round(age / 60)}h ago`;
+            document.getElementById('signalCardTitle').innerHTML =
+                `Signal <span style="font-size:10px;font-weight:400;color:var(--text-secondary);">${signal.timeframe} · ${ageLabel}</span>`;
+        } else {
+            clearSignalPanel();
+            document.getElementById('signalCardTitle').textContent = 'Signal';
+        }
+    } catch (e) {
+        // Нет сигнала — ничего не делаем
+    }
+}
+
+// ── Analysis ──────────────────────────────────────────────────────────────
+
+async function runAnalysis() {
+    const btn = document.getElementById('analyzeBtn');
+    const spinner = document.getElementById('analyzeSpinner');
+    btn.disabled = true;
+    spinner.classList.add('active');
+
+    try {
+        const signal = await apiPost(`/analyze/${encodeURIComponent(selectedSymbol)}`, { timeframe: selectedTf });
+        renderSignalPanel(signal);
+        showToast(`Signal generated: ${signal.signal_strength}`, 'success');
+        loadActiveSignals();
+        loadLatestSignal();
+    } catch (e) {
+        showToast(`Analysis failed: ${e.message}`, 'error');
+        console.error('Analysis error:', e);
+    } finally {
+        btn.disabled = false;
+        spinner.classList.remove('active');
+    }
+}
+
+function clearSignalPanel() {
+    document.getElementById('signalCardTitle').textContent = 'Signal';
+    document.getElementById('signalBadge').className = 'signal-badge HOLD';
+    document.getElementById('signalBadge').textContent = 'HOLD';
+    document.getElementById('signalPanel').innerHTML = `
+        <div class="empty-state">
+            <div class="empty-state-icon">📊</div>
+            <div class="empty-state-text">Click Analyze to generate a signal</div>
+        </div>`;
+    document.getElementById('indicatorsPanel').innerHTML = `
+        <div class="empty-state" style="padding:20px;">
+            <div class="empty-state-text">No data yet</div>
+        </div>`;
+}
+
+function renderSignalPanel(signal) {
+    // Update badge
+    const badge = document.getElementById('signalBadge');
+    badge.className = `signal-badge ${signal.signal_strength}`;
+    badge.textContent = signal.signal_strength.replace('_', ' ');
+
+    // Direction color
+    const dirColor = signal.direction === 'LONG' ? 'var(--accent-green)' :
+                     signal.direction === 'SHORT' ? 'var(--accent-red)' : 'var(--text-muted)';
+    const dirSymbol = signal.direction === 'LONG' ? '▲' : signal.direction === 'SHORT' ? '▼' : '●';
+
+    const score = parseFloat(signal.composite_score);
+    const scoreColor = score > 0 ? 'var(--accent-green)' : score < 0 ? 'var(--accent-red)' : 'var(--text-muted)';
+    const pct = Math.min(Math.abs(score) / 2, 50);
+
+    document.getElementById('signalPanel').innerHTML = `
+        <div style="margin-bottom: 12px;">
+            <div style="display:flex; align-items:center; gap:12px; margin-bottom:8px;">
+                <div style="font-size:32px; font-weight:800; color:${dirColor};">${dirSymbol} ${signal.direction}</div>
+                <div>
+                    <div style="font-size:12px; color:var(--text-secondary);">Confidence</div>
+                    <div style="font-size:16px; font-weight:600;">${formatNumber(signal.confidence, 1)}%</div>
+                </div>
+                <div>
+                    <div style="font-size:12px; color:var(--text-secondary);">Horizon</div>
+                    <div style="font-size:13px; font-weight:500;">${signal.horizon || '—'}</div>
+                </div>
+            </div>
+            <div style="margin: 8px 0;">
+                <div style="font-size:11px; color:var(--text-secondary); margin-bottom:4px;">Composite Score</div>
+                <div style="display:flex; align-items:center; gap:8px;">
+                    <div style="flex:1; height:8px; background:var(--bg-tertiary); border-radius:4px; position:relative; overflow:hidden;">
+                        <div style="position:absolute; top:0; left:50%; height:100%; width:1px; background:var(--border);"></div>
+                        <div style="position:absolute; top:0; ${score >= 0 ? 'left:50%' : `right:50%`}; height:100%; width:${pct}%; background:${scoreColor}; border-radius:4px;"></div>
+                    </div>
+                    <div style="font-size:16px; font-weight:700; color:${scoreColor}; min-width:50px; text-align:right;">${score >= 0 ? '+' : ''}${score.toFixed(1)}</div>
+                </div>
+            </div>
+        </div>
+        <div class="signal-levels">
+            <div class="level-item entry">
+                <div class="level-label">Entry</div>
+                <div class="level-value">${formatPrice(signal.entry_price)}</div>
+            </div>
+            <div class="level-item sl">
+                <div class="level-label">Stop Loss</div>
+                <div class="level-value">${formatPrice(signal.stop_loss) || '—'}</div>
+            </div>
+            <div class="level-item tp">
+                <div class="level-label">TP1</div>
+                <div class="level-value">${formatPrice(signal.take_profit_1) || '—'}</div>
+            </div>
+            <div class="level-item tp">
+                <div class="level-label">TP2</div>
+                <div class="level-value">${formatPrice(signal.take_profit_2) || '—'}</div>
+            </div>
+            <div class="level-item">
+                <div class="level-label">R:R</div>
+                <div class="level-value">${signal.risk_reward ? '1:' + formatNumber(signal.risk_reward) : '—'}</div>
+            </div>
+            <div class="level-item">
+                <div class="level-label">Position</div>
+                <div class="level-value">${signal.position_size_pct ? formatNumber(signal.position_size_pct) + '%' : '—'}</div>
+            </div>
+        </div>
+    `;
+
+    // Claude AI analysis block
+    try {
+        const r = JSON.parse(signal.reasoning || '{}');
+        const llmScore = r.llm_score;
+        const llmBias = r.llm_bias;
+        const llmConf = r.llm_confidence;
+        const llmText = r.llm_reasoning;
+        const claudeFactors = (r.factors || []).filter(f => f.startsWith('Claude:'));
+
+        if (llmText || (llmScore !== undefined && llmScore !== 0)) {
+            const biasColor = llmBias === 'BULLISH' ? 'var(--accent-green)' :
+                              llmBias === 'BEARISH' ? 'var(--accent-red)' : 'var(--text-secondary)';
+            const biasIcon = llmBias === 'BULLISH' ? '▲' : llmBias === 'BEARISH' ? '▼' : '●';
+            const llmScoreColor = llmScore > 0 ? 'var(--accent-green)' : llmScore < 0 ? 'var(--accent-red)' : 'var(--text-secondary)';
+
+            const factorsHtml = claudeFactors.length
+                ? `<ul style="margin:6px 0 0 0; padding-left:16px; font-size:11px; color:var(--text-secondary);">
+                    ${claudeFactors.map(f => `<li>${f.replace('Claude: ', '')}</li>`).join('')}
+                   </ul>`
+                : '';
+
+            const llmBlock = `
+                <div style="margin-top:12px; padding:10px; background:rgba(88,166,255,0.06); border:1px solid rgba(88,166,255,0.15); border-radius:8px;">
+                    <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">
+                        <span style="font-size:11px; font-weight:600; color:var(--accent-blue); letter-spacing:0.5px;">✦ CLAUDE AI</span>
+                        <span style="color:${biasColor}; font-size:12px; font-weight:700;">${biasIcon} ${llmBias || '—'}</span>
+                        ${llmScore !== undefined ? `<span style="color:${llmScoreColor}; font-size:12px; font-weight:600; margin-left:auto;">${llmScore >= 0 ? '+' : ''}${parseFloat(llmScore).toFixed(1)}</span>` : ''}
+                        ${llmConf ? `<span style="font-size:11px; color:var(--text-secondary);">${parseFloat(llmConf).toFixed(0)}% conf</span>` : ''}
+                    </div>
+                    ${llmText ? `<div style="font-size:11px; color:var(--text-secondary); line-height:1.5;">${llmText}</div>` : ''}
+                    ${factorsHtml}
+                </div>`;
+
+            document.getElementById('signalPanel').insertAdjacentHTML('beforeend', llmBlock);
+        }
+    } catch (e) {}
+
+    // Render indicators snapshot
+    try {
+        const snap = JSON.parse(signal.indicators_snapshot || '{}');
+        renderIndicatorsPanel(snap, signal);
+    } catch (e) {}
+}
+
+function renderIndicatorsPanel(indicators, signal) {
+    const items = [
+        { name: 'RSI (14)', value: formatNumber(indicators.rsi, 1), signal: indicators.rsi ? (indicators.rsi > 70 ? 'SELL' : indicators.rsi < 30 ? 'BUY' : 'NEUTRAL') : 'NEUTRAL' },
+        { name: 'MACD', value: formatNumber(indicators.macd, 5), signal: indicators.macd_hist ? (indicators.macd_hist > 0 ? 'BUY' : 'SELL') : 'NEUTRAL' },
+        { name: 'BB Position', value: indicators.bb_middle ? formatPrice(indicators.current_price) : '—', signal: 'NEUTRAL' },
+        { name: 'SMA 20', value: formatPrice(indicators.sma20), signal: indicators.current_price && indicators.sma20 ? (indicators.current_price > indicators.sma20 ? 'BUY' : 'SELL') : 'NEUTRAL' },
+        { name: 'SMA 50', value: formatPrice(indicators.sma50), signal: indicators.current_price && indicators.sma50 ? (indicators.current_price > indicators.sma50 ? 'BUY' : 'SELL') : 'NEUTRAL' },
+        { name: 'SMA 200', value: formatPrice(indicators.sma200), signal: indicators.current_price && indicators.sma200 ? (indicators.current_price > indicators.sma200 ? 'BUY' : 'SELL') : 'NEUTRAL' },
+        { name: 'ADX (14)', value: formatNumber(indicators.adx, 1), signal: indicators.adx ? (indicators.adx > 25 ? 'BUY' : 'NEUTRAL') : 'NEUTRAL' },
+        { name: 'ATR (14)', value: formatPrice(indicators.atr), signal: 'NEUTRAL' },
+        { name: 'Stoch %K', value: formatNumber(indicators.stoch_k, 1), signal: indicators.stoch_k ? (indicators.stoch_k > 80 ? 'SELL' : indicators.stoch_k < 20 ? 'BUY' : 'NEUTRAL') : 'NEUTRAL' },
+    ];
+
+    const scoresHtml = `
+        <div style="margin-bottom:12px;">
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:4px 12px; font-size:11px;">
+                <div style="color:var(--text-secondary);">TA Score: <span style="color:var(--text-primary); font-weight:600;">${formatScore(signal.ta_score)}</span></div>
+                <div style="color:var(--text-secondary);">FA Score: <span style="color:var(--text-primary); font-weight:600;">${formatScore(signal.fa_score)}</span></div>
+                <div style="color:var(--text-secondary);">Sentiment: <span style="color:var(--text-primary); font-weight:600;">${formatScore(signal.sentiment_score)}</span></div>
+                <div style="color:var(--text-secondary);">Geo Score: <span style="color:var(--text-primary); font-weight:600;">${formatScore(signal.geo_score)}</span></div>
+            </div>
+        </div>`;
+
+    const indicatorsHtml = items.map(item => `
+        <div class="indicator-item">
+            <span class="indicator-name">${item.name}</span>
+            <div style="display:flex; align-items:center; gap:8px;">
+                <span class="indicator-value mono" style="font-size:11px;">${item.value}</span>
+                <span class="indicator-signal ${item.signal}">${item.signal}</span>
+            </div>
+        </div>`).join('');
+
+    document.getElementById('indicatorsPanel').innerHTML = scoresHtml + indicatorsHtml;
+}
+
+// ── Active Signals ─────────────────────────────────────────────────────────
+
+async function loadActiveSignals() {
+    try {
+        const signals = await apiGet('/signals/active');
+        renderActiveSignals(signals);
+    } catch (e) {
+        console.error('Failed to load active signals:', e);
+    }
+}
+
+function renderActiveSignals(signals) {
+    const container = document.getElementById('activeSignalsPanel');
+    if (!signals || !signals.length) {
+        container.innerHTML = `<div class="empty-state" style="padding:20px;"><div class="empty-state-text">No active signals</div></div>`;
+        return;
+    }
+
+    const rows = signals.map(s => {
+        const instr = instruments.find(i => i.id === s.instrument_id);
+        const name = instr ? instr.name : `#${s.instrument_id}`;
+        const dirColor = s.direction === 'LONG' ? 'var(--accent-green)' : s.direction === 'SHORT' ? 'var(--accent-red)' : 'var(--text-muted)';
+        const score = parseFloat(s.composite_score);
+
+        return `<tr>
+            <td>
+                <div style="font-weight:600;">${name}</div>
+                <div style="font-size:11px; color:var(--text-secondary);">${s.timeframe}</div>
+            </td>
+            <td><span class="signal-badge ${s.signal_strength}" style="font-size:10px;">${s.signal_strength.replace('_',' ')}</span></td>
+            <td style="color:${dirColor}; font-weight:600;">${s.direction}</td>
+            <td style="font-family:monospace; font-size:12px;">${formatPrice(s.entry_price)}</td>
+            <td style="color:${score >= 0 ? 'var(--accent-green)' : 'var(--accent-red)'}; font-weight:600;">${score >= 0 ? '+' : ''}${score.toFixed(1)}</td>
+            <td>${statusBadge(s.status)}</td>
+        </tr>`;
+    }).join('');
+
+    container.innerHTML = `
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Instrument</th>
+                    <th>Signal</th>
+                    <th>Dir</th>
+                    <th>Entry</th>
+                    <th>Score</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+        </table>`;
+}
+
+// ── Start ─────────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', init);
+</script>
+</body>
+</html>

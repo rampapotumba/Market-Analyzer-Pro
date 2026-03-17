@@ -1,0 +1,549 @@
+"""Signal Engine: orchestrates all analysis engines to generate trading signals."""
+
+import datetime
+import json
+import logging
+from decimal import Decimal
+from typing import Any, Optional
+
+import pandas as pd
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.analysis.correlation_engine import CorrelationEngine
+from src.analysis.fa_engine import FAEngine
+from src.analysis.geo_engine import GeoEngine
+from src.analysis.llm_engine import LLMEngine
+from src.analysis.sentiment_engine import SentimentEngine
+from src.analysis.ta_engine import TAEngine
+from src.config import settings
+from src.database.crud import (
+    cancel_open_signals,
+    create_signal,
+    get_all_instruments,
+    get_instrument_by_symbol,
+    get_latest_signal_for_instrument,
+    get_macro_data,
+    get_news_events,
+    get_price_data,
+)
+from src.database.models import Instrument, Signal
+from src.notifications.telegram import telegram
+from src.signals.mtf_filter import MTFFilter
+from src.signals.risk_manager import RiskManager
+
+logger = logging.getLogger(__name__)
+
+# LLM call threshold: only invoke Claude if pre-LLM composite score exceeds this
+LLM_SCORE_THRESHOLD = 25.0
+
+# In-memory LLM result cache: key = (symbol, timeframe), value = (score, meta, expires_at)
+_llm_cache: dict[tuple[str, str], tuple[float, dict, datetime.datetime]] = {}
+LLM_CACHE_TTL_MINUTES = 30
+
+# Signal cooldown per timeframe (minutes) — A. Cooldown
+SIGNAL_COOLDOWN_MINUTES: dict[str, int] = {
+    "M1": 1, "M5": 5, "M15": 15,
+    "H1": 60, "H4": 240, "D1": 1440, "W1": 10080, "MN1": 43200,
+}
+
+# Minimum price change as fraction of ATR to trigger new signal — B. Price-change trigger
+ATR_PRICE_CHANGE_FACTOR = 0.3
+
+# In-memory caches for cooldown and price-change checks (key = (instrument_id, timeframe))
+_cooldown_cache: dict[tuple[int, str], datetime.datetime] = {}
+_last_signal_price_cache: dict[tuple[int, str], float] = {}
+
+
+def _get_cached_llm(symbol: str, timeframe: str) -> Optional[tuple[float, dict]]:
+    key = (symbol, timeframe)
+    if key in _llm_cache:
+        score, meta, expires_at = _llm_cache[key]
+        if datetime.datetime.now(datetime.timezone.utc) < expires_at:
+            return score, meta
+        del _llm_cache[key]
+    return None
+
+
+def _set_cached_llm(symbol: str, timeframe: str, score: float, meta: dict) -> None:
+    expires_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=LLM_CACHE_TTL_MINUTES)
+    _llm_cache[(symbol, timeframe)] = (score, meta, expires_at)
+
+
+def _refine_entry_point(
+    direction: str,
+    current_price: Decimal,
+    ta_indicators: dict,
+    atr: Optional[Decimal],
+) -> Decimal:
+    """
+    Refine entry point using Fibonacci, Order Blocks, FVG, and VPOC.
+    Returns a potentially better entry price (or current_price if no better level found).
+
+    Strategy:
+    - LONG: look for entry at nearest support (Fib 0.618, bull OB top, VPOC, PDL+buffer)
+    - SHORT: look for entry at nearest resistance (Fib 0.382, bear OB bottom, VPOC, PDH-buffer)
+    - Only use refined entry if it's within 1×ATR of current price (reachable)
+    - If no good level found, return current_price (market entry)
+    """
+    if atr is None or atr == Decimal("0"):
+        return current_price
+
+    price = float(current_price)
+    atr_f = float(atr)
+    candidates = []
+
+    if direction == "LONG":
+        # Fibonacci 0.618 retracement (support)
+        fib618 = ta_indicators.get("fib_618")
+        if fib618 and fib618 < price and price - fib618 <= 2 * atr_f:
+            candidates.append(fib618)
+
+        # Bullish Order Block top (entry on retest)
+        bull_ob_high = ta_indicators.get("bull_ob_high")
+        if bull_ob_high and bull_ob_high < price and price - bull_ob_high <= 2 * atr_f:
+            candidates.append(bull_ob_high)
+
+        # VPOC (volume point of control — price magnet)
+        vpoc = ta_indicators.get("vpoc")
+        if vpoc and vpoc < price and price - vpoc <= atr_f:
+            candidates.append(vpoc)
+
+        # PDL + small buffer
+        pdl = ta_indicators.get("pdl")
+        if pdl and pdl > 0 and pdl < price and price - pdl <= 1.5 * atr_f:
+            candidates.append(pdl + atr_f * 0.1)  # slight buffer above PDL
+
+        # Choose the highest candidate (closest to current price from below)
+        if candidates:
+            best = max(candidates)
+            if best < price:  # sanity check
+                return Decimal(str(round(best, 8)))
+
+    elif direction == "SHORT":
+        # Fibonacci 0.382 retracement (resistance)
+        fib382 = ta_indicators.get("fib_382")
+        if fib382 and fib382 > price and fib382 - price <= 2 * atr_f:
+            candidates.append(fib382)
+
+        # Bearish Order Block bottom (entry on retest)
+        bear_ob_low = ta_indicators.get("bear_ob_low")
+        if bear_ob_low and bear_ob_low > price and bear_ob_low - price <= 2 * atr_f:
+            candidates.append(bear_ob_low)
+
+        # VPOC
+        vpoc = ta_indicators.get("vpoc")
+        if vpoc and vpoc > price and vpoc - price <= atr_f:
+            candidates.append(vpoc)
+
+        # PDH - small buffer
+        pdh = ta_indicators.get("pdh")
+        if pdh and pdh > 0 and pdh > price and pdh - price <= 1.5 * atr_f:
+            candidates.append(pdh - atr_f * 0.1)
+
+        # Choose the lowest candidate (closest to current price from above)
+        if candidates:
+            best = min(candidates)
+            if best > price:
+                return Decimal(str(round(best, 8)))
+
+    return current_price
+
+
+def _determine_direction(score: float) -> str:
+    """Determine signal direction from composite score."""
+    if score >= settings.STRONG_BUY_THRESHOLD or score >= settings.BUY_THRESHOLD:
+        return "LONG"
+    elif score <= settings.STRONG_SELL_THRESHOLD or score <= settings.SELL_THRESHOLD:
+        return "SHORT"
+    else:
+        return "HOLD"
+
+
+def _determine_signal_strength(score: float) -> str:
+    """Determine signal strength label from composite score."""
+    if score >= settings.STRONG_BUY_THRESHOLD:
+        return "STRONG_BUY"
+    elif score >= settings.BUY_THRESHOLD:
+        return "BUY"
+    elif score <= settings.STRONG_SELL_THRESHOLD:
+        return "STRONG_SELL"
+    elif score <= settings.SELL_THRESHOLD:
+        return "SELL"
+    else:
+        return "HOLD"
+
+
+def _price_data_to_df(price_records: list) -> Optional[pd.DataFrame]:
+    """Convert price_data DB records to OHLCV DataFrame."""
+    if not price_records:
+        return None
+
+    rows = []
+    for p in price_records:
+        rows.append({
+            "open": float(p.open),
+            "high": float(p.high),
+            "low": float(p.low),
+            "close": float(p.close),
+            "volume": float(p.volume),
+        })
+    idx = [p.timestamp for p in price_records]
+    df = pd.DataFrame(rows, index=pd.DatetimeIndex(idx))
+    return df
+
+
+class SignalEngine:
+    """
+    Main signal generation engine.
+    Orchestrates TA, FA, Sentiment, Geo analysis and produces trading signals.
+    """
+
+    def __init__(self) -> None:
+        self.risk_manager = RiskManager()
+        self.mtf_filter = MTFFilter()
+
+    async def generate_signal(
+        self,
+        instrument: Instrument,
+        timeframe: str,
+        db: AsyncSession,
+        higher_tf_signals: Optional[list[dict[str, Any]]] = None,
+    ) -> Optional[Signal]:
+        """
+        Generate a trading signal for an instrument/timeframe combination.
+
+        Steps:
+            1. Fetch price data from DB
+            2. Run TAEngine
+            3. Run FAEngine (with macro/news data)
+            4. Run SentimentEngine
+            5. Run GeoEngine
+            6. Get timeframe-specific weights
+            7. Calculate composite_score
+            8. Determine direction and signal_strength
+            9. Calculate entry_price, SL, TP via RiskManager
+            10. Apply MTF filter
+            11. Save to DB and return
+        """
+        # A. Check signal cooldown before doing any heavy computation
+        cooldown_key = (instrument.id, timeframe)
+        cooldown_minutes = SIGNAL_COOLDOWN_MINUTES.get(timeframe, 60)
+        now = datetime.datetime.now(datetime.timezone.utc)
+
+        last_signal_time = _cooldown_cache.get(cooldown_key)
+        if last_signal_time is None:
+            # On startup, fall back to DB to seed the in-memory cache
+            last_sig = await get_latest_signal_for_instrument(db, instrument.id, timeframe)
+            if last_sig:
+                last_signal_time = last_sig.created_at
+                # SQLite returns naive datetimes — make UTC-aware
+                if last_signal_time.tzinfo is None:
+                    last_signal_time = last_signal_time.replace(tzinfo=datetime.timezone.utc)
+                _cooldown_cache[cooldown_key] = last_signal_time
+
+        if last_signal_time:
+            elapsed_minutes = (now - last_signal_time).total_seconds() / 60
+            if elapsed_minutes < cooldown_minutes:
+                logger.debug(
+                    f"[SignalEngine] Cooldown for {instrument.symbol}/{timeframe}: "
+                    f"{elapsed_minutes:.0f}/{cooldown_minutes} min elapsed — skipping"
+                )
+                return None
+
+        # 1. Fetch price data
+        price_records = await get_price_data(db, instrument.id, timeframe, limit=300)
+        if len(price_records) < 30:
+            logger.warning(
+                f"[SignalEngine] Insufficient data for {instrument.symbol}/{timeframe}: "
+                f"{len(price_records)} records (need ≥30)"
+            )
+            return None
+
+        df = _price_data_to_df(price_records)
+        if df is None or df.empty:
+            logger.warning(f"[SignalEngine] Empty DataFrame for {instrument.symbol}")
+            return None
+
+        # 2. Run TA Engine
+        try:
+            ta_engine = TAEngine(df)
+            ta_score = ta_engine.calculate_ta_score()
+            ta_indicators = ta_engine.calculate_all_indicators()
+            atr = ta_engine.get_atr(14)
+        except Exception as exc:
+            logger.error(f"[SignalEngine] TA engine error for {instrument.symbol}: {exc}")
+            ta_score = 0.0
+            ta_indicators = {}
+            atr = None
+
+        # B. Price-change trigger: skip if price hasn't moved enough since last signal
+        current_close = float(df["close"].iloc[-1])
+        last_price = _last_signal_price_cache.get(cooldown_key)
+        if last_price is not None and atr is not None and atr > Decimal("0"):
+            price_change = abs(current_close - last_price)
+            atr_threshold = float(atr) * ATR_PRICE_CHANGE_FACTOR
+            if price_change < atr_threshold:
+                logger.debug(
+                    f"[SignalEngine] Price change too small for {instrument.symbol}/{timeframe}: "
+                    f"{price_change:.6f} < {atr_threshold:.6f} (0.3×ATR) — skipping"
+                )
+                return None
+
+        # 3. Fetch macro and news data
+        macro_records = await get_macro_data(db, limit=50)
+        news_records = await get_news_events(db, limit=30)
+
+        # Economic calendar blocking disabled (Finnhub requires paid plan)
+        calendar_block = False
+
+        # 4. Run FA Engine
+        try:
+            fa_engine = FAEngine(instrument, macro_records, news_records)
+            fa_score = fa_engine.calculate_fa_score()
+        except Exception as exc:
+            logger.error(f"[SignalEngine] FA engine error: {exc}")
+            fa_score = 0.0
+
+        # 5. Run Sentiment Engine
+        try:
+            sent_engine = SentimentEngine(news_records)
+            sentiment_score = sent_engine.calculate_sentiment_score()
+        except Exception as exc:
+            logger.error(f"[SignalEngine] Sentiment engine error: {exc}")
+            sentiment_score = 0.0
+
+        # 6. Run Geo Engine
+        try:
+            geo_engine = GeoEngine(instrument)
+            geo_score = geo_engine.calculate_geo_score()
+        except Exception as exc:
+            logger.error(f"[SignalEngine] Geo engine error: {exc}")
+            geo_score = 0.0
+
+        # Run Correlation Engine (DXY, VIX, TNX)
+        try:
+            corr_engine = CorrelationEngine(instrument, macro_records)
+            correlation_score = corr_engine.calculate_correlation_score()
+        except Exception as exc:
+            logger.error(f"[SignalEngine] Correlation engine error: {exc}")
+            correlation_score = 0.0
+
+        # 7. Run LLM Engine (Claude API analysis)
+        # Pre-check: calculate preliminary score without LLM to avoid wasting API calls
+        weights = self.mtf_filter.get_timeframe_weights(timeframe)
+        pre_score = abs(
+            weights["ta"] * ta_score
+            + weights["fa"] * fa_score
+            + weights["sentiment"] * sentiment_score
+            + weights["geo"] * geo_score
+        )
+
+        llm_score, llm_meta = 0.0, {}
+        cached = _get_cached_llm(instrument.symbol, timeframe)
+        if cached:
+            llm_score, llm_meta = cached
+            logger.debug(f"[SignalEngine] LLM cache hit for {instrument.symbol}/{timeframe}")
+        elif pre_score >= LLM_SCORE_THRESHOLD:
+            llm_engine = LLMEngine()
+            try:
+                llm_score, llm_meta = await llm_engine.calculate_llm_score(
+                    instrument, timeframe,
+                    ta_score, fa_score, sentiment_score, geo_score,
+                    ta_indicators, macro_records, news_records,
+                )
+                _set_cached_llm(instrument.symbol, timeframe, llm_score, llm_meta)
+            except Exception as exc:
+                logger.warning(f"[SignalEngine] LLM engine error: {exc}")
+        else:
+            logger.debug(
+                f"[SignalEngine] Skipping LLM for {instrument.symbol}/{timeframe} "
+                f"(pre_score={pre_score:.1f} < {LLM_SCORE_THRESHOLD})"
+            )
+
+        # 8. Calculate composite score
+        composite_score = (
+            weights["ta"] * ta_score
+            + weights["fa"] * fa_score
+            + weights["sentiment"] * sentiment_score
+            + weights["geo"] * geo_score
+        )
+        # Add correlation score as additive factor (5%)
+        composite_score += 0.05 * correlation_score
+        composite_score = max(-100.0, min(100.0, composite_score))
+
+        # LLM as verifier: confirms or contradicts the composite direction
+        if llm_score != 0.0:
+            if llm_score * composite_score < 0:
+                # LLM disagrees — reduce confidence
+                composite_score *= 0.7
+                logger.debug(
+                    f"[SignalEngine] LLM contradicts signal for {instrument.symbol}/{timeframe} "
+                    f"(llm={llm_score:+.1f}, composite={composite_score:+.1f}) — penalty ×0.7"
+                )
+            else:
+                # LLM agrees — boost confidence, capped at 100
+                composite_score = max(-100.0, min(100.0, composite_score * 1.1))
+                logger.debug(
+                    f"[SignalEngine] LLM confirms signal for {instrument.symbol}/{timeframe} "
+                    f"(llm={llm_score:+.1f}) — boost ×1.1"
+                )
+
+        # Apply calendar block: reduce composite score by 30% but don't skip signal
+        if calendar_block:
+            composite_score *= 0.7
+
+        # 9. Apply MTF filter
+        if higher_tf_signals:
+            composite_score = self.mtf_filter.apply(
+                composite_score, timeframe, higher_tf_signals
+            )
+
+        # 10. Determine direction and strength
+        direction = _determine_direction(composite_score)
+        signal_strength = _determine_signal_strength(composite_score)
+
+        # 11. Calculate entry, SL, TP
+        current_price = Decimal(str(ta_indicators.get("current_price", df["close"].iloc[-1])))
+        entry_price = _refine_entry_point(direction, current_price, ta_indicators, atr)
+        initial_status = "tracking" if entry_price == current_price else "created"
+
+        levels = {"stop_loss": None, "take_profit_1": None, "take_profit_2": None}
+        risk_reward = None
+        position_size_pct = None
+
+        if direction != "HOLD" and atr is not None and atr > Decimal("0"):
+            levels = self.risk_manager.calculate_levels(entry_price, atr, direction)
+            if levels["stop_loss"] and levels["take_profit_1"]:
+                risk_reward = self.risk_manager.calculate_risk_reward(
+                    entry_price, levels["stop_loss"], levels["take_profit_1"]
+                )
+                sl_distance = abs(entry_price - levels["stop_loss"])
+                if sl_distance > Decimal("0"):
+                    position_size_pct = self.risk_manager.calculate_position_size(
+                        Decimal("10000"),  # Default $10k account
+                        settings.MAX_RISK_PER_TRADE_PCT,
+                        sl_distance,
+                        entry_price,
+                    )
+
+        # 12. Calculate confidence (after entry refinement)
+        score_abs = abs(composite_score)
+        confidence = min(100.0, score_abs * 1.2)  # Scale up slightly
+
+        # 13. Build reasoning
+        reasoning = {
+            "ta_score": round(ta_score, 2),
+            "fa_score": round(fa_score, 2),
+            "sentiment_score": round(sentiment_score, 2),
+            "geo_score": round(geo_score, 2),
+            "correlation_score": round(correlation_score, 2),
+            "llm_score": round(llm_score, 2),
+            "llm_bias": llm_meta.get("bias", "N/A"),
+            "llm_confidence": llm_meta.get("confidence", 0.0),
+            "llm_reasoning": llm_meta.get("reasoning", ""),
+            "weights": weights,
+            "composite_raw": round(composite_score, 2),
+            "calendar_block": calendar_block,
+            "factors": [],
+        }
+
+        # Add key factors
+        if abs(ta_score) > 20:
+            reasoning["factors"].append(
+                f"TA: {'Strong bullish' if ta_score > 0 else 'Strong bearish'} signal ({ta_score:.1f})"
+            )
+        if abs(fa_score) > 20:
+            reasoning["factors"].append(
+                f"FA: {'Positive' if fa_score > 0 else 'Negative'} fundamentals ({fa_score:.1f})"
+            )
+        if abs(sentiment_score) > 20:
+            reasoning["factors"].append(
+                f"Sentiment: {'Bullish' if sentiment_score > 0 else 'Bearish'} news ({sentiment_score:.1f})"
+            )
+        if llm_meta.get("key_factors"):
+            reasoning["factors"].extend(
+                [f"Claude: {f}" for f in llm_meta["key_factors"][:3]]
+            )
+
+        # 14. Do not save HOLD signals — no trading action
+        if direction == "HOLD":
+            logger.debug(
+                f"[SignalEngine] HOLD signal for {instrument.symbol}/{timeframe} "
+                f"(score={composite_score:.1f}) — not saved"
+            )
+            return None
+
+        # 15. Cancel previous open signals for this instrument+timeframe
+        cancelled = await cancel_open_signals(db, instrument.id, timeframe)
+        if cancelled:
+            logger.debug(f"[SignalEngine] Cancelled {cancelled} old signal(s) for {instrument.symbol}/{timeframe}")
+
+        # 16. initial_status is set above during entry refinement:
+        # entry = current_price → "tracking" (market order executed immediately)
+        # entry ≠ current_price → "created" (waiting for limit entry to be reached)
+
+        horizon = self.mtf_filter.get_horizon(timeframe)
+        expires_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+            hours=settings.SIGNAL_EXPIRY_HOURS
+        )
+
+        signal_data = {
+            "instrument_id": instrument.id,
+            "timeframe": timeframe,
+            "direction": direction,
+            "signal_strength": signal_strength,
+            "entry_price": entry_price,
+            "stop_loss": levels.get("stop_loss"),
+            "take_profit_1": levels.get("take_profit_1"),
+            "take_profit_2": levels.get("take_profit_2"),
+            "risk_reward": risk_reward,
+            "position_size_pct": position_size_pct,
+            "composite_score": Decimal(str(round(composite_score, 4))),
+            "ta_score": Decimal(str(round(ta_score, 4))),
+            "fa_score": Decimal(str(round(fa_score, 4))),
+            "sentiment_score": Decimal(str(round(sentiment_score, 4))),
+            "geo_score": Decimal(str(round(geo_score, 4))),
+            "confidence": round(confidence, 2),
+            "horizon": horizon,
+            "reasoning": json.dumps(reasoning),
+            "indicators_snapshot": json.dumps({
+                k: round(float(v), 6) if isinstance(v, (float, Decimal)) else v
+                for k, v in ta_indicators.items()
+                if v is not None
+            }),
+            "status": initial_status,
+            "expires_at": expires_at,
+        }
+
+        async with db.begin_nested():
+            signal = await create_signal(db, signal_data)
+
+        # Update in-memory caches so cooldown and price-change checks work immediately
+        _cooldown_cache[cooldown_key] = now
+        _last_signal_price_cache[cooldown_key] = current_close
+
+        logger.info(
+            f"[SignalEngine] Generated signal for {instrument.symbol}/{timeframe}: "
+            f"{direction} (score={composite_score:.2f}, strength={signal_strength})"
+        )
+
+        # Send Telegram alert (non-blocking, errors silently logged)
+        try:
+            await telegram.send_signal_alert(signal, instrument.symbol, instrument.name)
+        except Exception as exc:
+            logger.warning(f"[SignalEngine] Telegram alert failed: {exc}")
+
+        return signal
+
+    async def generate_signal_by_symbol(
+        self,
+        symbol: str,
+        timeframe: str,
+        db: AsyncSession,
+    ) -> Optional[Signal]:
+        """Convenience method to generate signal by symbol string."""
+        instrument = await get_instrument_by_symbol(db, symbol)
+        if not instrument:
+            logger.error(f"[SignalEngine] Instrument not found: {symbol}")
+            return None
+        return await self.generate_signal(instrument, timeframe, db)
