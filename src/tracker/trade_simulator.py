@@ -6,7 +6,8 @@ Runs in background (no frontend required). Every minute:
   3. Delegates SL/TP checks to SignalTracker (with injected live price).
   4. Commits results to DB.
 
-Account: $1,000 virtual USD. P&L in USD = pnl_pct / 100 × 1000.
+Account size: configurable via VIRTUAL_ACCOUNT_SIZE_USD setting.
+P&L in USD (v2): account × (position_size_pct/100) × (pnl_pct/100)
 """
 
 import asyncio
@@ -82,11 +83,14 @@ async def _ccxt_price(symbol: str) -> Optional[Decimal]:
 # ── Position management ───────────────────────────────────────────────────────
 
 async def open_position_for_signal(signal, db) -> bool:
-    """Idempotently open a virtual portfolio position at signal entry price.
+    """Idempotently open a virtual portfolio position (fallback for tracking signals).
 
+    Applies spread adjustment and records entry_filled_at.
     Returns True if a new position was created.
     """
-    from src.database.crud import create_virtual_position, get_virtual_position
+    import datetime as _dt
+    from src.database.crud import create_virtual_position, get_instrument_by_id, get_virtual_position
+    from src.tracker.signal_tracker import _apply_spread
 
     try:
         if await get_virtual_position(db, signal.id) is not None:
@@ -94,15 +98,34 @@ async def open_position_for_signal(signal, db) -> bool:
         if signal.entry_price is None:
             return False
 
+        instrument = await get_instrument_by_id(db, signal.instrument_id)
+        market = instrument.market if instrument else "forex"
+        pip_size = instrument.pip_size if instrument else Decimal("0.0001")
+
+        # Apply spread (SIM-02)
+        actual_price = _apply_spread(signal.entry_price, signal.direction, market, pip_size)
+
+        size_pct = Decimal("2.0")
+        if signal.position_size_pct and signal.position_size_pct > 0:
+            size_pct = Decimal(str(signal.position_size_pct))
+
+        now = _dt.datetime.now(_dt.timezone.utc)
         await create_virtual_position(db, data={
-            "signal_id": signal.id,
-            "size_pct": Decimal("1.0"),
-            "entry_price": signal.entry_price,
-            "status": "open",
+            "signal_id":         signal.id,
+            "size_pct":          size_pct,
+            "entry_price":       actual_price,
+            "status":            "open",
+            "entry_filled_at":   now,
+            "current_stop_loss": signal.stop_loss,
+            "size_remaining_pct": Decimal("1.0"),
+            "mfe":               Decimal("0"),
+            "mae":               Decimal("0"),
+            "breakeven_moved":   False,
+            "partial_closed":    False,
         })
         logger.info(
             f"[Simulator] Opened #{signal.id}: {signal.direction} "
-            f"{signal.timeframe} @ {signal.entry_price}"
+            f"{signal.timeframe} @ {actual_price} (spread applied)"
         )
         return True
     except Exception as exc:
@@ -163,8 +186,13 @@ async def run_simulator_tick() -> None:
 
 # ── Stats helpers (used by API) ───────────────────────────────────────────────
 
-def pnl_usd(pnl_pct: Optional[float]) -> float:
-    """Convert pnl_percent (%) to USD assuming $1,000 account."""
+def pnl_usd(pnl_pct: Optional[float], position_size_pct: Optional[float] = None) -> float:
+    """Convert pnl_percent (%) to USD with position sizing (SIM-06).
+
+    v2: pnl_usd = account × (size_pct/100) × (pnl_pct/100)
+    v1 compat: if position_size_pct is None, uses 100% (old behaviour, overestimates).
+    """
     if pnl_pct is None:
         return 0.0
-    return round(float(pnl_pct) / 100.0 * ACCOUNT_SIZE_FLOAT, 2)
+    size = position_size_pct if (position_size_pct and position_size_pct > 0) else 100.0
+    return round(float(pnl_pct) / 100.0 * (size / 100.0) * ACCOUNT_SIZE_FLOAT, 2)

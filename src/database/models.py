@@ -153,6 +153,11 @@ class SignalResult(Base):
     price_at_expiry: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 8))
     duration_minutes: Mapped[Optional[int]] = mapped_column(Integer)
 
+    # v2 simulator fields (SIM-06, SIM-07)
+    pnl_usd: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 4))
+    partial_close_pnl_usd: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 4))
+    full_close_pnl_usd: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 4))
+
     signal: Mapped["Signal"] = relationship("Signal", back_populates="result")
 
 
@@ -432,6 +437,19 @@ class VirtualPortfolio(Base):
     unrealized_pnl_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
     realized_pnl_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
     status: Mapped[str] = mapped_column(String(16), default="open")  # open/closed/partial
+
+    # v2 simulator fields (SIM-01..SIM-07)
+    mfe: Mapped[Decimal] = mapped_column(Numeric(18, 8), default=Decimal("0"))
+    mae: Mapped[Decimal] = mapped_column(Numeric(18, 8), default=Decimal("0"))
+    breakeven_moved: Mapped[bool] = mapped_column(Boolean, default=False)
+    partial_closed: Mapped[bool] = mapped_column(Boolean, default=False)
+    trailing_stop: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 8))
+    current_stop_loss: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 8))
+    size_remaining_pct: Mapped[Decimal] = mapped_column(Numeric(8, 4), default=Decimal("1.0"))
+    partial_close_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 8))
+    partial_close_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True))
+    partial_pnl_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
+    entry_filled_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True))
 
 
 # ── Backtesting ───────────────────────────────────────────────────────────────

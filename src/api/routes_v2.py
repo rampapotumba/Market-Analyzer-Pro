@@ -728,37 +728,70 @@ async def simulator_stats(db: AsyncSession = Depends(get_session)):
     """Aggregate trade simulator statistics (based on $1,000 virtual account)."""
     from src.tracker.trade_simulator import ACCOUNT_SIZE_FLOAT, pnl_usd
 
-    # Closed trade results
-    total_q = await db.execute(select(func.count(SignalResult.id)))
+    # Closed trade results — exclude "cancelled" (SIM-03: no entry was filled)
+    _real_trades = SignalResult.exit_reason != "cancelled"
+
+    total_q = await db.execute(
+        select(func.count(SignalResult.id)).where(_real_trades)
+    )
     total = total_q.scalar() or 0
 
     wins_q = await db.execute(
-        select(func.count(SignalResult.id)).where(SignalResult.result == "win")
+        select(func.count(SignalResult.id))
+        .where(_real_trades, SignalResult.result == "win")
     )
     wins = wins_q.scalar() or 0
 
     losses_q = await db.execute(
-        select(func.count(SignalResult.id)).where(SignalResult.result == "loss")
+        select(func.count(SignalResult.id))
+        .where(_real_trades, SignalResult.result == "loss")
     )
     losses = losses_q.scalar() or 0
 
     breakevens_q = await db.execute(
-        select(func.count(SignalResult.id)).where(SignalResult.result == "breakeven")
+        select(func.count(SignalResult.id))
+        .where(_real_trades, SignalResult.result == "breakeven")
     )
     breakevens = breakevens_q.scalar() or 0
 
-    pnl_q = await db.execute(select(func.sum(SignalResult.pnl_percent)))
-    total_pnl_pct = float(pnl_q.scalar() or 0)
-
-    win_pnl_q = await db.execute(
-        select(func.avg(SignalResult.pnl_percent)).where(SignalResult.result == "win")
+    # P&L: use stored pnl_usd when available; fall back to pnl_pct-based computation
+    total_pnl_usd_q = await db.execute(
+        select(func.sum(SignalResult.pnl_usd)).where(_real_trades)
     )
-    avg_win_pct = float(win_pnl_q.scalar() or 0)
+    total_pnl_usd_stored = float(total_pnl_usd_q.scalar() or 0)
 
-    loss_pnl_q = await db.execute(
-        select(func.avg(SignalResult.pnl_percent)).where(SignalResult.result == "loss")
+    pnl_pct_q = await db.execute(
+        select(func.sum(SignalResult.pnl_percent)).where(_real_trades)
     )
-    avg_loss_pct = float(loss_pnl_q.scalar() or 0)
+    total_pnl_pct = float(pnl_pct_q.scalar() or 0)
+
+    avg_win_pnl_q = await db.execute(
+        select(func.avg(SignalResult.pnl_usd))
+        .where(_real_trades, SignalResult.result == "win")
+    )
+    avg_win_usd = float(avg_win_pnl_q.scalar() or 0)
+
+    avg_loss_pnl_q = await db.execute(
+        select(func.avg(SignalResult.pnl_usd))
+        .where(_real_trades, SignalResult.result == "loss")
+    )
+    avg_loss_usd = float(avg_loss_pnl_q.scalar() or 0)
+
+    # Fallback for old records without stored pnl_usd
+    if total_pnl_usd_stored == 0 and total_pnl_pct != 0:
+        total_pnl_usd_stored = pnl_usd(total_pnl_pct)
+    if avg_win_usd == 0:
+        avg_win_pct_q = await db.execute(
+            select(func.avg(SignalResult.pnl_percent))
+            .where(_real_trades, SignalResult.result == "win")
+        )
+        avg_win_usd = pnl_usd(float(avg_win_pct_q.scalar() or 0))
+    if avg_loss_usd == 0:
+        avg_loss_pct_q = await db.execute(
+            select(func.avg(SignalResult.pnl_percent))
+            .where(_real_trades, SignalResult.result == "loss")
+        )
+        avg_loss_usd = pnl_usd(float(avg_loss_pct_q.scalar() or 0))
 
     # Open positions
     open_q = await db.execute(
@@ -766,7 +799,6 @@ async def simulator_stats(db: AsyncSession = Depends(get_session)):
     )
     open_positions = open_q.scalar() or 0
 
-    # Unrealized P&L on open positions
     unrealized_q = await db.execute(
         select(func.sum(VirtualPortfolio.unrealized_pnl_pct)).where(
             VirtualPortfolio.status == "open"
@@ -776,31 +808,43 @@ async def simulator_stats(db: AsyncSession = Depends(get_session)):
 
     win_rate = round(wins / total * 100, 1) if total > 0 else 0.0
 
-    # Profit factor = gross wins / abs(gross losses)
+    # Profit factor = gross wins USD / abs(gross losses USD)
     gross_wins_q = await db.execute(
-        select(func.sum(SignalResult.pnl_percent)).where(SignalResult.pnl_percent > 0)
+        select(func.sum(SignalResult.pnl_usd))
+        .where(_real_trades, SignalResult.pnl_usd > 0)
     )
     gross_losses_q = await db.execute(
-        select(func.sum(SignalResult.pnl_percent)).where(SignalResult.pnl_percent < 0)
+        select(func.sum(SignalResult.pnl_usd))
+        .where(_real_trades, SignalResult.pnl_usd < 0)
     )
-    gross_wins = float(gross_wins_q.scalar() or 0)
-    gross_losses = abs(float(gross_losses_q.scalar() or 0))
-    profit_factor = round(gross_wins / gross_losses, 2) if gross_losses > 0 else None
+    gross_wins_val = float(gross_wins_q.scalar() or 0)
+    gross_losses_val = abs(float(gross_losses_q.scalar() or 0))
+    # Fallback to pnl_percent if pnl_usd not yet stored
+    if gross_wins_val == 0 and gross_losses_val == 0:
+        gw_q = await db.execute(
+            select(func.sum(SignalResult.pnl_percent)).where(_real_trades, SignalResult.pnl_percent > 0)
+        )
+        gl_q = await db.execute(
+            select(func.sum(SignalResult.pnl_percent)).where(_real_trades, SignalResult.pnl_percent < 0)
+        )
+        gross_wins_val = float(gw_q.scalar() or 0)
+        gross_losses_val = abs(float(gl_q.scalar() or 0))
+    profit_factor = round(gross_wins_val / gross_losses_val, 2) if gross_losses_val > 0 else None
 
     return {
-        "account_size_usd": ACCOUNT_SIZE_FLOAT,
-        "total_trades": total,
-        "open_positions": open_positions,
-        "wins": wins,
-        "losses": losses,
-        "breakevens": breakevens,
-        "win_rate_pct": win_rate,
-        "total_pnl_usd": pnl_usd(total_pnl_pct),
-        "total_pnl_pct": round(total_pnl_pct, 4),
-        "unrealized_pnl_usd": pnl_usd(unrealized_pct),
-        "avg_win_usd": pnl_usd(avg_win_pct),
-        "avg_loss_usd": pnl_usd(avg_loss_pct),
-        "profit_factor": profit_factor,
+        "account_size_usd":    ACCOUNT_SIZE_FLOAT,
+        "total_trades":        total,
+        "open_positions":      open_positions,
+        "wins":                wins,
+        "losses":              losses,
+        "breakevens":          breakevens,
+        "win_rate_pct":        win_rate,
+        "total_pnl_usd":       round(total_pnl_usd_stored, 2),
+        "total_pnl_pct":       round(total_pnl_pct, 4),
+        "unrealized_pnl_usd":  pnl_usd(unrealized_pct),
+        "avg_win_usd":         round(avg_win_usd, 2),
+        "avg_loss_usd":        round(avg_loss_usd, 2),
+        "profit_factor":       profit_factor,
     }
 
 
@@ -817,6 +861,8 @@ async def simulator_trades(
         select(Signal, SignalResult, Instrument)
         .join(SignalResult, Signal.id == SignalResult.signal_id)
         .join(Instrument, Signal.instrument_id == Instrument.id)
+        # Exclude cancelled signals (SIM-03: no entry filled, not real trades)
+        .where(SignalResult.exit_reason != "cancelled")
         .order_by(SignalResult.exit_at.desc())
         .limit(limit)
     )
@@ -827,25 +873,31 @@ async def simulator_trades(
 
     trades = []
     for signal, sr, instr in rows:
+        # Use stored pnl_usd if available, else compute from pnl_percent (old records)
+        pnl_usd_val = (
+            float(sr.pnl_usd)
+            if sr.pnl_usd is not None
+            else pnl_usd(float(sr.pnl_percent or 0), float(signal.position_size_pct or 0) or None)
+        )
         trades.append({
-            "signal_id": signal.id,
-            "symbol": instr.symbol,
-            "name": instr.name,
-            "timeframe": signal.timeframe,
-            "direction": signal.direction,
-            "entry_price": float(sr.entry_actual_price or signal.entry_price or 0),
-            "exit_price": float(sr.exit_price or 0),
-            "stop_loss": float(signal.stop_loss or 0),
-            "take_profit_1": float(signal.take_profit_1 or 0),
-            "exit_reason": sr.exit_reason,
-            "pnl_pips": float(sr.pnl_pips or 0),
-            "pnl_pct": float(sr.pnl_percent or 0),
-            "pnl_usd": pnl_usd(float(sr.pnl_percent or 0)),
-            "result": sr.result,
+            "signal_id":        signal.id,
+            "symbol":           instr.symbol,
+            "name":             instr.name,
+            "timeframe":        signal.timeframe,
+            "direction":        signal.direction,
+            "entry_price":      float(sr.entry_actual_price or signal.entry_price or 0),
+            "exit_price":       float(sr.exit_price or 0),
+            "stop_loss":        float(signal.stop_loss or 0),
+            "take_profit_1":    float(signal.take_profit_1 or 0),
+            "exit_reason":      sr.exit_reason,
+            "pnl_pips":         float(sr.pnl_pips or 0),
+            "pnl_pct":          float(sr.pnl_percent or 0),
+            "pnl_usd":          round(pnl_usd_val, 2),
+            "result":           sr.result,
             "duration_minutes": sr.duration_minutes,
-            "entry_at": sr.entry_filled_at.isoformat() if sr.entry_filled_at else None,
-            "exit_at": sr.exit_at.isoformat() if sr.exit_at else None,
-            "composite_score": float(signal.composite_score or 0),
+            "entry_at":         sr.entry_filled_at.isoformat() if sr.entry_filled_at else None,
+            "exit_at":          sr.exit_at.isoformat() if sr.exit_at else None,
+            "composite_score":  float(signal.composite_score or 0),
         })
 
     return trades
