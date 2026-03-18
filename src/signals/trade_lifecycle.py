@@ -24,9 +24,9 @@ _TREND_REGIMES = {
     "WEAK_TREND_BEAR",
 }
 
-# ATR fractions for trailing stop
-_TRAIL_ATR_TREND = Decimal("0.5")
-_TRAIL_ATR_RANGE = Decimal("0.3")
+# ATR fractions for trailing stop (FIX-06: increased to avoid premature exits on normal pullbacks)
+_TRAIL_ATR_TREND = Decimal("1.0")   # was 0.5 — 1.0×ATR gives room for normal trend pullbacks
+_TRAIL_ATR_RANGE = Decimal("0.5")   # was 0.3 — tighter than trend but not too aggressive
 
 _QUANT = Decimal("0.00000001")
 
@@ -81,13 +81,28 @@ class TradeLifecycleManager:
         if direction not in ("LONG", "SHORT"):
             return _action("hold", reason="Unknown direction")
 
-        # Check exit conditions first (SL / TP)
+        # ── SL check always fires first (risk management) ─────────────────────
         exit_action = self._check_exits(
             direction, entry, stop_loss, trailing_stop,
             take_profit_1, take_profit_2, take_profit_3,
             current_price,
         )
-        if exit_action["action"].startswith("exit_"):
+        if exit_action["action"] == "exit_sl":
+            return exit_action
+
+        # ── Partial close at TP1 (FIX-04: before TP exits) ────────────────────
+        # When the position hasn't been partially closed yet, intercept TP1
+        # to take 50% profit and let the remaining run.  Subsequent TP exits
+        # only fire after partial_closed=True.
+        if not partial_closed and take_profit_1 is not None:
+            pc_action = self._check_partial_close(
+                direction, entry, take_profit_1, current_price
+            )
+            if pc_action:
+                return pc_action
+
+        # ── TP2/TP3 exits (only after partial close is done) ──────────────────
+        if exit_action["action"].startswith("exit_tp"):
             return exit_action
 
         actions = []
@@ -100,14 +115,6 @@ class TradeLifecycleManager:
             if be_action:
                 actions.append(be_action)
 
-        # ── Partial close at TP1 ──────────────────────────────────────────────
-        if not partial_closed and take_profit_1 is not None:
-            pc_action = self._check_partial_close(
-                direction, entry, take_profit_1, current_price
-            )
-            if pc_action:
-                actions.append(pc_action)
-
         # ── Trailing stop ─────────────────────────────────────────────────────
         if breakeven_moved:  # Only trail once breakeven is set
             trail_action = self._check_trailing(
@@ -117,7 +124,7 @@ class TradeLifecycleManager:
                 actions.append(trail_action)
 
         # Return the highest-priority action
-        for priority in ("partial_close", "breakeven", "trailing_update"):
+        for priority in ("breakeven", "trailing_update"):
             for a in actions:
                 if a["action"] == priority:
                     return a
@@ -205,22 +212,18 @@ class TradeLifecycleManager:
         take_profit_1: Decimal,
         current_price: Decimal,
     ) -> Optional[dict]:
-        """Suggest closing 50% when TP1 zone is entered (95% of TP1 distance)."""
-        dist = abs(take_profit_1 - entry)
-        threshold_frac = Decimal("0.95")
-
+        """Suggest closing 50% when price reaches TP1 (FIX-04: exactly at TP1, not 95%)."""
+        # FIX-04: close at TP1 exactly, not 95% before it — traders take profit at the level
         if direction == "LONG":
-            threshold = entry + dist * threshold_frac
-            reached = current_price >= threshold
+            reached = current_price >= take_profit_1
         else:
-            threshold = entry - dist * threshold_frac
-            reached = current_price <= threshold
+            reached = current_price <= take_profit_1
 
         if reached:
             return _action(
                 "partial_close",
                 close_pct=0.5,
-                reason=f"Price reached 95% of TP1 distance ({float(threshold):.5f})",
+                reason=f"TP1 reached ({float(take_profit_1):.5f}) — partial close 50%",
             )
         return None
 

@@ -703,3 +703,61 @@ class TestGenerateSignal:
         with patch("src.signals.signal_engine.cache.get", new=AsyncMock(return_value=recent)):
             result = await engine.generate_signal(instrument, "H1", db)
         assert result is None
+
+
+# ── FIX-02: Adaptive TTL per timeframe ────────────────────────────────────────
+
+class TestFix02AdaptiveTTL:
+    """FIX-02: signal expiry should scale with timeframe candle size."""
+
+    def test_h1_ttl_is_24_hours(self):
+        from src.signals.signal_engine import _calculate_expiry
+        import datetime
+        before = datetime.datetime.now(datetime.timezone.utc)
+        expiry = _calculate_expiry("H1")
+        delta = expiry - before
+        # 24 candles × 1h = 24 hours (allow ±60s tolerance)
+        assert abs(delta.total_seconds() - 24 * 3600) < 60
+
+    def test_d1_ttl_is_10_days(self):
+        from src.signals.signal_engine import _calculate_expiry
+        import datetime
+        before = datetime.datetime.now(datetime.timezone.utc)
+        expiry = _calculate_expiry("D1")
+        delta = expiry - before
+        # 10 candles × 24h = 240 hours = 10 days
+        assert abs(delta.total_seconds() - 10 * 24 * 3600) < 60
+
+    def test_w1_ttl_is_56_days(self):
+        from src.signals.signal_engine import _calculate_expiry
+        import datetime
+        before = datetime.datetime.now(datetime.timezone.utc)
+        expiry = _calculate_expiry("W1")
+        delta = expiry - before
+        # 8 candles × 168h = 1344 hours = 56 days
+        assert abs(delta.total_seconds() - 56 * 24 * 3600) < 60
+
+    def test_h4_ttl_shorter_than_d1(self):
+        from src.signals.signal_engine import _calculate_expiry
+        h4_expiry = _calculate_expiry("H4")
+        d1_expiry = _calculate_expiry("D1")
+        assert h4_expiry < d1_expiry
+
+    def test_unknown_tf_fallback_to_config(self):
+        from src.signals.signal_engine import _calculate_expiry
+        from src.config import settings
+        import datetime
+        before = datetime.datetime.now(datetime.timezone.utc)
+        expiry = _calculate_expiry("UNKNOWN")
+        delta = expiry - before
+        expected = settings.SIGNAL_EXPIRY_HOURS * 3600
+        assert abs(delta.total_seconds() - expected) < 60
+
+    def test_h1_ttl_much_less_than_flat_7_days(self):
+        """H1 signal must expire much sooner than the old flat 7-day TTL."""
+        from src.signals.signal_engine import _calculate_expiry
+        import datetime
+        expiry = _calculate_expiry("H1")
+        delta = expiry - datetime.datetime.now(datetime.timezone.utc)
+        seven_days = 7 * 24 * 3600
+        assert delta.total_seconds() < seven_days / 4  # less than 1.75 days

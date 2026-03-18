@@ -431,8 +431,9 @@ class SignalEngineV2:
           - Regime clarity (is it a strong/clear regime?): 20%
         Range: [0, 100]
         """
-        # Score magnitude: |composite| / 100 → [0, 1]
-        magnitude = min(abs(composite) / 100.0, 1.0)
+        # Score magnitude: |composite| / 25 → [0, 1]
+        # Real composite range is ≈ ±25 (not ±100), so normalise accordingly.
+        magnitude = min(abs(composite) / 25.0, 1.0)
 
         # Agreement: count how many sources agree with composite sign
         sources = [ta_score, fa_score, sentiment_score]

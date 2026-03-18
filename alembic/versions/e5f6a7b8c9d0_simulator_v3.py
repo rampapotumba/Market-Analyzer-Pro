@@ -70,53 +70,26 @@ def upgrade() -> None:
         sa.Column("account_balance_at_entry", sa.Numeric(14, 4), nullable=True),
     )
 
-    # ── virtual_account (новая таблица) ───────────────────────────────────────
-    op.create_table(
-        "virtual_account",
-        sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
-        sa.Column(
-            "initial_balance",
-            sa.Numeric(14, 4),
-            nullable=False,
-            server_default="1000.0",
-        ),
-        sa.Column(
-            "current_balance",
-            sa.Numeric(14, 4),
-            nullable=False,
-            server_default="1000.0",
-        ),
-        sa.Column(
-            "peak_balance",
-            sa.Numeric(14, 4),
-            nullable=False,
-            server_default="1000.0",
-        ),
-        sa.Column(
-            "total_realized_pnl",
-            sa.Numeric(14, 4),
-            nullable=False,
-            server_default="0.0",
-        ),
-        sa.Column(
-            "total_trades",
-            sa.Integer(),
-            nullable=False,
-            server_default="0",
-        ),
-        sa.Column(
-            "updated_at",
-            sa.DateTime(timezone=True),
-            nullable=False,
-            server_default=sa.func.now(),
-        ),
-    )
-
-    # Начальная запись счёта
-    op.execute(
-        "INSERT INTO virtual_account (initial_balance, current_balance, peak_balance) "
-        "VALUES (1000.0, 1000.0, 1000.0)"
-    )
+    # ── virtual_account ───────────────────────────────────────────────────────
+    # Table may already exist if created outside of Alembic — use IF NOT EXISTS
+    op.execute("""
+        CREATE TABLE IF NOT EXISTS virtual_account (
+            id SERIAL PRIMARY KEY,
+            initial_balance NUMERIC(14,4) NOT NULL DEFAULT 1000.0,
+            current_balance NUMERIC(14,4) NOT NULL DEFAULT 1000.0,
+            peak_balance    NUMERIC(14,4) NOT NULL DEFAULT 1000.0,
+            total_realized_pnl NUMERIC(14,4) NOT NULL DEFAULT 0.0,
+            total_trades    INTEGER NOT NULL DEFAULT 0,
+            updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+    # Insert initial row only if table is empty
+    op.execute("""
+        INSERT INTO virtual_account
+            (initial_balance, current_balance, peak_balance, total_realized_pnl, total_trades)
+        SELECT 1000.0, 1000.0, 1000.0, 0.0, 0
+        WHERE NOT EXISTS (SELECT 1 FROM virtual_account)
+    """)
 
 
 def downgrade() -> None:

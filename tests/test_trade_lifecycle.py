@@ -61,20 +61,42 @@ class TestExitConditions:
         result = check("SHORT", "1.10800")  # above SL 1.10750
         assert result["action"] == "exit_sl"
 
-    def test_tp1_hit_long(self):
+    def test_tp1_hit_long_partial_not_done(self):
+        """FIX-04: price at TP1 with partial_closed=False → partial_close, not exit_tp1."""
         result = check("LONG", "1.11500")
+        assert result["action"] == "partial_close"
+        assert result["close_pct"] == pytest.approx(0.5)
+
+    def test_tp1_hit_long_after_partial(self):
+        """After partial close done, TP1 exit fires normally."""
+        result = check("LONG", "1.11500", partial_closed=True)
         assert result["action"] == "exit_tp1"
 
-    def test_tp1_hit_short(self):
+    def test_tp1_hit_short_partial_not_done(self):
+        """FIX-04: price at TP1 SHORT with partial_closed=False → partial_close."""
         result = check("SHORT", "1.08500")
+        assert result["action"] == "partial_close"
+
+    def test_tp1_hit_short_after_partial(self):
+        result = check("SHORT", "1.08500", partial_closed=True)
         assert result["action"] == "exit_tp1"
 
-    def test_tp2_hit_long(self):
-        result = check("LONG", "1.12700")  # above TP2
+    def test_tp2_hit_long_partial_not_done(self):
+        """FIX-04: must partial close at TP1 before TP2 can fire."""
+        result = check("LONG", "1.12700", partial_closed=False)
+        assert result["action"] == "partial_close"
+
+    def test_tp2_hit_long_after_partial(self):
+        result = check("LONG", "1.12700", partial_closed=True)
         assert result["action"] == "exit_tp2"
 
-    def test_tp3_hit_long(self):
-        result = check("LONG", "1.14100")  # above TP3
+    def test_tp3_hit_long_partial_not_done(self):
+        """FIX-04: partial close must happen first before TP3 exit."""
+        result = check("LONG", "1.14100", partial_closed=False)
+        assert result["action"] == "partial_close"
+
+    def test_tp3_hit_long_after_partial(self):
+        result = check("LONG", "1.14100", partial_closed=True)
         assert result["action"] == "exit_tp3"
 
     def test_trailing_sl_hit_long(self):
@@ -111,18 +133,26 @@ class TestBreakeven:
 
 
 class TestPartialClose:
-    def test_partial_close_at_95pct_tp1_long(self):
-        """At 95% of the TP1 distance, suggest partial close."""
-        # 95% of dist: 1.10000 + 0.95 * 0.01500 = 1.11425
-        result = check("LONG", "1.11430")
+    def test_partial_close_at_tp1_long(self):
+        """FIX-04: partial close triggers exactly at TP1, not 95% before it."""
+        result = check("LONG", "1.11500")  # exactly at TP1
         assert result["action"] == "partial_close"
         assert result["close_pct"] == pytest.approx(0.5)
 
-    def test_partial_close_at_95pct_tp1_short(self):
-        # TP1_SHORT = 1.08500, entry = 1.10000, dist = 0.01500
-        # 95%: 1.10000 - 0.95 * 0.01500 = 1.08575
-        result = check("SHORT", "1.08570")
+    def test_partial_close_above_tp1_long(self):
+        """Price beyond TP1 also triggers partial_close when not yet done."""
+        result = check("LONG", "1.11600")  # above TP1
         assert result["action"] == "partial_close"
+
+    def test_partial_close_at_tp1_short(self):
+        """FIX-04: partial close triggers exactly at TP1 SHORT."""
+        result = check("SHORT", "1.08500")  # exactly at TP1_SHORT
+        assert result["action"] == "partial_close"
+
+    def test_no_partial_close_just_below_tp1(self):
+        """Price just below TP1 should NOT trigger partial close."""
+        result = check("LONG", "1.11499")
+        assert result["action"] != "partial_close"
 
     def test_no_partial_close_if_already_done(self):
         result = check("LONG", "1.11430", partial_closed=True)

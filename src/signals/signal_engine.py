@@ -51,6 +51,60 @@ SIGNAL_COOLDOWN_MINUTES: dict[str, int] = {
     "H1": 60, "H4": 240, "D1": 1440, "W1": 10080, "MN1": 43200,
 }
 
+# FIX-02: Adaptive TTL — how many candles a limit-entry signal should stay alive.
+# A signal on H1 that hasn't filled in 24 candles is stale; W1 can wait 8 candles (≈8 wks).
+_TF_CANDLE_HOURS: dict[str, float] = {
+    "M1": 1 / 60, "M5": 5 / 60, "M15": 15 / 60,
+    "H1": 1.0, "H4": 4.0, "D1": 24.0, "W1": 168.0, "MN1": 720.0,
+}
+_TF_EXPIRY_CANDLES: dict[str, int] = {
+    "M1": 60, "M5": 48, "M15": 32,
+    "H1": 24, "H4": 20, "D1": 10,
+    "W1": 8,  "MN1": 3,
+}
+
+
+def _calculate_expiry(timeframe: str) -> datetime.datetime:
+    """Return signal expiry timestamp based on timeframe (FIX-02).
+
+    TTL = candle_hours × expiry_candles.  Falls back to settings.SIGNAL_EXPIRY_HOURS
+    for unknown timeframes.
+    """
+    candle_hours = _TF_CANDLE_HOURS.get(timeframe)
+    n_candles = _TF_EXPIRY_CANDLES.get(timeframe)
+    if candle_hours is None or n_candles is None:
+        hours = settings.SIGNAL_EXPIRY_HOURS
+    else:
+        hours = candle_hours * n_candles
+    return datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=hours)
+
+# FIX-07: Session filter for European/NA forex pairs during Asian low-liquidity hours
+# JPY, AUD, NZD pairs are excluded — they are actively traded in Asian session.
+_FOREX_PAIRS_EU_NA: frozenset[str] = frozenset({
+    "EURUSD=X", "GBPUSD=X", "USDCHF=X", "EURGBP=X",
+    "EURCAD=X", "GBPCAD=X", "EURCHF=X", "GBPCHF=X",
+})
+_ASIAN_SESSION_UTC_START = 0   # 00:00 UTC
+_ASIAN_SESSION_UTC_END   = 7   # 07:00 UTC (exclusive)
+
+
+def _is_low_liquidity_session(
+    symbol: str,
+    market: str,
+    now_utc: datetime.datetime,
+) -> bool:
+    """Return True if this symbol should be skipped due to low-liquidity Asian hours.
+
+    Only blocks European/NA forex pairs during 00:00–06:59 UTC.
+    Crypto, stocks, Asian pairs are never blocked.
+    """
+    if market != "forex":
+        return False
+    if symbol not in _FOREX_PAIRS_EU_NA:
+        return False
+    return _ASIAN_SESSION_UTC_START <= now_utc.hour < _ASIAN_SESSION_UTC_END
+
+
 # Minimum price change as fraction of ATR to trigger new signal — B. Price-change trigger
 ATR_PRICE_CHANGE_FACTOR = 0.3
 
@@ -292,6 +346,15 @@ class SignalEngine:
                     f"{elapsed_minutes:.0f}/{cooldown_minutes} min elapsed — skipping"
                 )
                 return None
+
+        # FIX-07: Session filter — skip EU/NA forex pairs during Asian low-liquidity hours
+        market_type = getattr(instrument, "market_type", "") or ""
+        if _is_low_liquidity_session(instrument.symbol, market_type, now):
+            logger.info(
+                f"[SignalEngine] Asian session filter: skipping {instrument.symbol} "
+                f"(EU/NA forex, {now.hour:02d}:{now.minute:02d} UTC)"
+            )
+            return None
 
         # 1. Fetch price data
         price_records = await get_price_data(db, instrument.id, timeframe, limit=300)
@@ -585,9 +648,7 @@ class SignalEngine:
         # entry ≠ current_price → "created" (waiting for limit entry to be reached)
 
         horizon = self.mtf_filter.get_horizon(timeframe)
-        expires_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
-            hours=settings.SIGNAL_EXPIRY_HOURS
-        )
+        expires_at = _calculate_expiry(timeframe)  # FIX-02: adaptive TTL per timeframe
 
         signal_data = {
             "instrument_id": instrument.id,

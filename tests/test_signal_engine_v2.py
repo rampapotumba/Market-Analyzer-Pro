@@ -238,6 +238,47 @@ class TestSignalEngineV2Confidence:
         )
         assert conf < 60.0
 
+    # ── FIX-01: magnitude normalised to real composite range (±25, not ±100) ──
+
+    def test_fix01_magnitude_weak_signal(self):
+        """FIX-01: composite=7 (min BUY) → magnitude=0.28, not 0.07."""
+        engine = _make_engine()
+        # Access internal calculation: composite=7, all agree, strong trend
+        conf_weak = engine._calculate_confidence(
+            composite=7.0,
+            ta_score=5.0, fa_score=4.0, sentiment_score=3.0,
+            regime="STRONG_TREND_BULL",
+        )
+        # With correct normalisation: magnitude = 7/25 = 0.28 → contributes 11.2
+        # With old broken formula:    magnitude = 7/100 = 0.07 → contributes  2.8
+        # Minimum with correct formula: 11.2 (magnitude) + 40.0 (all align) + 20.0 (regime) = 71.2
+        assert conf_weak >= 65.0, f"Expected ≥65, got {conf_weak}"
+
+    def test_fix01_magnitude_max_at_25(self):
+        """FIX-01: composite=25 → magnitude=1.0 (max), not 0.25."""
+        engine = _make_engine()
+        conf_strong = engine._calculate_confidence(
+            composite=25.0,
+            ta_score=15.0, fa_score=10.0, sentiment_score=8.0,
+            regime="STRONG_TREND_BULL",
+        )
+        # With correct normalisation: magnitude = 25/25 = 1.0 → full 40 points from magnitude
+        # confidence = 40 + 40 + 20 = 100.0
+        assert conf_strong == 100.0, f"Expected 100.0, got {conf_strong}"
+
+    def test_fix01_weak_vs_strong_distinguishable(self):
+        """FIX-01: confidence must differ significantly between composite=7 and composite=20."""
+        engine = _make_engine()
+        same_kwargs = dict(ta_score=5.0, fa_score=4.0, sentiment_score=3.0,
+                           regime="STRONG_TREND_BULL")
+        conf_weak   = engine._calculate_confidence(composite=7.0,  **same_kwargs)
+        conf_strong = engine._calculate_confidence(composite=20.0, **same_kwargs)
+        # With correct normalisation: difference ≈ (20-7)/25 × 40 = 20.8 points
+        # With old formula:          difference ≈ (20-7)/100 × 40 = 5.2 points
+        assert conf_strong - conf_weak >= 15.0, (
+            f"Weak={conf_weak}, Strong={conf_strong} — difference too small"
+        )
+
 
 class TestSignalEngineV2Classify:
     def test_strong_buy(self):

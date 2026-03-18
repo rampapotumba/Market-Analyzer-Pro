@@ -61,6 +61,9 @@ _DEFAULT_SL_MULT = 1.5
 _DEFAULT_TP1_RR = 2.0
 _DEFAULT_TP2_RR = 3.5
 
+# Regimes where TP3 is unrealistic — lateral/volatile markets rarely sustain 3.75R moves
+_NO_TP3_REGIMES: frozenset[str] = frozenset({"RANGING", "HIGH_VOLATILITY"})
+
 # ── TP multipliers per regime (as multiples of ATR) — kept for legacy calculate_levels() ──
 _REGIME_TP: dict[str, tuple[float, float, float]] = {
     "STRONG_TREND_BULL": (2.0, 3.5, 5.0),
@@ -214,8 +217,8 @@ class RiskManagerV2:
         sl_mult = Decimal(str(REGIME_SL_MULTIPLIERS.get(regime, _DEFAULT_SL_MULT)))
         tp1_rr = Decimal(str(REGIME_TP1_RR.get(regime, _DEFAULT_TP1_RR)))
         tp2_rr = Decimal(str(REGIME_TP2_RR.get(regime, _DEFAULT_TP2_RR)))
-        # TP3 uses 1.5× TP2 R:R as a trailing target
-        tp3_rr = tp2_rr * Decimal("1.5")
+        # TP3 uses 1.5× TP2 R:R as a trailing target, but not for lateral/volatile regimes
+        tp3_rr = tp2_rr * Decimal("1.5") if regime not in _NO_TP3_REGIMES else None
 
         buffer = atr * Decimal(str(_SR_BUFFER_ATR_FRAC))
 
@@ -230,7 +233,7 @@ class RiskManagerV2:
             sl_distance = abs(entry - sl)
             tp1 = entry + sl_distance * tp1_rr
             tp2 = entry + sl_distance * tp2_rr
-            tp3 = entry + sl_distance * tp3_rr
+            tp3 = (entry + sl_distance * tp3_rr) if tp3_rr is not None else None
         else:  # SHORT
             raw_sl = entry + atr * sl_mult
             sl = self._align_sl_short(
@@ -242,13 +245,13 @@ class RiskManagerV2:
             sl_distance = abs(entry - sl)
             tp1 = entry - sl_distance * tp1_rr
             tp2 = entry - sl_distance * tp2_rr
-            tp3 = entry - sl_distance * tp3_rr
+            tp3 = (entry - sl_distance * tp3_rr) if tp3_rr is not None else None
 
         quant = Decimal("0.00000001")
         sl = sl.quantize(quant, rounding=ROUND_HALF_UP)
         tp1 = tp1.quantize(quant, rounding=ROUND_HALF_UP)
         tp2 = tp2.quantize(quant, rounding=ROUND_HALF_UP)
-        tp3 = tp3.quantize(quant, rounding=ROUND_HALF_UP)
+        tp3 = tp3.quantize(quant, rounding=ROUND_HALF_UP) if tp3 is not None else None
 
         actual_sl_dist = abs(entry - sl)
         rr1 = (
