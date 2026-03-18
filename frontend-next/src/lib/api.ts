@@ -36,6 +36,15 @@ export interface Signal {
   status: string;
   created_at: string;
   expires_at?: string;
+  // LLM (Claude) fields
+  llm_score?: number | null;
+  llm_bias?: "BULLISH" | "BEARISH" | "NEUTRAL" | null;
+  llm_confidence?: number | null;
+}
+
+export interface SignalDetail extends Signal {
+  llm_reasoning?: string | null;
+  llm_key_factors?: string[];
 }
 
 export interface Instrument {
@@ -85,7 +94,7 @@ export const api = {
   // Signals
   getSignals: (status?: string) =>
     fetchJSON<Signal[]>(`/api/v2/signals${status ? `?status=${status}` : ""}`),
-  getSignal: (id: number) => fetchJSON<Signal>(`/api/v2/signals/${id}`),
+  getSignal: (id: number) => fetchJSON<SignalDetail>(`/api/v2/signals/${id}`),
 
   // Instruments
   getInstruments: () => fetchJSON<Instrument[]>("/api/v2/instruments"),
