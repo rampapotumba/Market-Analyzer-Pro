@@ -121,6 +121,11 @@ class Signal(Base):
     earnings_days_ahead: Mapped[Optional[int]] = mapped_column(Integer)      # for stocks
     portfolio_heat: Mapped[Optional[float]] = mapped_column(Numeric(5, 2))   # % of account at risk
 
+    # LLM (Claude) analysis fields
+    llm_score: Mapped[Optional[float]] = mapped_column(Numeric(8, 4))        # -100..+100
+    llm_bias: Mapped[Optional[str]] = mapped_column(String(10))              # BULLISH/BEARISH/NEUTRAL
+    llm_confidence: Mapped[Optional[float]] = mapped_column(Numeric(5, 2))   # 0..100
+
     confidence: Mapped[float] = mapped_column(Numeric(5, 2), default=0.0)
     horizon: Mapped[Optional[str]] = mapped_column(String(32))
     reasoning: Mapped[Optional[str]] = mapped_column(Text)         # JSON

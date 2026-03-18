@@ -668,6 +668,9 @@ class SignalEngine:
             "geo_score": Decimal(str(round(geo_score, 4))),
             "confidence": round(confidence, 2),
             "horizon": horizon,
+            "llm_score": round(llm_score, 4) if llm_score != 0.0 else None,
+            "llm_bias": llm_meta.get("bias") or None,
+            "llm_confidence": round(llm_meta.get("confidence", 0.0), 2) if llm_meta else None,
             "reasoning": json.dumps(reasoning),
             "indicators_snapshot": json.dumps({
                 k: round(float(v), 6) if isinstance(v, (float, Decimal)) else v
