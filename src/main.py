@@ -63,12 +63,19 @@ async def lifespan(app: FastAPI):
     await start_realtime_streams()
     logger.info("Real-time streams started")
 
+    # Start APScheduler (price collection, signal generation, trade tracking)
+    from src.scheduler.jobs import start_scheduler, scheduler
+    start_scheduler()
+    logger.info("Scheduler started")
+
     logger.info("Market Analyzer Pro is ready!")
 
     yield  # Application is running
 
     # Shutdown
     logger.info("Shutting down Market Analyzer Pro...")
+    scheduler.shutdown(wait=False)
+    logger.info("Scheduler stopped")
 
 
 # ── FastAPI App ──────────────────────────────────────────────────────────────
