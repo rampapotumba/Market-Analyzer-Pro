@@ -11,12 +11,18 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from src.api.routes import router
+from src.api.routes_v2 import router_v2
 from src.api.websocket import websocket_all_prices, websocket_prices, websocket_signals
+from src.api.websocket_v2 import (
+    portfolio_ws_handler,
+    prices_ws_handler,
+    signals_ws_handler,
+)
 from src.collectors.realtime_collector import start_realtime_streams
 from src.config import settings
 from src.database.engine import init_db
 from src.database.seed import seed_instruments
-from src.scheduler.jobs import start_scheduler, stop_scheduler
+from src.monitoring.setup import setup_metrics
 
 # ── Logging Setup ────────────────────────────────────────────────────────────
 
@@ -53,10 +59,6 @@ async def lifespan(app: FastAPI):
     await seed_instruments()
     logger.info("Instruments seeded")
 
-    # Start background scheduler
-    start_scheduler()
-    logger.info("Scheduler started")
-
     # Start real-time price streams (Binance + Finnhub WebSocket)
     await start_realtime_streams()
     logger.info("Real-time streams started")
@@ -67,8 +69,6 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down Market Analyzer Pro...")
-    stop_scheduler()
-    logger.info("Scheduler stopped")
 
 
 # ── FastAPI App ──────────────────────────────────────────────────────────────
@@ -76,9 +76,32 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Market Analyzer Pro",
-    description="Financial market analysis and trading signal generation platform",
-    version="1.0.0",
+    description=(
+        "## Market Analyzer Pro v2 — Trading Signal Generation Platform\n\n"
+        "Combines technical, fundamental, macro, and geopolitical analysis to generate\n"
+        "regime-aware trading signals across Forex, US/EU Stocks, and Cryptocurrencies.\n\n"
+        "### Key Features\n"
+        "- Regime-adaptive composite scoring (TA/FA/Sentiment/Geo/OF)\n"
+        "- Intelligent SL/TP with S&R alignment (RiskManagerV2)\n"
+        "- Portfolio heat monitoring (max 6% total risk)\n"
+        "- LLM-based signal validation (Claude)\n"
+        "- Real-time WebSocket streams (signals, prices, portfolio)\n\n"
+        "### Authentication\n"
+        "API key authentication via `X-API-Key` header (when configured).\n\n"
+        "### Rate Limits\n"
+        "External API calls are protected by circuit breakers and backoff logic."
+    ),
+    version="2.0.0",
     lifespan=lifespan,
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
+    contact={
+        "name": "Market Analyzer Pro",
+    },
+    license_info={
+        "name": "Proprietary",
+    },
 )
 
 # CORS
@@ -90,8 +113,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Prometheus metrics
+setup_metrics(app)
+
 # REST API routes
 app.include_router(router)
+app.include_router(router_v2)
 
 
 # ── WebSocket Routes ──────────────────────────────────────────────────────────
@@ -113,6 +140,27 @@ async def ws_prices(websocket: WebSocket, symbol: str) -> None:
 async def ws_signals(websocket: WebSocket) -> None:
     """WebSocket endpoint for real-time signal updates."""
     await websocket_signals(websocket)
+
+
+# ── WebSocket v2 Routes ───────────────────────────────────────────────────────
+
+
+@app.websocket("/ws/v2/signals")
+async def ws_v2_signals(websocket: WebSocket) -> None:
+    """WebSocket v2: real-time signal alerts with full v2 schema."""
+    await signals_ws_handler(websocket)
+
+
+@app.websocket("/ws/v2/prices/{symbol}")
+async def ws_v2_prices(websocket: WebSocket, symbol: str) -> None:
+    """WebSocket v2: real-time price ticks for a specific symbol."""
+    await prices_ws_handler(websocket, symbol)
+
+
+@app.websocket("/ws/v2/portfolio")
+async def ws_v2_portfolio(websocket: WebSocket) -> None:
+    """WebSocket v2: real-time virtual portfolio updates."""
+    await portfolio_ws_handler(websocket)
 
 
 # ── Static Files (Frontend) ──────────────────────────────────────────────────

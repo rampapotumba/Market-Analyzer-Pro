@@ -461,3 +461,245 @@ class TestLLMCache:
         score, meta = _get_cached_llm("EURUSD=X", "H1")
         assert score == 20.0
         assert meta["bias"] == "bullish"
+
+
+# ── Helpers for generate_signal tests ─────────────────────────────────────────
+
+def _make_price_records_for_engine(n: int = 60) -> list:
+    """Create mock PriceData records for SignalEngine tests."""
+    records = []
+    price = 1.1000
+    base_ts = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+    for i in range(n):
+        r = MagicMock()
+        price += 0.0001 * (1 if i % 2 == 0 else -0.5)
+        r.open = Decimal(str(round(price - 0.0001, 5)))
+        r.high = Decimal(str(round(price + 0.0002, 5)))
+        r.low = Decimal(str(round(price - 0.0002, 5)))
+        r.close = Decimal(str(round(price, 5)))
+        r.volume = Decimal("1000")
+        r.timestamp = base_ts + datetime.timedelta(hours=i)
+        records.append(r)
+    return records
+
+
+def _make_instrument(symbol: str = "EURUSD=X", instr_type: str = "forex") -> MagicMock:
+    instr = MagicMock()
+    instr.id = 1
+    instr.symbol = symbol
+    instr.name = "EUR/USD"
+    instr.type = instr_type
+    return instr
+
+
+class TestGenerateSignal:
+    """Integration tests for SignalEngine.generate_signal() with mocked DB and engines."""
+
+    def _make_db(self) -> AsyncMock:
+        db = AsyncMock()
+        # Configure begin_nested() to support async context manager
+        nested_ctx = AsyncMock()
+        nested_ctx.__aenter__ = AsyncMock(return_value=None)
+        nested_ctx.__aexit__ = AsyncMock(return_value=False)
+        db.begin_nested = MagicMock(return_value=nested_ctx)
+        return db
+
+    def _patch_deps(self, patcher_ctx, ta_score=55.0, fa_score=40.0, sent_score=30.0, geo_score=20.0, atr=Decimal("0.001")):
+        """Patch all external dependencies for generate_signal."""
+        patches = {}
+
+        # CRUD
+        patches["price_data"] = patch("src.signals.signal_engine.get_price_data",
+                                       new=AsyncMock(return_value=_make_price_records_for_engine(60)))
+        patches["macro_data"] = patch("src.signals.signal_engine.get_macro_data",
+                                       new=AsyncMock(return_value=[]))
+        patches["news_events"] = patch("src.signals.signal_engine.get_news_events",
+                                        new=AsyncMock(return_value=[]))
+        patches["latest_signal"] = patch("src.signals.signal_engine.get_latest_signal_for_instrument",
+                                          new=AsyncMock(return_value=None))
+        patches["cancel_signals"] = patch("src.signals.signal_engine.cancel_open_signals",
+                                           new=AsyncMock(return_value=None))
+        patches["create_signal"] = patch("src.signals.signal_engine.create_signal",
+                                          new=AsyncMock(return_value=MagicMock(id=1)))
+
+        # Cache
+        patches["cache_get"] = patch("src.signals.signal_engine.cache.get",
+                                      new=AsyncMock(return_value=None))
+        patches["cache_set"] = patch("src.signals.signal_engine.cache.set",
+                                      new=AsyncMock(return_value=None))
+
+        # TA Engine
+        mock_ta = MagicMock()
+        mock_ta.calculate_ta_score.return_value = ta_score
+        mock_ta.calculate_all_indicators.return_value = {}
+        mock_ta.get_atr.return_value = atr
+        patches["ta_engine"] = patch("src.signals.signal_engine.TAEngine",
+                                      return_value=mock_ta)
+
+        # FA Engine
+        mock_fa = MagicMock()
+        mock_fa.calculate_fa_score.return_value = fa_score
+        patches["fa_engine"] = patch("src.signals.signal_engine.FAEngine",
+                                      return_value=mock_fa)
+
+        # Sentiment Engine
+        mock_sent = MagicMock()
+        mock_sent.calculate_sentiment_score.return_value = sent_score
+        patches["sent_engine"] = patch("src.signals.signal_engine.SentimentEngine",
+                                        return_value=mock_sent)
+
+        # Geo Engine
+        mock_geo = MagicMock()
+        mock_geo.calculate_geo_score.return_value = geo_score
+        patches["geo_engine"] = patch("src.signals.signal_engine.GeoEngine",
+                                       return_value=mock_geo)
+
+        # LLM Engine
+        mock_llm = MagicMock()
+        mock_llm.analyze_signal = AsyncMock(return_value=(50.0, {"bias": "bullish"}))
+        patches["llm_engine"] = patch("src.signals.signal_engine.LLMEngine",
+                                       return_value=mock_llm)
+
+        # Correlation Engine
+        mock_corr = MagicMock()
+        mock_corr.calculate_correlation_score.return_value = 0.0
+        patches["corr_engine"] = patch("src.signals.signal_engine.CorrelationEngine",
+                                        return_value=mock_corr)
+
+        # MTF Filter
+        mock_mtf = MagicMock()
+        mock_mtf.apply_mtf_multiplier = AsyncMock(return_value=ta_score)
+        patches["mtf"] = patch.object(patcher_ctx.mtf_filter, "apply_mtf_multiplier",
+                                       new=AsyncMock(return_value=ta_score))
+
+        # Telegram
+        patches["telegram"] = patch("src.signals.signal_engine.telegram.send_signal_alert",
+                                     new=AsyncMock(return_value=None))
+
+        return patches
+
+    @pytest.mark.asyncio
+    async def test_generate_signal_insufficient_price_data(self):
+        """Returns None when price data < 30 records."""
+        engine = SignalEngine()
+        db = self._make_db()
+        instrument = _make_instrument()
+
+        with patch("src.signals.signal_engine.get_price_data", new=AsyncMock(return_value=[])):
+            with patch("src.signals.signal_engine.get_latest_signal_for_instrument", new=AsyncMock(return_value=None)):
+                with patch("src.signals.signal_engine.cache.get", new=AsyncMock(return_value=None)):
+                    result = await engine.generate_signal(instrument, "H1", db)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_generate_signal_returns_signal_on_strong_bull(self):
+        """High composite score → signal generated and saved."""
+        engine = SignalEngine()
+        db = self._make_db()
+        instrument = _make_instrument()
+
+        price_records = _make_price_records_for_engine(60)
+        mock_signal = MagicMock()
+        mock_signal.id = 42
+
+        with patch("src.signals.signal_engine.get_price_data", new=AsyncMock(return_value=price_records)):
+            with patch("src.signals.signal_engine.get_latest_signal_for_instrument", new=AsyncMock(return_value=None)):
+                with patch("src.signals.signal_engine.get_macro_data", new=AsyncMock(return_value=[])):
+                    with patch("src.signals.signal_engine.get_news_events", new=AsyncMock(return_value=[])):
+                        with patch("src.signals.signal_engine.cancel_open_signals", new=AsyncMock()):
+                            with patch("src.signals.signal_engine.create_signal", new=AsyncMock(return_value=mock_signal)):
+                                with patch("src.signals.signal_engine.cache.get", new=AsyncMock(return_value=None)):
+                                    with patch("src.signals.signal_engine.cache.set", new=AsyncMock()):
+                                        mock_ta = MagicMock()
+                                        mock_ta.calculate_ta_score.return_value = 60.0
+                                        mock_ta.calculate_all_indicators.return_value = {}
+                                        mock_ta.get_atr.return_value = Decimal("0.001")
+                                        mock_fa = MagicMock()
+                                        mock_fa.calculate_fa_score.return_value = 50.0
+                                        mock_sent = MagicMock()
+                                        mock_sent.calculate_sentiment_score.return_value = 40.0
+                                        mock_geo = MagicMock()
+                                        mock_geo.calculate_geo_score.return_value = 30.0
+                                        mock_llm = MagicMock()
+                                        mock_llm.calculate_llm_score = AsyncMock(return_value=(55.0, {}))
+                                        mock_corr = MagicMock()
+                                        mock_corr.calculate_correlation_score.return_value = 0.0
+                                        with patch("src.signals.signal_engine.TAEngine", return_value=mock_ta):
+                                            with patch("src.signals.signal_engine.FAEngine", return_value=mock_fa):
+                                                with patch("src.signals.signal_engine.SentimentEngine", return_value=mock_sent):
+                                                    with patch("src.signals.signal_engine.GeoEngine", return_value=mock_geo):
+                                                        with patch("src.signals.signal_engine.LLMEngine", return_value=mock_llm):
+                                                            with patch("src.signals.signal_engine.CorrelationEngine", return_value=mock_corr):
+                                                                with patch.object(engine.mtf_filter, "apply", return_value=55.0), patch.object(engine.mtf_filter, "get_timeframe_weights", return_value={"ta": 0.4, "fa": 0.3, "sentiment": 0.2, "geo": 0.1}), patch.object(engine.mtf_filter, "get_horizon", return_value="1-3 days"):
+                                                                    with patch("src.signals.signal_engine.telegram.send_signal_alert", new=AsyncMock()):
+                                                                        result = await engine.generate_signal(instrument, "H1", db)
+        # Signal created (strong bull composite)
+        assert result is not None
+
+    @pytest.mark.asyncio
+    async def test_generate_signal_hold_returns_none(self):
+        """Composite score in HOLD range → no signal generated."""
+        engine = SignalEngine()
+        db = self._make_db()
+        instrument = _make_instrument()
+        price_records = _make_price_records_for_engine(60)
+
+        with patch("src.signals.signal_engine.get_price_data", new=AsyncMock(return_value=price_records)):
+            with patch("src.signals.signal_engine.get_latest_signal_for_instrument", new=AsyncMock(return_value=None)):
+                with patch("src.signals.signal_engine.get_macro_data", new=AsyncMock(return_value=[])):
+                    with patch("src.signals.signal_engine.get_news_events", new=AsyncMock(return_value=[])):
+                        with patch("src.signals.signal_engine.cache.get", new=AsyncMock(return_value=None)):
+                            with patch("src.signals.signal_engine.cache.set", new=AsyncMock()):
+                                mock_ta = MagicMock()
+                                mock_ta.calculate_ta_score.return_value = 5.0  # near zero = HOLD
+                                mock_ta.calculate_all_indicators.return_value = {}
+                                mock_ta.get_atr.return_value = Decimal("0.001")
+                                mock_fa = MagicMock()
+                                mock_fa.calculate_fa_score.return_value = 5.0
+                                mock_sent = MagicMock()
+                                mock_sent.calculate_sentiment_score.return_value = 0.0
+                                mock_geo = MagicMock()
+                                mock_geo.calculate_geo_score.return_value = 0.0
+                                mock_corr = MagicMock()
+                                mock_corr.calculate_correlation_score.return_value = 0.0
+                                with patch("src.signals.signal_engine.TAEngine", return_value=mock_ta):
+                                    with patch("src.signals.signal_engine.FAEngine", return_value=mock_fa):
+                                        with patch("src.signals.signal_engine.SentimentEngine", return_value=mock_sent):
+                                            with patch("src.signals.signal_engine.GeoEngine", return_value=mock_geo):
+                                                with patch("src.signals.signal_engine.CorrelationEngine", return_value=mock_corr):
+                                                    with patch.object(engine.mtf_filter, "apply", return_value=5.0), patch.object(engine.mtf_filter, "get_timeframe_weights", return_value={"ta": 0.4, "fa": 0.3, "sentiment": 0.2, "geo": 0.1}), patch.object(engine.mtf_filter, "get_horizon", return_value="1-3 days"):
+                                                        result = await engine.generate_signal(instrument, "H1", db)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_generate_signal_by_symbol_not_found(self):
+        """generate_signal_by_symbol returns None when symbol not in DB."""
+        engine = SignalEngine()
+        db = self._make_db()
+        with patch("src.signals.signal_engine.get_instrument_by_symbol", new=AsyncMock(return_value=None)):
+            result = await engine.generate_signal_by_symbol("UNKNOWN", "H1", db)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_generate_signal_by_symbol_delegates(self):
+        """generate_signal_by_symbol finds instrument and calls generate_signal."""
+        engine = SignalEngine()
+        db = self._make_db()
+        instrument = _make_instrument()
+        with patch("src.signals.signal_engine.get_instrument_by_symbol", new=AsyncMock(return_value=instrument)):
+            with patch.object(engine, "generate_signal", new=AsyncMock(return_value=None)) as mock_gen:
+                await engine.generate_signal_by_symbol("EURUSD=X", "H1", db)
+                mock_gen.assert_called_once_with(instrument, "H1", db)
+
+    @pytest.mark.asyncio
+    async def test_generate_signal_cooldown_from_redis(self):
+        """Returns None when cooldown is active (recent signal in Redis)."""
+        engine = SignalEngine()
+        db = self._make_db()
+        instrument = _make_instrument()
+
+        # Signal was 5 minutes ago, H1 cooldown = 60 min
+        recent = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=5)).isoformat()
+        with patch("src.signals.signal_engine.cache.get", new=AsyncMock(return_value=recent)):
+            result = await engine.generate_signal(instrument, "H1", db)
+        assert result is None

@@ -3,6 +3,8 @@
 import logging
 from typing import Any
 
+from src.config import settings
+
 logger = logging.getLogger(__name__)
 
 # Timeframe hierarchy (lower index = lower timeframe)
@@ -18,11 +20,19 @@ MTF_MULTIPLIERS = {
 }
 
 
-def _get_direction_from_score(score: float) -> int:
-    """Get direction integer from score. Returns -1, 0, or 1."""
-    if score >= 30:
+def _get_direction_from_score(
+    score: float,
+    buy_threshold: float = settings.BUY_THRESHOLD,
+    sell_threshold: float = settings.SELL_THRESHOLD,
+) -> int:
+    """Get direction integer from score. Returns -1, 0, or 1.
+
+    v3 fix: thresholds now default to BUY_THRESHOLD/SELL_THRESHOLD (±7.0)
+    instead of the old ±30 which was never reachable given max composite ≈ ±25.
+    """
+    if score >= buy_threshold:
         return 1
-    if score <= -30:
+    if score <= sell_threshold:
         return -1
     return 0
 
@@ -34,6 +44,14 @@ class MTFFilter:
     Adjusts composite signal score based on agreement/disagreement
     with higher timeframe signals.
     """
+
+    def __init__(
+        self,
+        buy_threshold: float = settings.BUY_THRESHOLD,
+        sell_threshold: float = settings.SELL_THRESHOLD,
+    ) -> None:
+        self._buy_threshold = buy_threshold
+        self._sell_threshold = sell_threshold
 
     def apply(
         self,
@@ -56,7 +74,9 @@ class MTFFilter:
         if not higher_tf_signals:
             return score
 
-        working_direction = _get_direction_from_score(score)
+        working_direction = _get_direction_from_score(
+            score, self._buy_threshold, self._sell_threshold
+        )
         if working_direction == 0:
             # HOLD signals don't get multiplied
             return score
@@ -72,7 +92,9 @@ class MTFFilter:
             if tf in TIMEFRAME_HIERARCHY:
                 tf_idx = TIMEFRAME_HIERARCHY.index(tf)
                 if tf_idx > working_idx:
-                    tf_direction = _get_direction_from_score(tf_score)
+                    tf_direction = _get_direction_from_score(
+                        tf_score, self._buy_threshold, self._sell_threshold
+                    )
                     relevant_tfs.append({
                         "timeframe": tf,
                         "idx": tf_idx,

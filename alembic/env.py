@@ -1,4 +1,4 @@
-"""Alembic environment configuration for async SQLAlchemy."""
+"""Alembic environment configuration for async SQLAlchemy + PostgreSQL."""
 
 import asyncio
 from logging.config import fileConfig
@@ -17,23 +17,24 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 # Import metadata from our models
-from src.database.models import Base
+from src.database.models import Base  # noqa: E402
+
 target_metadata = Base.metadata
 
-# Override sqlalchemy.url from settings
-from src.config import settings
+# Override sqlalchemy.url from application settings
+from src.config import settings  # noqa: E402
+
 config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
 
 
 def run_migrations_offline() -> None:
-    """Run migrations in 'offline' mode."""
+    """Run migrations in 'offline' mode (generate SQL without connecting)."""
     url = config.get_main_option("sqlalchemy.url")
     context.configure(
         url=url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
-        render_as_batch=True,  # Required for SQLite
     )
 
     with context.begin_transaction():
@@ -44,7 +45,6 @@ def do_run_migrations(connection: Connection) -> None:
     context.configure(
         connection=connection,
         target_metadata=target_metadata,
-        render_as_batch=True,  # Required for SQLite
     )
 
     with context.begin_transaction():
@@ -66,7 +66,7 @@ async def run_async_migrations() -> None:
 
 
 def run_migrations_online() -> None:
-    """Run migrations in 'online' mode."""
+    """Entry point for online migration mode."""
     asyncio.run(run_async_migrations())
 
 

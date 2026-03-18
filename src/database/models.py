@@ -1,4 +1,4 @@
-"""SQLAlchemy 2.0 ORM models."""
+"""SQLAlchemy 2.0 ORM models — v2 schema."""
 
 import datetime
 from decimal import Decimal
@@ -8,6 +8,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -24,6 +25,8 @@ class Base(DeclarativeBase):
     pass
 
 
+# ── Core market instruments ───────────────────────────────────────────────────
+
 class Instrument(Base):
     __tablename__ = "instruments"
 
@@ -33,6 +36,13 @@ class Instrument(Base):
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     pip_size: Mapped[Decimal] = mapped_column(Numeric(18, 8), default=Decimal("0.0001"))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    # v2 additions
+    sector: Mapped[Optional[str]] = mapped_column(String(64))          # for stocks
+    base_currency: Mapped[Optional[str]] = mapped_column(String(8))    # for forex/crypto
+    quote_currency: Mapped[Optional[str]] = mapped_column(String(8))   # for forex/crypto
+    central_bank: Mapped[Optional[str]] = mapped_column(String(16))    # ECB/FED/BOJ/…
+
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
@@ -43,14 +53,16 @@ class Instrument(Base):
     signals: Mapped[list["Signal"]] = relationship("Signal", back_populates="instrument")
 
 
+# ── OHLCV price data (TimescaleDB hypertable on timestamp) ───────────────────
+
 class PriceData(Base):
     __tablename__ = "price_data"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     instrument_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("instruments.id"), nullable=False, index=True
     )
-    timeframe: Mapped[str] = mapped_column(String(8), nullable=False)  # M1/M5/M15/H1/H4/D1/W1
+    timeframe: Mapped[str] = mapped_column(String(8), nullable=False)
     timestamp: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
@@ -69,6 +81,8 @@ class PriceData(Base):
     )
 
 
+# ── Trading signals ───────────────────────────────────────────────────────────
+
 class Signal(Base):
     __tablename__ = "signals"
 
@@ -82,28 +96,41 @@ class Signal(Base):
         server_default=func.now(),
         nullable=False,
     )
-    direction: Mapped[str] = mapped_column(String(8), nullable=False)  # LONG/SHORT/HOLD
-    signal_strength: Mapped[str] = mapped_column(String(16), nullable=False)  # STRONG_BUY/BUY/HOLD/SELL/STRONG_SELL
+    direction: Mapped[str] = mapped_column(String(8), nullable=False)        # LONG/SHORT/HOLD
+    signal_strength: Mapped[str] = mapped_column(String(16), nullable=False)  # STRONG_BUY/…
+
     entry_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 8))
     stop_loss: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 8))
     take_profit_1: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 8))
     take_profit_2: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 8))
+    take_profit_3: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 8))  # v2
     risk_reward: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 4))
     position_size_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
+
     composite_score: Mapped[float] = mapped_column(Numeric(8, 4), default=0.0)
     ta_score: Mapped[float] = mapped_column(Numeric(8, 4), default=0.0)
     fa_score: Mapped[float] = mapped_column(Numeric(8, 4), default=0.0)
     sentiment_score: Mapped[float] = mapped_column(Numeric(8, 4), default=0.0)
     geo_score: Mapped[float] = mapped_column(Numeric(8, 4), default=0.0)
+
+    # v2 score components
+    of_score: Mapped[Optional[float]] = mapped_column(Numeric(8, 4))         # order-flow
+    correlation_score: Mapped[Optional[float]] = mapped_column(Numeric(8, 4))
+    regime: Mapped[Optional[str]] = mapped_column(String(32))                # detected regime
+    earnings_days_ahead: Mapped[Optional[int]] = mapped_column(Integer)      # for stocks
+    portfolio_heat: Mapped[Optional[float]] = mapped_column(Numeric(5, 2))   # % of account at risk
+
     confidence: Mapped[float] = mapped_column(Numeric(5, 2), default=0.0)
     horizon: Mapped[Optional[str]] = mapped_column(String(32))
-    reasoning: Mapped[Optional[str]] = mapped_column(Text)  # JSON
+    reasoning: Mapped[Optional[str]] = mapped_column(Text)         # JSON
     indicators_snapshot: Mapped[Optional[str]] = mapped_column(Text)  # JSON
     status: Mapped[str] = mapped_column(String(16), default="created", index=True)
     expires_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True))
 
     instrument: Mapped["Instrument"] = relationship("Instrument", back_populates="signals")
-    result: Mapped[Optional["SignalResult"]] = relationship("SignalResult", back_populates="signal", uselist=False)
+    result: Mapped[Optional["SignalResult"]] = relationship(
+        "SignalResult", back_populates="signal", uselist=False
+    )
 
 
 class SignalResult(Base):
@@ -117,7 +144,7 @@ class SignalResult(Base):
     entry_actual_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 8))
     exit_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True))
     exit_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 8))
-    exit_reason: Mapped[Optional[str]] = mapped_column(String(16))  # sl_hit/tp1_hit/tp2_hit/expired/manual
+    exit_reason: Mapped[Optional[str]] = mapped_column(String(16))  # sl_hit/tp1_hit/tp2_hit/tp3_hit/expired/manual
     pnl_pips: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 4))
     pnl_percent: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
     result: Mapped[Optional[str]] = mapped_column(String(16))  # win/loss/breakeven
@@ -128,6 +155,8 @@ class SignalResult(Base):
 
     signal: Mapped["Signal"] = relationship("Signal", back_populates="result")
 
+
+# ── Accuracy stats ────────────────────────────────────────────────────────────
 
 class AccuracyStats(Base):
     __tablename__ = "accuracy_stats"
@@ -159,6 +188,8 @@ class AccuracyStats(Base):
     )
 
 
+# ── Macro-economic data ───────────────────────────────────────────────────────
+
 class MacroData(Base):
     __tablename__ = "macro_data"
 
@@ -176,9 +207,167 @@ class MacroData(Base):
     )
 
 
-class EconomicEvent(Base):
-    """Upcoming economic calendar events from FMP."""
+# ── Central bank interest rates ───────────────────────────────────────────────
 
+class CentralBankRate(Base):
+    __tablename__ = "central_bank_rates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    bank: Mapped[str] = mapped_column(String(16), nullable=False)   # FED/ECB/BOJ/BOE/RBA/BOC/SNB/RBNZ
+    currency: Mapped[str] = mapped_column(String(8), nullable=False)  # USD/EUR/JPY/…
+    rate: Mapped[Decimal] = mapped_column(Numeric(8, 4), nullable=False)  # % e.g. 5.25
+    effective_date: Mapped[datetime.date] = mapped_column(DateTime(timezone=True), nullable=False)
+    next_meeting_date: Mapped[Optional[datetime.date]] = mapped_column(DateTime(timezone=True))
+    bias: Mapped[Optional[str]] = mapped_column(String(16))  # hawkish/neutral/dovish
+    source: Mapped[Optional[str]] = mapped_column(String(64))
+    collected_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint("bank", "effective_date", name="uix_central_bank_rates"),
+        Index("ix_cbr_bank_date", "bank", "effective_date"),
+    )
+
+
+# ── Company fundamentals (stocks) ────────────────────────────────────────────
+
+class CompanyFundamentals(Base):
+    __tablename__ = "company_fundamentals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    instrument_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("instruments.id"), nullable=False, index=True
+    )
+    period: Mapped[str] = mapped_column(String(16), nullable=False)  # YYYY-QN or YYYY
+    pe_ratio: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 4))
+    eps: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 4))
+    revenue_growth_yoy: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))  # %
+    gross_margin: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))        # %
+    net_margin: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))          # %
+    debt_to_equity: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 4))
+    roe: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))                 # %
+    analyst_rating: Mapped[Optional[str]] = mapped_column(String(16))            # buy/hold/sell
+    analyst_target: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 4))
+    earnings_surprise_avg: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))  # % 4Q avg
+    insider_net_shares: Mapped[Optional[int]] = mapped_column(BigInteger)         # >0 buying
+    source: Mapped[Optional[str]] = mapped_column(String(32))
+    collected_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint("instrument_id", "period", name="uix_company_fundamentals"),
+    )
+
+
+# ── On-chain data (crypto) ────────────────────────────────────────────────────
+
+class OnchainData(Base):
+    __tablename__ = "onchain_data"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    instrument_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("instruments.id"), nullable=False, index=True
+    )
+    timestamp: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    nvt_ratio: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 4))
+    active_addresses: Mapped[Optional[int]] = mapped_column(BigInteger)
+    mvrv_ratio: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 4))
+    exchange_inflow: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 8))
+    exchange_outflow: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 8))
+    funding_rate: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 6))
+    open_interest: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
+    dominance: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))  # BTC dominance %
+    source: Mapped[Optional[str]] = mapped_column(String(32))
+
+    __table_args__ = (
+        UniqueConstraint("instrument_id", "timestamp", name="uix_onchain_data"),
+        Index("ix_onchain_timestamp", "timestamp"),
+    )
+
+
+# ── Market regime state ───────────────────────────────────────────────────────
+
+class RegimeState(Base):
+    __tablename__ = "regime_state"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    instrument_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("instruments.id"), nullable=False, index=True
+    )
+    detected_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    regime: Mapped[str] = mapped_column(String(32), nullable=False)  # STRONG_TREND_BULL/…
+    adx: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
+    atr_percentile: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
+    vix: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
+    ta_weight: Mapped[Decimal] = mapped_column(Numeric(5, 3))
+    fa_weight: Mapped[Decimal] = mapped_column(Numeric(5, 3))
+    sentiment_weight: Mapped[Decimal] = mapped_column(Numeric(5, 3))
+    geo_weight: Mapped[Decimal] = mapped_column(Numeric(5, 3))
+    sl_atr_multiplier: Mapped[Decimal] = mapped_column(Numeric(5, 3))
+
+    __table_args__ = (
+        Index("ix_regime_instrument_date", "instrument_id", "detected_at"),
+    )
+
+
+# ── Order flow data (TimescaleDB hypertable on timestamp) ─────────────────────
+
+class OrderFlowData(Base):
+    __tablename__ = "order_flow_data"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    instrument_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("instruments.id"), nullable=False, index=True
+    )
+    timestamp: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    cvd: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 8))          # Cumulative Volume Delta
+    funding_rate: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 6)) # 8h funding %
+    open_interest: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
+    long_liquidations: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
+    short_liquidations: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 4))
+    buy_volume: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 8))
+    sell_volume: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 8))
+
+    __table_args__ = (
+        UniqueConstraint("instrument_id", "timestamp", name="uix_order_flow_data"),
+        Index("ix_order_flow_timestamp", "timestamp"),
+    )
+
+
+# ── Social sentiment ──────────────────────────────────────────────────────────
+
+class SocialSentiment(Base):
+    __tablename__ = "social_sentiment"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    instrument_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("instruments.id"), nullable=False, index=True
+    )
+    timestamp: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    source: Mapped[str] = mapped_column(String(32), nullable=False)  # reddit/stocktwits/fear_greed
+    score: Mapped[Decimal] = mapped_column(Numeric(8, 4), nullable=False)  # -100 to +100
+    mention_count: Mapped[Optional[int]] = mapped_column(Integer)
+    raw_data: Mapped[Optional[str]] = mapped_column(Text)  # JSON
+
+    __table_args__ = (
+        UniqueConstraint("instrument_id", "source", "timestamp", name="uix_social_sentiment"),
+        Index("ix_social_sentiment_timestamp", "timestamp"),
+    )
+
+
+# ── Economic calendar events ──────────────────────────────────────────────────
+
+class EconomicEvent(Base):
     __tablename__ = "economic_events"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -205,6 +394,8 @@ class EconomicEvent(Base):
     )
 
 
+# ── News ──────────────────────────────────────────────────────────────────────
+
 class NewsEvent(Base):
     __tablename__ = "news_events"
 
@@ -220,3 +411,101 @@ class NewsEvent(Base):
     importance: Mapped[str] = mapped_column(String(16), default="low")  # low/medium/high/critical
     related_instruments: Mapped[Optional[str]] = mapped_column(Text)  # JSON
     category: Mapped[Optional[str]] = mapped_column(String(64))
+
+
+# ── Virtual portfolio ─────────────────────────────────────────────────────────
+
+class VirtualPortfolio(Base):
+    __tablename__ = "virtual_portfolio"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    signal_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("signals.id"), unique=True, nullable=False, index=True
+    )
+    opened_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    closed_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True))
+    size_pct: Mapped[Decimal] = mapped_column(Numeric(8, 4), nullable=False)
+    entry_price: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False)
+    current_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 8))
+    unrealized_pnl_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
+    realized_pnl_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
+    status: Mapped[str] = mapped_column(String(16), default="open")  # open/closed/partial
+
+
+# ── Backtesting ───────────────────────────────────────────────────────────────
+
+class BacktestRun(Base):
+    __tablename__ = "backtest_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    started_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    completed_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True))
+    instrument_ids: Mapped[Optional[str]] = mapped_column(Text)    # JSON list
+    in_sample_start: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True))
+    in_sample_end: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True))
+    oos_start: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True))
+    oos_end: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True))
+    optimal_weights: Mapped[Optional[str]] = mapped_column(Text)   # JSON {ta,fa,sent,geo}
+    oos_sharpe: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
+    oos_profit_factor: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
+    oos_win_rate: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
+    oos_max_drawdown: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
+    oos_total_trades: Mapped[Optional[int]] = mapped_column(Integer)
+    monte_carlo_ci_drawdown: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))  # 95th pct
+    passed_validation: Mapped[Optional[bool]] = mapped_column(Boolean)
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+
+    trades: Mapped[list["BacktestTrade"]] = relationship("BacktestTrade", back_populates="run")
+
+
+class BacktestTrade(Base):
+    __tablename__ = "backtest_trades"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("backtest_runs.id"), nullable=False, index=True
+    )
+    instrument_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("instruments.id"), nullable=False, index=True
+    )
+    timeframe: Mapped[str] = mapped_column(String(8), nullable=False)
+    entry_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    exit_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True))
+    direction: Mapped[str] = mapped_column(String(8), nullable=False)  # LONG/SHORT
+    entry_price: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False)
+    exit_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 8))
+    pnl_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
+    result: Mapped[Optional[str]] = mapped_column(String(16))  # win/loss/breakeven
+    composite_score: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
+    phase: Mapped[str] = mapped_column(String(8), default="oos")  # is/oos
+
+    run: Mapped["BacktestRun"] = relationship("BacktestRun", back_populates="trades")
+
+
+# ── System event log (3-day retention) ───────────────────────────────────────
+
+class SystemEvent(Base):
+    __tablename__ = "system_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    level: Mapped[str] = mapped_column(String(8), nullable=False, default="INFO")   # INFO/WARNING/ERROR
+    event_type: Mapped[str] = mapped_column(String(32), nullable=False)             # SIGNAL_GENERATED/…
+    source: Mapped[str] = mapped_column(String(64), nullable=False, default="")    # module / job name
+    symbol: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    timeframe: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    details: Mapped[Optional[str]] = mapped_column(Text, nullable=True)             # JSON
+
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        Index("ix_system_events_created_at", "created_at"),
+        Index("ix_system_events_event_type", "event_type"),
+        Index("ix_system_events_level", "level"),
+    )

@@ -7,7 +7,7 @@ from decimal import Decimal
 from typing import Any, Optional, Sequence
 
 from sqlalchemy import and_, delete, select, update
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.database.models import (
@@ -19,6 +19,8 @@ from src.database.models import (
     PriceData,
     Signal,
     SignalResult,
+    SystemEvent,
+    VirtualPortfolio,
 )
 
 logger = logging.getLogger(__name__)
@@ -78,7 +80,7 @@ async def bulk_upsert_price_data(
     if not records:
         return 0
 
-    stmt = sqlite_insert(PriceData).values(records)
+    stmt = pg_insert(PriceData).values(records)
     stmt = stmt.on_conflict_do_nothing(
         index_elements=["instrument_id", "timeframe", "timestamp"]
     )
@@ -266,7 +268,7 @@ async def upsert_macro_data(
         return 0
     count = 0
     for record in records:
-        stmt = sqlite_insert(MacroData).values(record)
+        stmt = pg_insert(MacroData).values(record)
         stmt = stmt.on_conflict_do_nothing(
             index_elements=["indicator_name", "country", "release_date"]
         )
@@ -310,12 +312,138 @@ async def get_news_events(
     return result.scalars().all()
 
 
+def _get_instrument_keywords(symbol: str, market: str) -> list[str]:
+    """Return keyword list for instrument-aware news filtering.
+
+    v3: used by get_news_events_for_instrument to filter news relevant
+    to a specific instrument rather than returning last-N global news.
+    """
+    sym_upper = symbol.upper().replace("/", "").replace("-", "").replace("_", "")
+
+    if market == "forex":
+        # "EURUSD" → ["EUR", "USD", "ECB", "Federal Reserve", "euro", "dollar"]
+        _forex_keywords: dict[str, list[str]] = {
+            "EUR": ["EUR", "euro", "ECB", "European Central Bank"],
+            "USD": ["USD", "dollar", "Federal Reserve", "Fed", "FOMC"],
+            "GBP": ["GBP", "pound", "sterling", "Bank of England", "BOE"],
+            "JPY": ["JPY", "yen", "Bank of Japan", "BOJ"],
+            "AUD": ["AUD", "aussie", "Reserve Bank of Australia", "RBA"],
+            "CAD": ["CAD", "loonie", "Bank of Canada", "BOC"],
+            "CHF": ["CHF", "franc", "Swiss National Bank", "SNB"],
+            "NZD": ["NZD", "kiwi", "Reserve Bank of New Zealand", "RBNZ"],
+        }
+        keywords: list[str] = []
+        # Extract 3-letter currency codes from the symbol (e.g. EURUSD → EUR, USD)
+        for i in range(0, len(sym_upper) - 2, 3):
+            ccy = sym_upper[i : i + 3]
+            keywords.extend(_forex_keywords.get(ccy, [ccy]))
+        return keywords or [sym_upper]
+
+    elif market == "crypto":
+        _crypto_keywords: dict[str, list[str]] = {
+            "BTC": ["bitcoin", "BTC", "Bitcoin"],
+            "ETH": ["ethereum", "ETH", "Ethereum"],
+            "BNB": ["BNB", "Binance"],
+            "SOL": ["solana", "SOL", "Solana"],
+            "XRP": ["XRP", "Ripple"],
+            "ADA": ["cardano", "ADA", "Cardano"],
+            "DOGE": ["dogecoin", "DOGE", "Dogecoin"],
+            "MATIC": ["polygon", "MATIC", "Polygon"],
+        }
+        # symbol can be BTCUSDT, BTC/USDT, etc.
+        base = sym_upper[:3]
+        return _crypto_keywords.get(base, [base, symbol.split("/")[0].upper()])
+
+    elif market == "stocks":
+        # Use ticker directly + company name heuristic
+        ticker = sym_upper
+        return [ticker]
+
+    elif market == "commodities":
+        _commodity_keywords: dict[str, list[str]] = {
+            "GOLD": ["gold", "XAU", "bullion"],
+            "XAUUSD": ["gold", "XAU", "bullion"],
+            "SILVER": ["silver", "XAG"],
+            "XAGUSD": ["silver", "XAG"],
+            "OIL": ["oil", "crude", "WTI", "Brent", "OPEC"],
+            "USOIL": ["oil", "crude", "WTI", "OPEC"],
+            "UKOIL": ["oil", "crude", "Brent", "OPEC"],
+        }
+        return _commodity_keywords.get(sym_upper, [sym_upper])
+
+    return [symbol]
+
+
+async def get_news_events_for_instrument(
+    session: AsyncSession,
+    symbol: str,
+    market: str,
+    limit: int = 30,
+    hours_back: int = 24,
+    fallback_limit: int = 5,
+) -> list[NewsEvent]:
+    """Return news events filtered by relevance to the given instrument.
+
+    v3 fix: replaces generic get_news_events(db, limit=30) which returned
+    unrelated news for all instruments.
+
+    Strategy:
+    1. Fetch recent news matching instrument keywords in headline/summary.
+    2. If fewer than `fallback_limit` results, supplement with generic macro news.
+
+    Args:
+        symbol:         instrument symbol, e.g. "EUR/USD", "AAPL", "BTC/USDT"
+        market:         "forex" | "stocks" | "crypto" | "commodities"
+        limit:          max results to return
+        hours_back:     look-back window in hours
+        fallback_limit: minimum results before adding generic macro news
+    """
+    from_dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours_back)
+    keywords = _get_instrument_keywords(symbol, market)
+
+    # Build OR filter: headline or summary contains any keyword (case-insensitive)
+    from sqlalchemy import or_, func as sa_func  # noqa: PLC0415
+
+    keyword_filters = []
+    for kw in keywords:
+        kw_lower = kw.lower()
+        keyword_filters.append(sa_func.lower(NewsEvent.headline).contains(kw_lower))
+        keyword_filters.append(sa_func.lower(sa_func.coalesce(NewsEvent.summary, "")).contains(kw_lower))
+
+    stmt = (
+        select(NewsEvent)
+        .where(NewsEvent.published_at >= from_dt)
+        .where(or_(*keyword_filters))
+        .order_by(NewsEvent.published_at.desc())
+        .limit(limit)
+    )
+    result = await session.execute(stmt)
+    rows = list(result.scalars().all())
+
+    # Fallback: supplement with generic macro news if too few instrument-specific results
+    if len(rows) < fallback_limit:
+        macro_stmt = (
+            select(NewsEvent)
+            .where(NewsEvent.published_at >= from_dt)
+            .where(NewsEvent.importance.in_(["high", "critical"]))
+            .order_by(NewsEvent.published_at.desc())
+            .limit(fallback_limit - len(rows))
+        )
+        macro_result = await session.execute(macro_stmt)
+        existing_ids = {r.id for r in rows}
+        for macro_row in macro_result.scalars().all():
+            if macro_row.id not in existing_ids:
+                rows.append(macro_row)
+
+    return rows
+
+
 # ── EconomicEvent ─────────────────────────────────────────────────────────────
 
 
 async def upsert_economic_event(session: AsyncSession, data: dict[str, Any]) -> None:
     """Insert economic event; on conflict update estimate/actual/previous."""
-    stmt = sqlite_insert(EconomicEvent).values(**data)
+    stmt = pg_insert(EconomicEvent).values(**data)
     stmt = stmt.on_conflict_do_update(
         index_elements=["event_date", "country", "event_name"],
         set_={
@@ -358,3 +486,138 @@ async def delete_old_economic_events(session: AsyncSession) -> int:
     )
     await session.flush()
     return result.rowcount or 0
+
+
+# ── Virtual Portfolio ─────────────────────────────────────────────────────────
+
+
+async def create_virtual_position(
+    session: AsyncSession, data: dict[str, Any]
+) -> VirtualPortfolio:
+    """Open a new virtual position."""
+    pos = VirtualPortfolio(**data)
+    session.add(pos)
+    await session.flush()
+    return pos
+
+
+async def get_virtual_position(
+    session: AsyncSession, signal_id: int
+) -> Optional[VirtualPortfolio]:
+    result = await session.execute(
+        select(VirtualPortfolio).where(VirtualPortfolio.signal_id == signal_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_open_positions(session: AsyncSession) -> Sequence[VirtualPortfolio]:
+    """Return all positions with status 'open' or 'partial'."""
+    result = await session.execute(
+        select(VirtualPortfolio).where(
+            VirtualPortfolio.status.in_(["open", "partial"])
+        )
+    )
+    return result.scalars().all()
+
+
+async def update_virtual_position(
+    session: AsyncSession, signal_id: int, updates: dict[str, Any]
+) -> None:
+    await session.execute(
+        update(VirtualPortfolio)
+        .where(VirtualPortfolio.signal_id == signal_id)
+        .values(**updates)
+    )
+    await session.flush()
+
+
+async def close_virtual_position(
+    session: AsyncSession,
+    signal_id: int,
+    close_price: Decimal,
+    entry_price: Decimal,
+    direction: str,
+    status: str = "closed",
+) -> None:
+    """Mark position as closed and compute realized PnL %."""
+    if direction == "LONG":
+        pnl_pct = (close_price - entry_price) / entry_price * Decimal("100")
+    else:
+        pnl_pct = (entry_price - close_price) / entry_price * Decimal("100")
+
+    await session.execute(
+        update(VirtualPortfolio)
+        .where(VirtualPortfolio.signal_id == signal_id)
+        .values(
+            status=status,
+            closed_at=datetime.datetime.now(datetime.timezone.utc),
+            current_price=close_price,
+            realized_pnl_pct=pnl_pct.quantize(Decimal("0.0001")),
+            unrealized_pnl_pct=Decimal("0"),
+        )
+    )
+    await session.flush()
+
+
+# ── SystemEvent ───────────────────────────────────────────────────────────────
+
+
+async def create_system_event(session: AsyncSession, data: dict[str, Any]) -> SystemEvent:
+    event = SystemEvent(**data)
+    session.add(event)
+    await session.flush()
+    return event
+
+
+async def get_system_events(
+    session: AsyncSession,
+    level: Optional[str] = None,
+    event_type: Optional[str] = None,
+    symbol: Optional[str] = None,
+    limit: int = 100,
+) -> Sequence[SystemEvent]:
+    stmt = select(SystemEvent).order_by(SystemEvent.created_at.desc()).limit(limit)
+    if level:
+        stmt = stmt.where(SystemEvent.level == level)
+    if event_type:
+        stmt = stmt.where(SystemEvent.event_type == event_type)
+    if symbol:
+        stmt = stmt.where(SystemEvent.symbol == symbol)
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+
+async def cleanup_system_events(session: AsyncSession, days: int = 3) -> int:
+    """Delete system events older than `days` days. Returns count deleted."""
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
+    result = await session.execute(
+        delete(SystemEvent).where(SystemEvent.created_at < cutoff)
+    )
+    await session.flush()
+    return result.rowcount or 0
+
+
+async def get_portfolio_pnl(session: AsyncSession) -> dict[str, Any]:
+    """Aggregate open and closed PnL."""
+    open_positions = await get_open_positions(session)
+    result = await session.execute(
+        select(VirtualPortfolio).where(
+            VirtualPortfolio.status.notin_(["open", "partial"])
+        )
+    )
+    closed_positions = result.scalars().all()
+
+    open_pnl = sum(
+        float(p.unrealized_pnl_pct or 0) for p in open_positions
+    )
+    realized_pnl = sum(
+        float(p.realized_pnl_pct or 0) for p in closed_positions
+    )
+
+    return {
+        "open_count": len(open_positions),
+        "open_unrealized_pnl_pct": round(open_pnl, 4),
+        "closed_count": len(closed_positions),
+        "realized_pnl_pct": round(realized_pnl, 4),
+        "total_pnl_pct": round(open_pnl + realized_pnl, 4),
+    }

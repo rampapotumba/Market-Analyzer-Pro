@@ -46,3 +46,19 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# FinBERT model cache
+models/
+services/finbert/models/
+
+# Node.js (frontend)
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+
+# Celery
+celerybeat-schedule
+celerybeat-schedule.db
+
+# Grafana
+infra/grafana/data/

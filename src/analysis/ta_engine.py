@@ -16,6 +16,21 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# ── v3: Timeframe-adaptive indicator periods ───────────────────────────────────
+# Different timeframes have different meaningful MA lookback ranges.
+# H4 with SMA200 would require 800+ trading days of data (overkill).
+# D1 needs longer periods to smooth out noise.
+TF_INDICATOR_PERIODS: dict[str, dict[str, int]] = {
+    "M1":  {"rsi": 14, "sma_fast": 20, "sma_slow": 50, "sma_long": 200, "ema_fast": 12, "ema_slow": 26},
+    "M5":  {"rsi": 14, "sma_fast": 20, "sma_slow": 50, "sma_long": 200, "ema_fast": 12, "ema_slow": 26},
+    "M15": {"rsi": 14, "sma_fast": 20, "sma_slow": 50, "sma_long": 200, "ema_fast": 12, "ema_slow": 26},
+    "H1":  {"rsi": 14, "sma_fast": 20, "sma_slow": 50, "sma_long": 200, "ema_fast": 12, "ema_slow": 26},
+    "H4":  {"rsi": 14, "sma_fast": 20, "sma_slow": 50, "sma_long": 100, "ema_fast": 12, "ema_slow": 26},
+    "D1":  {"rsi": 14, "sma_fast": 50, "sma_slow": 100, "sma_long": 200, "ema_fast": 21, "ema_slow": 55},
+    "W1":  {"rsi": 14, "sma_fast": 50, "sma_slow": 100, "sma_long": 200, "ema_fast": 21, "ema_slow": 55},
+    "_default": {"rsi": 14, "sma_fast": 20, "sma_slow": 50, "sma_long": 200, "ema_fast": 12, "ema_slow": 26},
+}
+
 # TA indicator weights (must sum to 1.0)
 TA_WEIGHTS = {
     "macd": 0.20,
@@ -44,13 +59,20 @@ def _safe_last(series) -> Optional[float]:
 class TAEngine:
     """Technical Analysis Engine. Accepts an OHLCV DataFrame."""
 
-    def __init__(self, df: pd.DataFrame) -> None:
+    def __init__(self, df: pd.DataFrame, timeframe: str = "H1") -> None:
         """
         Args:
-            df: DataFrame with columns [Open/open, High/high, Low/low, Close/close, Volume/volume]
-                indexed by datetime.
+            df:        DataFrame with columns [Open/open, High/high, Low/low, Close/close, Volume/volume]
+                       indexed by datetime.
+            timeframe: Trading timeframe string (e.g. "M15", "H1", "H4", "D1").
+                       Used to select adaptive indicator periods. Defaults to "H1".
         """
         self.df = df.copy()
+        self._timeframe = timeframe
+        # v3: load TF-adaptive periods (3.2.5)
+        self._periods: dict[str, int] = TF_INDICATOR_PERIODS.get(
+            timeframe, TF_INDICATOR_PERIODS["_default"]
+        )
         self._normalize_columns()
         self._indicators: Optional[dict[str, Any]] = None
         self._signals: Optional[dict[str, Any]] = None
@@ -142,10 +164,37 @@ class TAEngine:
             plus_di = talib.PLUS_DI(self._high, self._low, self._close, timeperiod=period)
             minus_di = talib.MINUS_DI(self._high, self._low, self._close, timeperiod=period)
             return adx, plus_di, minus_di
-        # Fallback: simplified
+
+        # v3 fallback: proper Directional Movement calculation (3.2.2)
+        # Previously returned constant 25/25/25 causing ADX signal = 0 always.
         close = pd.Series(self._close)
-        adx = pd.Series(np.full(len(close), 25.0))  # neutral
-        return adx.values, adx.values, adx.values
+        high = pd.Series(self._high)
+        low = pd.Series(self._low)
+
+        # True Range
+        tr = pd.concat([
+            high - low,
+            (high - close.shift()).abs(),
+            (low - close.shift()).abs(),
+        ], axis=1).max(axis=1)
+        atr = tr.ewm(span=period, adjust=False).mean()
+
+        # Directional Movement
+        up_move = high.diff()
+        down_move = -low.diff()
+        plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+        minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+
+        smoothed_plus_dm = plus_dm.ewm(span=period, adjust=False).mean()
+        smoothed_minus_dm = minus_dm.ewm(span=period, adjust=False).mean()
+
+        plus_di = 100.0 * smoothed_plus_dm / atr.replace(0, np.nan)
+        minus_di = 100.0 * smoothed_minus_dm / atr.replace(0, np.nan)
+
+        dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+        adx = dx.ewm(span=period, adjust=False).mean()
+
+        return adx.fillna(25.0).values, plus_di.fillna(25.0).values, minus_di.fillna(25.0).values
 
     def _calc_stochastic(self, k_period: int = 14, d_period: int = 3):
         if TALIB_AVAILABLE:
@@ -211,15 +260,85 @@ class TAEngine:
             return -1
         return 0
 
-    def _find_support_resistance(self) -> dict[str, float]:
-        """Find approximate support and resistance using recent highs/lows."""
-        if len(self.df) < 20:
-            return {"support": 0.0, "resistance": 0.0}
+    def _find_support_resistance(self) -> dict[str, Any]:
+        """Find S/R levels using pivot-point clustering.
 
-        recent = self.df.tail(50)
-        support = float(recent["low"].min())
-        resistance = float(recent["high"].max())
-        return {"support": support, "resistance": resistance}
+        v3 fix (3.2.3): replaced simplistic min/max of last 50 candles with
+        a cluster-based approach that counts touches.
+
+        Algorithm:
+          1. Collect pivot highs / lows (local extremes with 3 candles each side).
+          2. Group by price proximity (tolerance = ATR × 0.3).
+          3. Return levels with most touches as S/R.
+        """
+        if len(self.df) < 20:
+            return {
+                "support": 0.0, "resistance": 0.0,
+                "nearest_support_touches": 0, "nearest_resistance_touches": 0,
+            }
+
+        atr = self._calc_atr(14)
+        atr_val = float(atr[-1]) if atr is not None and len(atr) > 0 and not np.isnan(atr[-1]) else 0.0
+        tolerance = atr_val * 0.3 if atr_val > 0 else 0.001
+
+        window = 3
+        highs = self.df["high"].values
+        lows = self.df["low"].values
+        close = float(self.df["close"].iloc[-1])
+
+        pivots_high: list[float] = []
+        pivots_low: list[float] = []
+
+        for i in range(window, len(self.df) - window):
+            if all(highs[i] >= highs[i - j] for j in range(1, window + 1)) and \
+               all(highs[i] >= highs[i + j] for j in range(1, window + 1)):
+                pivots_high.append(float(highs[i]))
+            if all(lows[i] <= lows[i - j] for j in range(1, window + 1)) and \
+               all(lows[i] <= lows[i + j] for j in range(1, window + 1)):
+                pivots_low.append(float(lows[i]))
+
+        def cluster_levels(levels: list[float], tol: float) -> list[tuple[float, int]]:
+            """Group nearby levels; return (avg_price, touch_count) sorted by touches."""
+            if not levels:
+                return []
+            clusters: list[tuple[float, int]] = []
+            used = [False] * len(levels)
+            for i, lvl in enumerate(levels):
+                if used[i]:
+                    continue
+                group = [lvl]
+                for j, other in enumerate(levels):
+                    if not used[j] and i != j and abs(lvl - other) <= tol:
+                        group.append(other)
+                        used[j] = True
+                clusters.append((sum(group) / len(group), len(group)))
+                used[i] = True
+            return sorted(clusters, key=lambda x: x[1], reverse=True)
+
+        resistance_clusters = cluster_levels(
+            [p for p in pivots_high if p > close], tolerance
+        )
+        support_clusters = cluster_levels(
+            [p for p in pivots_low if p < close], tolerance
+        )
+
+        resistance = (
+            resistance_clusters[0][0]
+            if resistance_clusters
+            else float(self.df["high"].tail(50).max())
+        )
+        support = (
+            support_clusters[0][0]
+            if support_clusters
+            else float(self.df["low"].tail(50).min())
+        )
+
+        return {
+            "support": support,
+            "resistance": resistance,
+            "nearest_resistance_touches": resistance_clusters[0][1] if resistance_clusters else 0,
+            "nearest_support_touches": support_clusters[0][1] if support_clusters else 0,
+        }
 
     def calculate_all_indicators(self) -> dict[str, Any]:
         """Calculate all technical indicators. Returns dict with values."""
@@ -228,8 +347,11 @@ class TAEngine:
 
         indicators: dict[str, Any] = {}
 
+        # v3: use TF-adaptive periods (3.2.5)
+        p = self._periods
+
         # RSI
-        rsi = self._calc_rsi(14)
+        rsi = self._calc_rsi(p["rsi"])
         indicators["rsi"] = _safe_last(rsi)
 
         # MACD
@@ -238,8 +360,8 @@ class TAEngine:
         indicators["macd_signal"] = _safe_last(macd_signal)
         indicators["macd_hist"] = _safe_last(macd_hist)
 
-        # Bollinger Bands
-        bb_upper, bb_middle, bb_lower = self._calc_bb(20, 2.0)
+        # Bollinger Bands (uses sma_fast period)
+        bb_upper, bb_middle, bb_lower = self._calc_bb(p["sma_fast"], 2.0)
         indicators["bb_upper"] = _safe_last(bb_upper)
         indicators["bb_middle"] = _safe_last(bb_middle)
         indicators["bb_lower"] = _safe_last(bb_lower)
@@ -248,12 +370,13 @@ class TAEngine:
             if indicators["bb_middle"] else None
         )
 
-        # Moving Averages
-        indicators["sma20"] = _safe_last(self._calc_sma(20))
-        indicators["sma50"] = _safe_last(self._calc_sma(50))
-        indicators["sma200"] = _safe_last(self._calc_sma(200))
-        indicators["ema12"] = _safe_last(self._calc_ema(12))
-        indicators["ema26"] = _safe_last(self._calc_ema(26))
+        # Moving Averages — keys kept as sma20/50/200 for backward compat;
+        # actual periods come from TF_INDICATOR_PERIODS.
+        indicators["sma20"] = _safe_last(self._calc_sma(p["sma_fast"]))
+        indicators["sma50"] = _safe_last(self._calc_sma(p["sma_slow"]))
+        indicators["sma200"] = _safe_last(self._calc_sma(p["sma_long"]))
+        indicators["ema12"] = _safe_last(self._calc_ema(p["ema_fast"]))
+        indicators["ema26"] = _safe_last(self._calc_ema(p["ema_slow"]))
 
         # ADX
         adx, plus_di, minus_di = self._calc_adx(14)
@@ -276,10 +399,12 @@ class TAEngine:
         indicators["current_volume"] = float(self.df["volume"].iloc[-1])
         indicators["avg_volume_20"] = float(self.df["volume"].tail(20).mean())
 
-        # Support/Resistance
+        # Support/Resistance — v3: cluster-based with touch counts (3.2.3)
         sr = self._find_support_resistance()
         indicators["support"] = sr["support"]
         indicators["resistance"] = sr["resistance"]
+        indicators["nearest_support_touches"] = sr.get("nearest_support_touches", 0)
+        indicators["nearest_resistance_touches"] = sr.get("nearest_resistance_touches", 0)
 
         # Candle patterns
         indicators["candle_pattern"] = self._detect_candle_patterns()
@@ -321,6 +446,45 @@ class TAEngine:
         self._indicators = indicators
         return indicators
 
+    def _rsi_signal(self, rsi: float, adx: Optional[float]) -> dict[str, Any]:
+        """RSI signal with ADX trend context.
+
+        v3 fix (3.2.1): contextual RSI avoids false oversold buy signals in downtrends.
+
+        ADX >= 25 (trend mode):
+            RSI 40-55 = pullback into trend → bullish entry signal
+            RSI 45-60 = pullback in downtrend → bearish entry signal
+            RSI < 30  = oversold trap filter → reduced strength (×0.4)
+            RSI > 70  = overbought trap filter → reduced strength (×0.4)
+
+        ADX < 25 (range mode):
+            RSI < 30 = classic oversold → bullish
+            RSI > 70 = classic overbought → bearish
+        """
+        trending = adx is not None and adx >= 25
+
+        if not trending:
+            # Range mode: classic oversold/overbought
+            if rsi < 30:
+                return {"signal": 1, "strength": (30 - rsi) / 30}
+            elif rsi > 70:
+                return {"signal": -1, "strength": (rsi - 70) / 30}
+            else:
+                return {"signal": 0, "strength": 0.0}
+        else:
+            # Trend mode: RSI as pullback indicator
+            if 40 <= rsi <= 55:
+                return {"signal": 1, "strength": (55 - rsi) / 15}
+            elif 45 <= rsi <= 60:
+                return {"signal": -1, "strength": (rsi - 45) / 15}
+            # Extreme zones get reduced weight in trend (trap filter)
+            elif rsi < 30:
+                return {"signal": 1, "strength": (30 - rsi) / 30 * 0.4}
+            elif rsi > 70:
+                return {"signal": -1, "strength": (rsi - 70) / 30 * 0.4}
+            else:
+                return {"signal": 0, "strength": 0.0}
+
     def generate_ta_signals(self) -> dict[str, Any]:
         """
         Generate signals for each indicator.
@@ -332,15 +496,11 @@ class TAEngine:
         ind = self.calculate_all_indicators()
         signals: dict[str, Any] = {}
 
-        # RSI signal
+        # RSI signal — v3: ADX-contextual (3.2.1)
         rsi = ind.get("rsi")
+        adx_for_rsi = ind.get("adx")
         if rsi is not None:
-            if rsi < 30:
-                signals["rsi"] = {"signal": 1, "strength": (30 - rsi) / 30}
-            elif rsi > 70:
-                signals["rsi"] = {"signal": -1, "strength": (rsi - 70) / 30}
-            else:
-                signals["rsi"] = {"signal": 0, "strength": abs(rsi - 50) / 50}
+            signals["rsi"] = self._rsi_signal(rsi, adx_for_rsi)
         else:
             signals["rsi"] = {"signal": 0, "strength": 0.0}
 
@@ -424,7 +584,7 @@ class TAEngine:
         plus_di = ind.get("plus_di")
         minus_di = ind.get("minus_di")
         if adx is not None and plus_di is not None and minus_di is not None:
-            if adx > 25:  # Strong trend
+            if adx >= 20 and plus_di != minus_di:  # Trending (>= 20 to handle fallback boundary)
                 if plus_di > minus_di:
                     signals["adx"] = {"signal": 1, "strength": min(adx / 100, 1.0)}
                 else:
@@ -434,43 +594,66 @@ class TAEngine:
         else:
             signals["adx"] = {"signal": 0, "strength": 0.0}
 
-        # Stochastic signal
+        # Stochastic signal — fires on oversold/overbought zone; crossover adds strength
         stoch_k = ind.get("stoch_k")
         stoch_d = ind.get("stoch_d")
         if stoch_k is not None and stoch_d is not None:
-            if stoch_k < 20 and stoch_k > stoch_d:
-                signals["stochastic"] = {"signal": 1, "strength": (20 - stoch_k) / 20}
-            elif stoch_k > 80 and stoch_k < stoch_d:
-                signals["stochastic"] = {"signal": -1, "strength": (stoch_k - 80) / 20}
+            if stoch_k < 20:
+                base_strength = (20 - stoch_k) / 20
+                # Crossover confirmation (K rising above D) boosts strength
+                crossover_boost = 1.2 if stoch_k > stoch_d else 1.0
+                signals["stochastic"] = {"signal": 1, "strength": min(base_strength * crossover_boost, 1.0)}
+            elif stoch_k > 80:
+                base_strength = (stoch_k - 80) / 20
+                crossover_boost = 1.2 if stoch_k < stoch_d else 1.0
+                signals["stochastic"] = {"signal": -1, "strength": min(base_strength * crossover_boost, 1.0)}
             else:
                 signals["stochastic"] = {"signal": 0, "strength": 0.0}
         else:
             signals["stochastic"] = {"signal": 0, "strength": 0.0}
 
-        # Volume signal
+        # Volume signal — v3: direction via price vs SMA20 (3.2.4)
+        # Previously used MACD direction: MACD can be bullish while price falls.
+        # SMA20 (fast MA) more directly reflects short-term price trend.
         avg_vol = ind.get("avg_volume_20", 0)
         curr_vol = ind.get("current_volume", 0)
         if avg_vol > 0:
             vol_ratio = curr_vol / avg_vol
             if vol_ratio > 1.5:
-                # High volume: confirms current direction
-                macd_dir = signals.get("macd", {}).get("signal", 0)
-                signals["volume"] = {"signal": macd_dir, "strength": min((vol_ratio - 1) / 2, 1.0)}
+                sma20 = ind.get("sma20")
+                curr_close = ind["current_price"]
+                price_dir = 0
+                if sma20 is not None and sma20 != 0:
+                    price_dir = 1 if curr_close > sma20 else -1
+                signals["volume"] = {"signal": price_dir, "strength": min((vol_ratio - 1) / 2, 1.0)}
             else:
                 signals["volume"] = {"signal": 0, "strength": vol_ratio / 1.5}
         else:
             signals["volume"] = {"signal": 0, "strength": 0.0}
 
-        # Support/Resistance signal
+        # Support/Resistance signal — v3: touch-count boost (3.2.3)
         support = ind.get("support", 0)
         resistance = ind.get("resistance", 0)
+        sup_touches = ind.get("nearest_support_touches", 0)
+        res_touches = ind.get("nearest_resistance_touches", 0)
         if resistance > support > 0:
             sr_range = resistance - support
             position_in_range = (close - support) / sr_range
             if position_in_range < 0.15:
-                signals["support_resistance"] = {"signal": 1, "strength": (0.15 - position_in_range) / 0.15}
+                # Near support: boost signal if level has multiple touches
+                touch_boost = 1.0 + min(0.5, (sup_touches - 1) * 0.15) if sup_touches >= 2 else 1.0
+                raw_strength = (0.15 - position_in_range) / 0.15
+                signals["support_resistance"] = {
+                    "signal": 1,
+                    "strength": min(raw_strength * touch_boost, 1.0),
+                }
             elif position_in_range > 0.85:
-                signals["support_resistance"] = {"signal": -1, "strength": (position_in_range - 0.85) / 0.15}
+                touch_boost = 1.0 + min(0.5, (res_touches - 1) * 0.15) if res_touches >= 2 else 1.0
+                raw_strength = (position_in_range - 0.85) / 0.15
+                signals["support_resistance"] = {
+                    "signal": -1,
+                    "strength": min(raw_strength * touch_boost, 1.0),
+                }
             else:
                 signals["support_resistance"] = {"signal": 0, "strength": 0.0}
         else:

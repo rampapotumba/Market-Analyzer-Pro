@@ -24,46 +24,70 @@ class FAEngine:
         news_data: list[Any],
     ) -> None:
         self.instrument = instrument
-        self.macro_data = macro_data
         self.news_data = news_data
+        # Build latest + previous maps from sorted records (desc by release_date)
+        # so the FAEngine can compute deltas even when previous_value is NULL in DB
+        self.macro_data = macro_data
+        self._latest: dict[str, float] = {}
+        self._previous: dict[str, float] = {}
+        seen: dict[str, int] = {}  # indicator → how many times we've seen it
+        for item in macro_data:
+            name = item.indicator_name if hasattr(item, "indicator_name") else item.get("indicator_name", "")
+            val = item.value if hasattr(item, "value") else item.get("value")
+            if val is None:
+                continue
+            val_f = float(val)
+            count = seen.get(name, 0)
+            if count == 0:
+                self._latest[name] = val_f
+            elif count == 1:
+                self._previous[name] = val_f
+            seen[name] = count + 1
+
+    def _delta(self, indicator: str) -> Optional[float]:
+        """Return (latest - previous) for an indicator, or None if insufficient data."""
+        val = self._latest.get(indicator)
+        prev = self._previous.get(indicator)
+        if val is None or prev is None:
+            return None
+        return val - prev
+
+    def _pct_change(self, indicator: str) -> Optional[float]:
+        """Return % change for an indicator, or None if insufficient data."""
+        val = self._latest.get(indicator)
+        prev = self._previous.get(indicator)
+        if val is None or prev is None or prev == 0:
+            return None
+        return (val - prev) / prev * 100
 
     def _analyze_forex_fundamentals(self) -> float:
         """Analyze fundamentals for forex instruments."""
         score = 0.0
         count = 0
 
-        for item in self.macro_data:
-            ind_name = item.indicator_name if hasattr(item, 'indicator_name') else item.get('indicator_name', '')
-            value = float(item.value) if hasattr(item, 'value') and item.value is not None else None
-            prev = float(item.previous_value) if hasattr(item, 'previous_value') and item.previous_value is not None else None
+        if (d := self._delta("FEDFUNDS")) is not None:
+            score -= d * 10  # Rate hike → USD stronger → bearish EUR/USD
+            count += 1
+        elif "FEDFUNDS" in self._latest:
+            count += 1  # Have data but no prev — neutral contribution
 
-            if value is None:
-                continue
+        if (p := self._pct_change("CPIAUCSL")) is not None:
+            score -= p * 5  # Higher CPI may signal rate hikes → USD stronger
+            count += 1
+        elif "CPIAUCSL" in self._latest:
+            count += 1
 
-            if ind_name == "FEDFUNDS":
-                # Higher rates = stronger USD = bearish for EUR/USD
-                if prev is not None:
-                    delta = value - prev
-                    score -= delta * 10  # Rate hike → USD stronger → bearish EUR/USD
-                count += 1
-            elif ind_name == "CPIAUCSL":
-                # Higher CPI may signal rate hikes ahead
-                if prev is not None and prev > 0:
-                    pct_change = (value - prev) / prev * 100
-                    score -= pct_change * 5
-                count += 1
-            elif ind_name == "UNRATE":
-                # Lower unemployment = stronger economy = stronger USD = bearish for EUR/USD
-                if prev is not None:
-                    delta = value - prev
-                    score += delta * 15  # Unemployment drop (delta<0) → USD stronger → negative score
-                count += 1
-            elif ind_name == "GDPC1":
-                # Higher GDP = stronger economy
-                if prev is not None and prev > 0:
-                    pct_change = (value - prev) / prev * 100
-                    score -= pct_change * 8  # Stronger GDP = USD stronger
-                count += 1
+        if (d := self._delta("UNRATE")) is not None:
+            score += d * 15  # Unemployment drop (delta<0) → USD stronger → negative score
+            count += 1
+        elif "UNRATE" in self._latest:
+            count += 1
+
+        if (p := self._pct_change("GDPC1")) is not None:
+            score -= p * 8  # Stronger GDP = USD stronger
+            count += 1
+        elif "GDPC1" in self._latest:
+            count += 1
 
         # Symbol-specific adjustments
         symbol = self.instrument.symbol if hasattr(self.instrument, 'symbol') else ""
@@ -81,35 +105,30 @@ class FAEngine:
         score = 0.0
         count = 0
 
-        for item in self.macro_data:
-            ind_name = item.indicator_name if hasattr(item, 'indicator_name') else item.get('indicator_name', '')
-            value = float(item.value) if hasattr(item, 'value') and item.value is not None else None
-            prev = float(item.previous_value) if hasattr(item, 'previous_value') and item.previous_value is not None else None
+        if (p := self._pct_change("GDPC1")) is not None:
+            score += p * 10  # Better GDP = positive for stocks
+            count += 1
+        elif "GDPC1" in self._latest:
+            count += 1
 
-            if value is None:
-                continue
+        if (d := self._delta("UNRATE")) is not None:
+            score -= d * 20  # Lower unemployment = bullish stocks
+            count += 1
+        elif "UNRATE" in self._latest:
+            count += 1
 
-            if ind_name == "GDPC1":
-                if prev is not None and prev > 0:
-                    pct_change = (value - prev) / prev * 100
-                    score += pct_change * 10  # Better GDP = positive for stocks
-                count += 1
-            elif ind_name == "UNRATE":
-                if prev is not None:
-                    delta = value - prev
-                    score -= delta * 20  # Lower unemployment = bullish stocks
-                count += 1
-            elif ind_name == "FEDFUNDS":
-                if prev is not None:
-                    delta = value - prev
-                    score -= delta * 15  # Rate hikes = bearish stocks
-                count += 1
-            elif ind_name == "CPIAUCSL":
-                if prev is not None and prev > 0:
-                    pct_change = (value - prev) / prev * 100
-                    if pct_change > 0.5:
-                        score -= pct_change * 5  # High inflation = bearish
-                    count += 1
+        if (d := self._delta("FEDFUNDS")) is not None:
+            score -= d * 15  # Rate hikes = bearish stocks
+            count += 1
+        elif "FEDFUNDS" in self._latest:
+            count += 1
+
+        if (p := self._pct_change("CPIAUCSL")) is not None:
+            if p > 0.5:
+                score -= p * 5  # High inflation = bearish
+            count += 1
+        elif "CPIAUCSL" in self._latest:
+            count += 1
 
         return max(-100.0, min(100.0, score / max(count, 1)))
 

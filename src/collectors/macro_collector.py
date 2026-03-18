@@ -2,16 +2,20 @@
 
 import asyncio
 import datetime
+import json
 import logging
 from decimal import Decimal
 from typing import Any, Optional
 
 import httpx
 
+from src.cache import cache
 from src.collectors.base import BaseCollector, CollectorResult
 from src.config import settings
 from src.database.crud import upsert_macro_data
 from src.database.engine import async_session_factory
+
+_CACHE_TTL = 3600 * 6  # 6 hours — FRED data updates infrequently
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +49,14 @@ class FREDCollector(BaseCollector):
         if not self.api_key:
             return []
 
+        cache_key = f"fred:{series_id}:{limit}"
+        cached = await cache.get(cache_key)
+        if cached:
+            try:
+                return json.loads(cached)
+            except Exception:
+                pass
+
         params = {
             "series_id": series_id,
             "api_key": self.api_key,
@@ -57,7 +69,14 @@ class FREDCollector(BaseCollector):
             response = await client.get(FRED_BASE_URL, params=params)
             response.raise_for_status()
             data = response.json()
-            return data.get("observations", [])
+            observations = data.get("observations", [])
+
+        try:
+            await cache.set(cache_key, json.dumps(observations), ttl=_CACHE_TTL)
+        except Exception:
+            pass
+
+        return observations
 
     async def collect_series(self, series_id: str) -> CollectorResult:
         """Collect a single FRED series."""

@@ -1,0 +1,90 @@
+groups:
+  - name: market_analyzer_alerts
+    interval: 30s
+    rules:
+
+      # ── Collector Alerts ──────────────────────────────────────────────────────
+
+      - alert: CollectorDown
+        expr: collector_up == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Collector {{ $labels.collector }} is down"
+          description: >
+            The {{ $labels.collector }} data collector has been reporting failures
+            for more than 5 minutes. Signals may be degraded.
+
+      - alert: AllCollectorsDown
+        expr: sum(collector_up) == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "ALL collectors are down"
+          description: >
+            No data collectors are reporting healthy. Signal generation is halted.
+
+      # ── Latency Alerts ────────────────────────────────────────────────────────
+
+      - alert: HighAPILatency
+        expr: >
+          histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 2.0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High API latency (p95 > 2s)"
+          description: >
+            The p95 API response time is {{ $value | humanizeDuration }} over the last 5 minutes.
+
+      - alert: CollectorHighLatency
+        expr: >
+          histogram_quantile(0.95, rate(collector_latency_seconds_bucket[5m])) > 30
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Slow collector: {{ $labels.collector }} (p95 > 30s)"
+          description: >
+            The {{ $labels.collector }} collector p95 latency is {{ $value | humanizeDuration }}.
+
+      # ── Portfolio Alerts ──────────────────────────────────────────────────────
+
+      - alert: PortfolioHeatHigh
+        expr: portfolio_heat_percent > 5.5
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Portfolio heat approaching limit ({{ $value | humanize }}%)"
+          description: >
+            Portfolio heat is {{ $value }}% (limit 6%). No new positions should be opened.
+
+      # ── Circuit Breaker Alerts ────────────────────────────────────────────────
+
+      - alert: CircuitBreakerOpen
+        expr: circuit_breaker_state == 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Circuit breaker {{ $labels.name }} is OPEN"
+          description: >
+            The {{ $labels.name }} circuit breaker has been open for 2+ minutes.
+            External API calls to this service are being blocked.
+
+      # ── Application Availability ──────────────────────────────────────────────
+
+      - alert: AppHighErrorRate
+        expr: >
+          rate(http_requests_total{status_code=~"5.."}[5m]) /
+          rate(http_requests_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High HTTP error rate (>5%)"
+          description: >
+            {{ $value | humanizePercentage }} of requests are returning 5xx errors.

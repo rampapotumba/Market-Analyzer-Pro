@@ -162,7 +162,7 @@ async def list_instruments(
     return [InstrumentResponse.model_validate(i) for i in instruments]
 
 
-@router.get("/prices/{symbol}", response_model=list[PriceDataResponse])
+@router.get("/prices/{symbol:path}", response_model=list[PriceDataResponse])
 async def get_prices(
     symbol: str,
     timeframe: str = Query("H1", description="Timeframe: M1/M5/M15/H1/H4/D1/W1"),
@@ -193,14 +193,15 @@ async def get_prices(
     ]
 
 
-@router.post("/analyze/{symbol}", response_model=SignalResponse)
+@router.post("/analyze/{symbol:path}")
 async def analyze_symbol(
     symbol: str,
     timeframe: str = Query("H4", description="Timeframe: M1/M5/M15/H1/H4/D1/W1"),
     db: AsyncSession = Depends(get_session),
-) -> SignalResponse:
+) -> dict:
     """Run analysis for a symbol and generate a trading signal.
     Auto-collects price data if not enough exists in the DB.
+    Returns the signal if actionable, or a no_signal response with reason for HOLD.
     """
     instrument = await get_instrument_by_symbol(db, symbol)
     if not instrument:
@@ -234,12 +235,38 @@ async def analyze_symbol(
         raise HTTPException(status_code=500, detail=str(exc))
 
     if signal is None:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Could not generate signal for {symbol}/{timeframe}. Try a different timeframe.",
-        )
+        # No actionable signal (HOLD zone, cooldown, or insufficient data)
+        # Return 200 with a no_signal status so the frontend can display analysis info
+        return {
+            "status": "no_signal",
+            "direction": "HOLD",
+            "signal_strength": "HOLD",
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "composite_score": "0",
+            "confidence": 0.0,
+            "horizon": None,
+            "entry_price": None,
+            "stop_loss": None,
+            "take_profit_1": None,
+            "take_profit_2": None,
+            "risk_reward": None,
+            "ta_score": "0",
+            "fa_score": "0",
+            "sentiment_score": "0",
+            "geo_score": "0",
+            "reasoning": None,
+            "indicators_snapshot": None,
+            "message": (
+                f"No actionable signal for {symbol}/{timeframe}. "
+                "Market is in consolidation or cooldown is active. "
+                "Analysis is running — try again shortly or switch timeframe."
+            ),
+        }
 
-    return SignalResponse.model_validate(signal)
+    data = SignalResponse.model_validate(signal).model_dump()
+    data["status_ok"] = True
+    return data
 
 
 @router.get("/signals", response_model=list[SignalResponse])
@@ -256,7 +283,7 @@ async def list_signals(
     return [SignalResponse.model_validate(s) for s in signals]
 
 
-@router.get("/signals/latest/{symbol}", response_model=Optional[SignalResponse])
+@router.get("/signals/latest/{symbol:path}", response_model=Optional[SignalResponse])
 async def get_latest_signal(
     symbol: str,
     timeframe: Optional[str] = Query(None),

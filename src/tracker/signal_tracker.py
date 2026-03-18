@@ -9,11 +9,15 @@ from typing import Any, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.database.crud import (
+    close_virtual_position,
     create_signal_result,
+    create_virtual_position,
     get_active_signals,
     get_instrument_by_id,
     get_price_data,
+    get_virtual_position,
     update_signal_status,
+    update_virtual_position,
 )
 from src.database.engine import async_session_factory
 from src.database.models import Signal
@@ -26,7 +30,7 @@ ENTRY_TOLERANCE_PCT = Decimal("0.001")  # 0.1%
 
 
 def _utc(dt: Optional[datetime.datetime]) -> Optional[datetime.datetime]:
-    """Ensure datetime is UTC-aware. SQLite returns naive datetimes."""
+    """Ensure datetime is UTC-aware (handles naive datetimes from legacy data)."""
     if dt is None:
         return None
     if dt.tzinfo is None:
@@ -146,15 +150,21 @@ class SignalTracker:
         self,
         db: AsyncSession,
         signal: Signal,
+        current_price: Optional[Decimal] = None,
     ) -> None:
-        """Process a single signal and update its status."""
+        """Process a single signal and update its status.
+
+        Args:
+            current_price: If provided, use this live price instead of fetching from DB.
+        """
         now = datetime.datetime.now(datetime.timezone.utc)
 
         # Check expiry
         if signal.expires_at and now > _utc(signal.expires_at):
             if signal.status in ("created", "active", "tracking"):
                 instrument = await get_instrument_by_id(db, signal.instrument_id)
-                current_price = await self._get_current_price(db, signal.instrument_id)
+                if current_price is None:
+                    current_price = await self._get_current_price(db, signal.instrument_id)
 
                 result_data = {
                     "signal_id": signal.id,
@@ -184,8 +194,9 @@ class SignalTracker:
                 logger.info(f"[Tracker] Signal {signal.id} expired")
             return
 
-        # Get current price
-        current_price = await self._get_current_price(db, signal.instrument_id)
+        # Get current price (use injected live price if available)
+        if current_price is None:
+            current_price = await self._get_current_price(db, signal.instrument_id)
         if current_price is None:
             logger.debug(f"[Tracker] No price data for signal {signal.id}")
             return
@@ -200,12 +211,17 @@ class SignalTracker:
             if self._check_entry(current_price, entry_price, signal.direction):
                 async with db.begin_nested():
                     await update_signal_status(db, signal.id, "tracking")
+                    # Create virtual portfolio position on entry fill
+                    await self._open_virtual_position(db, signal, entry_price)
                 logger.info(
                     f"[Tracker] Signal {signal.id} activated: "
                     f"{signal.direction} @ {current_price}"
                 )
 
         elif signal.status in ("active", "tracking"):
+            # Update unrealized PnL on virtual position
+            await self._update_virtual_unrealized(db, signal, current_price)
+
             # Check TP2 first (higher profit target)
             tp2_hit, _ = self._check_tp_hit(current_price, signal.take_profit_2, signal.direction)
             tp1_hit, _ = self._check_tp_hit(current_price, signal.take_profit_1, signal.direction)
@@ -259,6 +275,20 @@ class SignalTracker:
         async with db.begin_nested():
             await create_signal_result(db, result_data)
             await update_signal_status(db, signal.id, "completed")
+            # Close virtual portfolio position
+            try:
+                position = await get_virtual_position(db, signal.id)
+                if position and position.status == "open":
+                    entry = position.entry_price or entry_price
+                    await close_virtual_position(
+                        db,
+                        signal_id=signal.id,
+                        close_price=exit_price,
+                        entry_price=entry,
+                        direction=signal.direction,
+                    )
+            except Exception as exc:
+                logger.warning(f"[Tracker] Failed to close virtual position for signal {signal.id}: {exc}")
 
         # Clean up tracking data
         self._mfe.pop(signal.id, None)
@@ -277,6 +307,63 @@ class SignalTracker:
             )
         except Exception as exc:
             logger.warning(f"[Tracker] Telegram result notification failed: {exc}")
+
+    async def _open_virtual_position(
+        self,
+        db: AsyncSession,
+        signal: Signal,
+        entry_price: Decimal,
+    ) -> None:
+        """Create a virtual portfolio position when a signal entry is filled."""
+        try:
+            existing = await get_virtual_position(db, signal.id)
+            if existing is not None:
+                return  # already opened (idempotent)
+
+            size_pct = Decimal("1.0")
+            if hasattr(signal, "risk_pct") and signal.risk_pct is not None:
+                size_pct = Decimal(str(signal.risk_pct))
+            await create_virtual_position(
+                db,
+                data={
+                    "signal_id": signal.id,
+                    "size_pct": size_pct,
+                    "entry_price": entry_price,
+                    "status": "open",
+                },
+            )
+            logger.info(f"[Tracker] Virtual position opened for signal {signal.id}")
+        except Exception as exc:
+            logger.warning(f"[Tracker] Failed to open virtual position for signal {signal.id}: {exc}")
+
+    async def _update_virtual_unrealized(
+        self,
+        db: AsyncSession,
+        signal: Signal,
+        current_price: Decimal,
+    ) -> None:
+        """Update unrealized P&L on the virtual portfolio position."""
+        try:
+            position = await get_virtual_position(db, signal.id)
+            if position is None or position.status != "open":
+                return
+            entry = position.entry_price or signal.entry_price
+            if not entry:
+                return
+            if signal.direction == "LONG":
+                pnl_pct = (current_price - entry) / entry * Decimal("100")
+            else:
+                pnl_pct = (entry - current_price) / entry * Decimal("100")
+            await update_virtual_position(
+                db,
+                signal_id=signal.id,
+                updates={
+                    "current_price": current_price,
+                    "unrealized_pnl_pct": pnl_pct.quantize(Decimal("0.0001")),
+                },
+            )
+        except Exception as exc:
+            logger.debug(f"[Tracker] Unrealized PnL update failed for signal {signal.id}: {exc}")
 
     async def check_active_signals(self, db: Optional[AsyncSession] = None) -> None:
         """Check all active signals."""

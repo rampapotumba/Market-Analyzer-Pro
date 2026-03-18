@@ -10,10 +10,14 @@ from typing import Any, Optional
 import httpx
 from textblob import TextBlob
 
+from src.cache import cache
 from src.collectors.base import BaseCollector, CollectorResult
 from src.config import settings
 from src.database.crud import create_news_event
 from src.database.engine import async_session_factory
+
+_CACHE_TTL_GENERAL = 600   # 10 min — general news
+_CACHE_TTL_COMPANY = 1800  # 30 min — company news
 
 logger = logging.getLogger(__name__)
 
@@ -58,11 +62,26 @@ class FinnhubNewsCollector(BaseCollector):
         if not self.api_key:
             return []
 
+        cache_key = f"finnhub:news:{category}"
+        cached = await cache.get(cache_key)
+        if cached:
+            try:
+                return json.loads(cached)
+            except Exception:
+                pass
+
         params = {"category": category, "token": self.api_key}
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(f"{FINNHUB_BASE_URL}/news", params=params)
             response.raise_for_status()
-            return response.json()
+            data = response.json()
+
+        try:
+            await cache.set(cache_key, json.dumps(data), ttl=_CACHE_TTL_GENERAL)
+        except Exception:
+            pass
+
+        return data
 
     async def _fetch_company_news(
         self,
@@ -74,6 +93,14 @@ class FinnhubNewsCollector(BaseCollector):
         if not self.api_key:
             return []
 
+        cache_key = f"finnhub:company-news:{symbol}:{from_date}"
+        cached = await cache.get(cache_key)
+        if cached:
+            try:
+                return json.loads(cached)
+            except Exception:
+                pass
+
         params = {
             "symbol": symbol,
             "from": from_date,
@@ -83,7 +110,14 @@ class FinnhubNewsCollector(BaseCollector):
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(f"{FINNHUB_BASE_URL}/company-news", params=params)
             response.raise_for_status()
-            return response.json()
+            data = response.json()
+
+        try:
+            await cache.set(cache_key, json.dumps(data), ttl=_CACHE_TTL_COMPANY)
+        except Exception:
+            pass
+
+        return data
 
     async def _process_news_items(
         self, items: list[dict], related_symbols: Optional[list[str]] = None

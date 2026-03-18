@@ -9,6 +9,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from src.config import settings
+from src.utils.event_logger import EventType, log_event
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,7 @@ COLLECT_TIMEFRAMES = ["H1", "H4", "D1", "W1", "MN1"]
 async def job_collect_prices() -> None:
     """Collect latest prices for all instruments across multiple timeframes."""
     logger.info("[Scheduler] Running price collection job")
+    errors: list[str] = []
     try:
         from src.collectors.price_collector import CcxtCollector, YFinanceCollector
         from src.database.crud import get_all_instruments
@@ -40,23 +42,34 @@ async def job_collect_prices() -> None:
                     if result.success:
                         total += result.records_count
                     else:
-                        logger.warning(
-                            f"[Scheduler] YF failed for {instrument.symbol}/{tf}: {result.error}"
-                        )
+                        err = f"{instrument.symbol}/{tf}: {result.error}"
+                        logger.warning(f"[Scheduler] YF failed for {err}")
+                        errors.append(err)
                 elif instrument.market == "crypto":
                     result = await ccxt_collector.collect_latest(instrument.symbol, tf)
                     if result.success:
                         total += result.records_count
                     else:
-                        logger.warning(
-                            f"[Scheduler] CCXT failed for {instrument.symbol}/{tf}: {result.error}"
-                        )
+                        err = f"{instrument.symbol}/{tf}: {result.error}"
+                        logger.warning(f"[Scheduler] CCXT failed for {err}")
+                        errors.append(err)
                 await asyncio.sleep(0.5)  # small pause between requests
 
         logger.info(f"[Scheduler] Price collection completed: {total} records upserted")
+        level = "WARNING" if errors else "INFO"
+        await log_event(
+            EventType.PRICE_COLLECT,
+            f"Collected {total} records across {len(instruments)} instruments × {len(COLLECT_TIMEFRAMES)} TFs",
+            level=level,
+            source="job_collect_prices",
+            details={"total_records": total, "instruments": len(instruments), "errors": errors[:10]},
+        )
         # Signal generation is handled by TF-specific scheduled jobs (D. implementation)
     except Exception as exc:
         logger.error(f"[Scheduler] Price collection job error: {exc}")
+        await log_event(
+            EventType.PRICE_COLLECT, str(exc), level="ERROR", source="job_collect_prices"
+        )
 
 
 async def job_collect_rss_news() -> None:
@@ -77,14 +90,22 @@ async def job_collect_rss_news() -> None:
             affected_symbols: list[str] = result.metadata.get("affected_symbols", [])
             has_general_news: bool = result.metadata.get("has_general_news", False)
 
+            await log_event(
+                EventType.NEWS_COLLECT,
+                f"RSS: {result.records_count} new articles, affected={affected_symbols}, general={has_general_news}",
+                source="job_collect_rss_news",
+                details={"count": result.records_count, "affected_symbols": affected_symbols, "general": has_general_news},
+            )
+
             if has_general_news or not affected_symbols:
-                # General/macro news → regenerate signals for all instruments
-                await job_generate_signals_for_timeframes(["H1", "H4"])
+                # General/macro news → only targeted H1 (not full sweep, to avoid Telegram spam)
+                logger.info("[Scheduler] General news detected — skipping bulk signal regen (H1 job handles it)")
             else:
-                # Targeted: only instruments mentioned in news
-                await job_generate_signals_for_symbols(affected_symbols, ["H1", "H4"])
+                # Targeted: only instruments explicitly mentioned in news
+                await job_generate_signals_for_symbols(affected_symbols, ["H1"])
     except Exception as exc:
         logger.error(f"[Scheduler] RSS news job error: {exc}")
+        await log_event(EventType.NEWS_COLLECT, str(exc), level="ERROR", source="job_collect_rss_news")
 
 
 async def job_collect_news() -> None:
@@ -96,10 +117,17 @@ async def job_collect_news() -> None:
         collector = FinnhubNewsCollector()
         result = await collector.collect()
         logger.info(f"[Scheduler] News collected: {result.records_count} items")
+        await log_event(
+            EventType.NEWS_COLLECT,
+            f"Finnhub: {result.records_count} items",
+            source="job_collect_news",
+            details={"count": result.records_count},
+        )
         # Recalculate signals after news update (affects Sentiment Score)
         await job_generate_signals()
     except Exception as exc:
         logger.error(f"[Scheduler] News collection job error: {exc}")
+        await log_event(EventType.NEWS_COLLECT, str(exc), level="ERROR", source="job_collect_news")
 
 
 async def job_collect_macro() -> None:
@@ -111,10 +139,17 @@ async def job_collect_macro() -> None:
         collector = FREDCollector()
         result = await collector.collect()
         logger.info(f"[Scheduler] Macro data collected: {result.records_count} items")
+        await log_event(
+            EventType.MACRO_COLLECT,
+            f"FRED: {result.records_count} indicators",
+            source="job_collect_macro",
+            details={"count": result.records_count},
+        )
         # Macro affects FA score — regenerate longer-timeframe signals
         await job_generate_signals_daily()
     except Exception as exc:
         logger.error(f"[Scheduler] Macro collection job error: {exc}")
+        await log_event(EventType.MACRO_COLLECT, str(exc), level="ERROR", source="job_collect_macro")
 
 
 async def job_generate_signals_for_timeframes(timeframes: list[str]) -> None:
@@ -154,8 +189,19 @@ async def job_generate_signals_for_timeframes(timeframes: list[str]) -> None:
             f"[Scheduler] Signal generation done ({timeframes}): "
             f"{generated} generated, {skipped} skipped"
         )
+        await log_event(
+            EventType.SIGNAL_BATCH,
+            f"Batch {timeframes}: {generated} generated, {skipped} skipped",
+            source="job_generate_signals_for_timeframes",
+            details={"timeframes": timeframes, "generated": generated, "skipped": skipped},
+        )
     except Exception as exc:
         logger.error(f"[Scheduler] Signal generation job error: {exc}")
+        await log_event(
+            EventType.SIGNAL_BATCH, str(exc), level="ERROR",
+            source="job_generate_signals_for_timeframes",
+            details={"timeframes": timeframes},
+        )
 
 
 async def job_generate_signals_for_symbols(
@@ -223,8 +269,15 @@ async def job_collect_market_context() -> None:
         collector = MarketContextCollector()
         result = await collector.collect()
         logger.info(f"[Scheduler] Market context collected: {result.records_count} records")
+        await log_event(
+            EventType.MARKET_CONTEXT,
+            f"DXY/VIX/TNX/funding: {result.records_count} records",
+            source="job_collect_market_context",
+            details={"count": result.records_count},
+        )
     except Exception as exc:
         logger.error(f"[Scheduler] Market context job error: {exc}")
+        await log_event(EventType.MARKET_CONTEXT, str(exc), level="ERROR", source="job_collect_market_context")
 
 
 async def job_collect_economic_calendar() -> None:
@@ -235,8 +288,15 @@ async def job_collect_economic_calendar() -> None:
         result = await collector.collect()
         if result.records_count > 0:
             logger.info(f"[Scheduler] Economic calendar: {result.records_count} events saved")
+        await log_event(
+            EventType.CALENDAR_COLLECT,
+            f"FMP calendar: {result.records_count} events (next 14 days)",
+            source="job_collect_economic_calendar",
+            details={"count": result.records_count},
+        )
     except Exception as exc:
         logger.error(f"[Scheduler] Economic calendar job error: {exc}")
+        await log_event(EventType.CALENDAR_COLLECT, str(exc), level="ERROR", source="job_collect_economic_calendar")
 
 
 async def job_collect_cot() -> None:
@@ -246,8 +306,15 @@ async def job_collect_cot() -> None:
         collector = COTCollector()
         result = await collector.collect()
         logger.info(f"[Scheduler] COT data collected: {result.records_count} records")
+        await log_event(
+            EventType.COT_COLLECT,
+            f"CFTC COT: {result.records_count} records",
+            source="job_collect_cot",
+            details={"count": result.records_count},
+        )
     except Exception as exc:
         logger.error(f"[Scheduler] COT collection job error: {exc}")
+        await log_event(EventType.COT_COLLECT, str(exc), level="ERROR", source="job_collect_cot")
 
 
 async def job_check_signals() -> None:
@@ -256,11 +323,54 @@ async def job_check_signals() -> None:
         from src.database.engine import async_session_factory
         from src.tracker.signal_tracker import SignalTracker
 
+        from src.database.crud import get_active_signals
         tracker = SignalTracker()
         async with async_session_factory() as db:
-            await tracker.check_active_signals(db)
+            active = await get_active_signals(db)
+            active_count = len(active)
+            if active_count:
+                await tracker.check_active_signals(db)
+                await db.commit()
+        if active_count:
+            await log_event(
+                EventType.SIGNAL_CHECK,
+                f"Checked {active_count} active signal(s)",
+                source="job_check_signals",
+                details={"active_count": active_count},
+            )
     except Exception as exc:
         logger.error(f"[Scheduler] Signal check job error: {exc}")
+        await log_event(EventType.SIGNAL_CHECK, str(exc), level="ERROR", source="job_check_signals")
+
+
+async def job_simulate_trades() -> None:
+    """Simulator tick: fetch live prices and check SL/TP for all open positions."""
+    try:
+        from src.tracker.trade_simulator import run_simulator_tick
+        await run_simulator_tick()
+    except Exception as exc:
+        logger.error(f"[Scheduler] Simulator tick error: {exc}")
+
+
+async def job_cleanup_system_events() -> None:
+    """Delete system_events older than 3 days (runs daily)."""
+    try:
+        from src.database.crud import cleanup_system_events
+        from src.database.engine import async_session_factory
+
+        async with async_session_factory() as db:
+            deleted = await cleanup_system_events(db, days=3)
+            await db.commit()
+        logger.info(f"[Scheduler] System events cleanup: {deleted} old records deleted")
+        if deleted:
+            await log_event(
+                EventType.CLEANUP,
+                f"Deleted {deleted} system events older than 3 days",
+                source="job_cleanup_system_events",
+                details={"deleted": deleted},
+            )
+    except Exception as exc:
+        logger.error(f"[Scheduler] System events cleanup error: {exc}")
 
 
 def start_scheduler() -> None:
@@ -379,6 +489,28 @@ def start_scheduler() -> None:
         next_run_time=now + datetime.timedelta(minutes=5),
     )
 
+    # Trade simulator — every 1 minute (live SL/TP monitoring, starts 2 min after boot)
+    scheduler.add_job(
+        job_simulate_trades,
+        trigger=IntervalTrigger(minutes=1),
+        id="simulate_trades",
+        name="Trade Simulator Tick",
+        replace_existing=True,
+        misfire_grace_time=30,
+        next_run_time=now + datetime.timedelta(minutes=2),
+    )
+
+    # System events cleanup — daily, deletes records older than 3 days
+    scheduler.add_job(
+        job_cleanup_system_events,
+        trigger=IntervalTrigger(hours=24),
+        id="cleanup_system_events",
+        name="Cleanup System Events",
+        replace_existing=True,
+        misfire_grace_time=3600,
+        next_run_time=now + datetime.timedelta(hours=1),
+    )
+
     scheduler.start()
     logger.info(
         "[Scheduler] APScheduler started:\n"
@@ -389,7 +521,8 @@ def start_scheduler() -> None:
         f"  • Tracker: every {settings.TRACKER_CHECK_INTERVAL_MINUTES}min\n"
         f"  • Market Context: every 1h (DXY, VIX, TNX, funding rates)\n"
         f"  • COT:     every 7 days (CFTC COT reports)\n"
-        f"  • Calendar: every 12h (FMP economic events, next 14 days)"
+        f"  • Calendar: every 12h (FMP economic events, next 14 days)\\n"
+        f"  • Simulator: every 1min (live SL/TP monitoring)"
     )
 
 

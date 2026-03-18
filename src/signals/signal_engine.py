@@ -10,11 +10,13 @@ import pandas as pd
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.analysis.correlation_engine import CorrelationEngine
+from src.analysis.crypto_fa_engine import CryptoFAEngine
 from src.analysis.fa_engine import FAEngine
-from src.analysis.geo_engine import GeoEngine
+from src.analysis.geo_engine_v2 import GeoEngineV2
 from src.analysis.llm_engine import LLMEngine
-from src.analysis.sentiment_engine import SentimentEngine
+from src.analysis.sentiment_engine_v2 import SentimentEngineV2
 from src.analysis.ta_engine import TAEngine
+from src.cache import cache
 from src.config import settings
 from src.database.crud import (
     cancel_open_signals,
@@ -25,11 +27,14 @@ from src.database.crud import (
     get_macro_data,
     get_news_events,
     get_price_data,
+    get_upcoming_economic_events,
 )
 from src.database.models import Instrument, Signal
 from src.notifications.telegram import telegram
 from src.signals.mtf_filter import MTFFilter
 from src.signals.risk_manager import RiskManager
+from src.tracker.trade_simulator import open_position_for_signal
+from src.utils.event_logger import EventType, log_event_bg
 
 logger = logging.getLogger(__name__)
 
@@ -49,9 +54,33 @@ SIGNAL_COOLDOWN_MINUTES: dict[str, int] = {
 # Minimum price change as fraction of ATR to trigger new signal — B. Price-change trigger
 ATR_PRICE_CHANGE_FACTOR = 0.3
 
-# In-memory caches for cooldown and price-change checks (key = (instrument_id, timeframe))
+# Redis cache key helpers for cooldown and price-change checks
+def _cooldown_redis_key(instrument_id: int, timeframe: str) -> str:
+    return f"cooldown:{instrument_id}:{timeframe}"
+
+
+def _price_redis_key(instrument_id: int, timeframe: str) -> str:
+    return f"last_price:{instrument_id}:{timeframe}"
+
+
+# Fallback in-memory caches used when Redis is unavailable
 _cooldown_cache: dict[tuple[int, str], datetime.datetime] = {}
 _last_signal_price_cache: dict[tuple[int, str], float] = {}
+
+# Telegram alert cooldown: don't send more than once per 4 hours per instrument
+TELEGRAM_COOLDOWN_HOURS = 4
+_telegram_sent_cache: dict[int, datetime.datetime] = {}  # instrument_id → last sent
+
+
+def _can_send_telegram(instrument_id: int) -> bool:
+    last = _telegram_sent_cache.get(instrument_id)
+    if last is None:
+        return True
+    return (datetime.datetime.now(datetime.timezone.utc) - last).total_seconds() > TELEGRAM_COOLDOWN_HOURS * 3600
+
+
+def _mark_telegram_sent(instrument_id: int) -> None:
+    _telegram_sent_cache[instrument_id] = datetime.datetime.now(datetime.timezone.utc)
 
 
 def _get_cached_llm(symbol: str, timeframe: str) -> Optional[tuple[float, dict]]:
@@ -230,9 +259,18 @@ class SignalEngine:
         cooldown_minutes = SIGNAL_COOLDOWN_MINUTES.get(timeframe, 60)
         now = datetime.datetime.now(datetime.timezone.utc)
 
-        last_signal_time = _cooldown_cache.get(cooldown_key)
+        # Try Redis first; fall back to in-memory; then seed from DB on startup
+        redis_val = await cache.get(_cooldown_redis_key(instrument.id, timeframe))
+        last_signal_time: Optional[datetime.datetime] = None
+        if redis_val is not None:
+            try:
+                last_signal_time = datetime.datetime.fromisoformat(redis_val)
+            except (ValueError, TypeError):
+                pass
         if last_signal_time is None:
-            # On startup, fall back to DB to seed the in-memory cache
+            last_signal_time = _cooldown_cache.get(cooldown_key)
+        if last_signal_time is None:
+            # On startup, fall back to DB to seed the cache
             last_sig = await get_latest_signal_for_instrument(db, instrument.id, timeframe)
             if last_sig:
                 last_signal_time = last_sig.created_at
@@ -240,6 +278,11 @@ class SignalEngine:
                 if last_signal_time.tzinfo is None:
                     last_signal_time = last_signal_time.replace(tzinfo=datetime.timezone.utc)
                 _cooldown_cache[cooldown_key] = last_signal_time
+                await cache.set(
+                    _cooldown_redis_key(instrument.id, timeframe),
+                    last_signal_time.isoformat(),
+                    ttl=cooldown_minutes * 60,
+                )
 
         if last_signal_time:
             elapsed_minutes = (now - last_signal_time).total_seconds() / 60
@@ -278,7 +321,11 @@ class SignalEngine:
 
         # B. Price-change trigger: skip if price hasn't moved enough since last signal
         current_close = float(df["close"].iloc[-1])
-        last_price = _last_signal_price_cache.get(cooldown_key)
+        cached_price = await cache.get(_price_redis_key(instrument.id, timeframe))
+        last_price: Optional[float] = (
+            float(cached_price) if cached_price is not None
+            else _last_signal_price_cache.get(cooldown_key)
+        )
         if last_price is not None and atr is not None and atr > Decimal("0"):
             price_change = abs(current_close - last_price)
             atr_threshold = float(atr) * ATR_PRICE_CHANGE_FACTOR
@@ -290,34 +337,64 @@ class SignalEngine:
                 return None
 
         # 3. Fetch macro and news data
-        macro_records = await get_macro_data(db, limit=50)
+        macro_records = await get_macro_data(db, limit=200)
         news_records = await get_news_events(db, limit=30)
 
-        # Economic calendar blocking disabled (Finnhub requires paid plan)
+        # Economic calendar blocking — check for HIGH-impact events in next 4 hours
         calendar_block = False
-
-        # 4. Run FA Engine
         try:
-            fa_engine = FAEngine(instrument, macro_records, news_records)
-            fa_score = fa_engine.calculate_fa_score()
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
+            upcoming = await get_upcoming_economic_events(
+                db, from_dt=now_utc, to_dt=now_utc + datetime.timedelta(hours=4)
+            )
+            high_impact = [e for e in upcoming if getattr(e, "impact", "") == "HIGH"]
+            if high_impact:
+                calendar_block = True
+                logger.info(
+                    f"[SignalEngine] Calendar block active for {instrument.symbol}: "
+                    f"{len(high_impact)} HIGH-impact events in next 4h"
+                )
+        except Exception as exc:
+            logger.warning(f"[SignalEngine] Calendar check error: {exc}")
+
+        # 4. Run FA Engine (CryptoFAEngine for crypto, FAEngine for forex/stocks)
+        try:
+            if instrument.market == "crypto":
+                crypto_fa = CryptoFAEngine(db)
+                crypto_result = await crypto_fa.analyze(instrument.id, instrument.symbol)
+                fa_score = crypto_result["score"]
+                logger.debug(
+                    f"[SignalEngine] CryptoFA for {instrument.symbol}: {fa_score:.1f} "
+                    f"(onchain={crypto_result['components'].get('onchain', 0):.1f}, "
+                    f"cycle={crypto_result['components'].get('cycle', 0):.1f})"
+                )
+            else:
+                fa_engine = FAEngine(instrument, macro_records, news_records)
+                fa_score = fa_engine.calculate_fa_score()
         except Exception as exc:
             logger.error(f"[SignalEngine] FA engine error: {exc}")
             fa_score = 0.0
 
-        # 5. Run Sentiment Engine
+        # 5. Run Sentiment Engine V2 (FinBERT + multi-source, TextBlob fallback)
         try:
-            sent_engine = SentimentEngine(news_records)
-            sentiment_score = sent_engine.calculate_sentiment_score()
+            sent_engine = SentimentEngineV2(news_events=news_records)
+            sentiment_score = await sent_engine.calculate()
+            logger.debug(
+                f"[SignalEngine] SentimentV2 for {instrument.symbol}: {sentiment_score:.1f} "
+                f"(sources: {sent_engine.get_summary()})"
+            )
         except Exception as exc:
-            logger.error(f"[SignalEngine] Sentiment engine error: {exc}")
+            logger.error(f"[SignalEngine] Sentiment V2 engine error: {exc}")
             sentiment_score = 0.0
 
-        # 6. Run Geo Engine
+        # 6. Run Geo Engine V2 (GDELT real-time geopolitical risk)
         try:
-            geo_engine = GeoEngine(instrument)
-            geo_score = geo_engine.calculate_geo_score()
+            geo_engine = GeoEngineV2()
+            geo_score = await geo_engine.score(instrument.symbol)
+            await geo_engine.close()
+            logger.debug(f"[SignalEngine] GeoV2 for {instrument.symbol}: {geo_score:.1f}")
         except Exception as exc:
-            logger.error(f"[SignalEngine] Geo engine error: {exc}")
+            logger.error(f"[SignalEngine] Geo V2 engine error: {exc}")
             geo_score = 0.0
 
         # Run Correlation Engine (DXY, VIX, TNX)
@@ -398,7 +475,19 @@ class SignalEngine:
                 composite_score, timeframe, higher_tf_signals
             )
 
-        # 10. Determine direction and strength
+        # 10. TA quality gate — TA must meaningfully confirm the signal direction
+        # Required: TA contribution ≥ 3.0 points AND TA must agree in direction
+        ta_contribution = weights["ta"] * ta_score
+        ta_disagrees = (composite_score > 0 and ta_score < 0) or (composite_score < 0 and ta_score > 0)
+        if abs(ta_contribution) < 3.0 or ta_disagrees:
+            logger.debug(
+                f"[SignalEngine] TA gate failed for {instrument.symbol}/{timeframe}: "
+                f"ta_score={ta_score:.1f}, ta_contribution={ta_contribution:.2f} "
+                f"(need ≥3.0), ta_disagrees={ta_disagrees} — HOLD"
+            )
+            return None
+
+        # 11. Determine direction and strength
         direction = _determine_direction(composite_score)
         signal_strength = _determine_signal_strength(composite_score)
 
@@ -427,8 +516,21 @@ class SignalEngine:
                     )
 
         # 12. Calculate confidence (after entry refinement)
+        # Normalize relative to threshold bands so strong signals start at ≥60%
+        # and regular BUY/SELL start at 30%, scaling up within each band.
         score_abs = abs(composite_score)
-        confidence = min(100.0, score_abs * 1.2)  # Scale up slightly
+        strong_thresh = abs(settings.STRONG_BUY_THRESHOLD)  # 15.0
+        buy_thresh = abs(settings.BUY_THRESHOLD)  # 7.0
+        if signal_strength in ("STRONG_BUY", "STRONG_SELL"):
+            # 60% at threshold, +2% per unit above it, capped at 100%
+            excess = score_abs - strong_thresh
+            confidence = min(100.0, 60.0 + excess * 2.0)
+        elif signal_strength in ("BUY", "SELL"):
+            # 30–60% interpolated across the BUY band (7 → 15)
+            band_progress = (score_abs - buy_thresh) / max(strong_thresh - buy_thresh, 1.0)
+            confidence = 30.0 + band_progress * 30.0
+        else:
+            confidence = 0.0
 
         # 13. Build reasoning
         reasoning = {
@@ -518,20 +620,67 @@ class SignalEngine:
         async with db.begin_nested():
             signal = await create_signal(db, signal_data)
 
-        # Update in-memory caches so cooldown and price-change checks work immediately
+        # Commit so the signal is persisted before Telegram alert fires
+        await db.commit()
+
+        # Open virtual position immediately (market order simulation)
+        try:
+            await open_position_for_signal(signal, db)
+            await db.commit()
+        except Exception as exc:
+            logger.warning(f"[SignalEngine] Failed to open simulator position: {exc}")
+
+        # Update Redis + in-memory caches so subsequent checks work immediately
         _cooldown_cache[cooldown_key] = now
         _last_signal_price_cache[cooldown_key] = current_close
+        await cache.set(
+            _cooldown_redis_key(instrument.id, timeframe),
+            now.isoformat(),
+            ttl=cooldown_minutes * 60,
+        )
+        await cache.set(
+            _price_redis_key(instrument.id, timeframe),
+            current_close,
+            ttl=cooldown_minutes * 60,
+        )
 
         logger.info(
             f"[SignalEngine] Generated signal for {instrument.symbol}/{timeframe}: "
             f"{direction} (score={composite_score:.2f}, strength={signal_strength})"
         )
 
-        # Send Telegram alert (non-blocking, errors silently logged)
-        try:
-            await telegram.send_signal_alert(signal, instrument.symbol, instrument.name)
-        except Exception as exc:
-            logger.warning(f"[SignalEngine] Telegram alert failed: {exc}")
+        log_event_bg(
+            EventType.SIGNAL_GENERATED,
+            f"{direction} {instrument.symbol}/{timeframe} | score={composite_score:.1f} | {signal_strength}",
+            source="signal_engine",
+            symbol=instrument.symbol,
+            timeframe=timeframe,
+            details={
+                "signal_id": signal.id,
+                "direction": direction,
+                "signal_strength": signal_strength,
+                "composite_score": round(composite_score, 2),
+                "ta_score": round(ta_score, 2),
+                "fa_score": round(fa_score, 2),
+                "sentiment_score": round(sentiment_score, 2),
+                "geo_score": round(geo_score, 2),
+            },
+        )
+
+        # Send Telegram alert: only STRONG_BUY/STRONG_SELL, max once per 4h per instrument
+        is_strong = signal_strength in ("STRONG_BUY", "STRONG_SELL")
+        if is_strong and _can_send_telegram(instrument.id):
+            try:
+                await telegram.send_signal_alert(signal, instrument.symbol, instrument.name)
+                _mark_telegram_sent(instrument.id)
+            except Exception as exc:
+                logger.warning(f"[SignalEngine] Telegram alert failed: {exc}")
+        else:
+            logger.debug(
+                f"[SignalEngine] Telegram skipped for {instrument.symbol}/{timeframe} "
+                f"(strength={signal_strength}, strong={is_strong}, "
+                f"cooldown={'active' if not _can_send_telegram(instrument.id) else 'ok'})"
+            )
 
         return signal
 
