@@ -24,11 +24,15 @@ from src.database.crud import (
     close_virtual_position,
     create_signal_result,
     create_virtual_position,
+    create_virtual_account_if_not_exists,
     get_active_signals,
     get_instrument_by_id,
+    get_latest_funding_rate,
     get_price_data,
+    get_virtual_account,
     get_virtual_position,
     update_signal_status,
+    update_virtual_account,
     update_virtual_position,
 )
 from src.database.engine import async_session_factory
@@ -56,6 +60,32 @@ SPREAD_PIPS_BY_MARKET: dict[str, Decimal] = {
     "stocks": Decimal("2.0"),   # 2 cents / 0.01 pip_size = 2 pips
 }
 CRYPTO_SPREAD_PCT: Decimal = Decimal("0.00075")  # 0.075% Binance taker fee
+
+# ── SL slippage constants (SIM-10) ────────────────────────────────────────────
+
+SL_SLIPPAGE_PIPS: dict[str, Decimal] = {
+    "forex":  Decimal("1.0"),   # 1 pip — нормальные условия ECN
+    "stocks": Decimal("1.0"),   # 1 цент / 0.01 pip_size
+    "crypto": Decimal("0.0"),   # для крипто — % от цены
+}
+SL_SLIPPAGE_CRYPTO_PCT: Decimal = Decimal("0.001")  # 0.1% — taker при пробое
+
+# ── Overnight swap constants (SIM-13) ─────────────────────────────────────────
+
+# Типовые дневные swap-ставки (в пипах за 1 лот, ориентировочно)
+# Положительный = начисляется держателю позиции
+SWAP_DAILY_PIPS: dict[str, dict[str, Decimal]] = {
+    "EURUSD=X": {"long": Decimal("-0.5"),  "short": Decimal("0.3")},
+    "USDJPY=X": {"long": Decimal("1.2"),   "short": Decimal("-1.5")},
+    "GBPUSD=X": {"long": Decimal("-0.8"),  "short": Decimal("0.5")},
+    "AUDUSD=X": {"long": Decimal("0.2"),   "short": Decimal("-0.4")},
+    "USDCAD=X": {"long": Decimal("0.4"),   "short": Decimal("-0.7")},
+    "USDCHF=X": {"long": Decimal("-0.3"),  "short": Decimal("0.1")},
+    "NZDUSD=X": {"long": Decimal("0.1"),   "short": Decimal("-0.3")},
+}
+
+TRIPLE_SWAP_WEEKDAY: int = 2    # Wednesday (0=Mon)
+ROLLOVER_HOUR_UTC: int = 22     # 22:00 UTC
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -115,6 +145,51 @@ class SignalTracker:
             return None
         return records[-1].close
 
+    # ── Candle High/Low (SIM-09) ──────────────────────────────────────────────
+
+    async def _get_candle_prices(
+        self,
+        db: AsyncSession,
+        instrument_id: int,
+        timeframe: str,
+    ) -> tuple[Decimal, Decimal, Decimal]:
+        """Return (last_close, candle_high, candle_low) of last completed candle.
+
+        Falls back to H1 if no data for the requested timeframe.
+        """
+        records = await get_price_data(db, instrument_id, timeframe, limit=1)
+        if not records:
+            records = await get_price_data(db, instrument_id, "H1", limit=1)
+        if not records:
+            return Decimal("0"), Decimal("0"), Decimal("0")
+        candle = records[-1]
+        return (
+            Decimal(str(candle.close)),
+            Decimal(str(candle.high)),
+            Decimal(str(candle.low)),
+        )
+
+    # ── SL slippage (SIM-10) ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _apply_sl_slippage(
+        sl_price: Decimal,
+        direction: str,
+        market: str,
+        pip_size: Decimal,
+    ) -> Decimal:
+        """Ухудшить цену выхода по SL на величину проскальзывания (SIM-10).
+
+        LONG SL: цена исполнения ниже SL (хуже для покупателя)
+        SHORT SL: цена исполнения выше SL (хуже для продавца)
+        """
+        if market == "crypto":
+            slip = sl_price * SL_SLIPPAGE_CRYPTO_PCT
+        else:
+            slip = SL_SLIPPAGE_PIPS.get(market, Decimal("1.0")) * pip_size
+
+        return sl_price - slip if direction == "LONG" else sl_price + slip
+
     # ── Entry check (SIM-08) ──────────────────────────────────────────────────
 
     def _check_entry(
@@ -129,25 +204,51 @@ class SignalTracker:
         tolerance = entry_price * tol_pct
         return abs(current_price - entry_price) <= tolerance
 
-    # ── Simple SL/TP checks (used as fallback when no TP1 defined) ────────────
+    # ── SL/TP checks with candle High/Low (SIM-09) ───────────────────────────
 
     def _check_sl_hit(
-        self, current_price: Decimal, stop_loss: Optional[Decimal], direction: str
+        self,
+        current_price: Decimal,
+        stop_loss: Optional[Decimal],
+        direction: str,
+        candle_low: Optional[Decimal] = None,
+        candle_high: Optional[Decimal] = None,
     ) -> bool:
+        """SIM-09: SL hit if current_price OR candle extreme breaches the level."""
         if not stop_loss:
             return False
         if direction == "LONG":
-            return current_price <= stop_loss
-        return current_price >= stop_loss
+            by_price = current_price <= stop_loss
+            by_candle = (candle_low is not None) and (candle_low <= stop_loss)
+            return by_price or by_candle
+        else:
+            by_price = current_price >= stop_loss
+            by_candle = (candle_high is not None) and (candle_high >= stop_loss)
+            return by_price or by_candle
 
     def _check_tp_hit(
-        self, current_price: Decimal, take_profit: Optional[Decimal], direction: str
-    ) -> bool:
+        self,
+        current_price: Decimal,
+        take_profit: Optional[Decimal],
+        direction: str,
+        candle_high: Optional[Decimal] = None,
+        candle_low: Optional[Decimal] = None,
+    ) -> tuple[bool, str]:
+        """SIM-09: TP hit if current_price OR candle extreme reaches the level.
+
+        Returns (hit, tp_name) for backward compatibility with v2 callers.
+        """
         if not take_profit:
-            return False
+            return False, ""
         if direction == "LONG":
-            return current_price >= take_profit
-        return current_price <= take_profit
+            by_price = current_price >= take_profit
+            by_candle = (candle_high is not None) and (candle_high >= take_profit)
+            hit = by_price or by_candle
+        else:
+            by_price = current_price <= take_profit
+            by_candle = (candle_low is not None) and (candle_low <= take_profit)
+            hit = by_price or by_candle
+        return hit, ("tp_hit" if hit else "")
 
     # ── P&L calculation ───────────────────────────────────────────────────────
 
@@ -171,10 +272,16 @@ class SignalTracker:
         self,
         pnl_pct: Decimal,
         position_size_pct: Optional[Decimal],
+        account_balance: Optional[Decimal] = None,
     ) -> Decimal:
-        """SIM-06: pnl_usd = account × (size_pct/100) × (pnl_pct/100)."""
+        """SIM-06/SIM-16: pnl_usd = balance × (size_pct/100) × (pnl_pct/100).
+
+        v3: uses account_balance_at_entry snapshot if provided (SIM-16).
+        v2 compat: if account_balance is None → falls back to ACCOUNT_SIZE.
+        """
+        balance = account_balance if account_balance is not None else ACCOUNT_SIZE
         size = position_size_pct if (position_size_pct and position_size_pct > 0) else Decimal("2.0")
-        return ACCOUNT_SIZE * (size / Decimal("100")) * (pnl_pct / Decimal("100"))
+        return balance * (size / Decimal("100")) * (pnl_pct / Decimal("100"))
 
     # ── MFE/MAE (SIM-01) — DB-persisted ──────────────────────────────────────
 
@@ -210,24 +317,80 @@ class SignalTracker:
         except Exception as exc:
             logger.debug(f"[Tracker] MFE/MAE update failed for signal {signal.id}: {exc}")
 
-    # ── ATR helper (for TradeLifecycleManager) ────────────────────────────────
+    # ── ATR helper (SIM-11: live Wilder's ATR with fallback chain) ───────────
+
+    async def _get_live_atr(
+        self,
+        db: AsyncSession,
+        instrument_id: int,
+        timeframe: str,
+        period: int = 14,
+    ) -> Optional[Decimal]:
+        """Compute ATR(14) from recent price_data candles using Wilder's smoothing (SIM-11).
+
+        Returns None if insufficient candles for the calculation.
+        """
+        candles = await get_price_data(db, instrument_id, timeframe, limit=period + 1)
+        if len(candles) < period + 1:
+            return None
+
+        trs: list[Decimal] = []
+        for i in range(1, len(candles)):
+            h = Decimal(str(candles[i].high))
+            l = Decimal(str(candles[i].low))
+            prev_c = Decimal(str(candles[i - 1].close))
+            tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+            trs.append(tr)
+
+        # Wilder's smoothing: seed with SMA of first period, then smooth
+        atr: Decimal = sum(trs[:period]) / Decimal(str(period))
+        for tr in trs[period:]:
+            atr = (atr * Decimal(str(period - 1)) + tr) / Decimal(str(period))
+        return atr
 
     async def _get_atr(self, db: AsyncSession, signal: Signal, instrument: Any) -> Decimal:
-        """Get ATR from signal's indicators_snapshot, or compute a fallback."""
+        """Get ATR using fallback chain (SIM-11):
+        1. Live ATR from price_data (signal's timeframe)
+        2. Live ATR from price_data (H1)
+        3. ATR from indicators_snapshot
+        4. 14 × pip_size
+        """
+        pip_size = instrument.pip_size if instrument and instrument.pip_size else Decimal("0.0001")
+
+        # 1. Live ATR — signal timeframe
+        live_atr = await self._get_live_atr(db, signal.instrument_id, signal.timeframe)
+        if live_atr and live_atr > 0:
+            return live_atr
+
+        # 2. Live ATR — H1 fallback
+        if signal.timeframe != "H1":
+            live_atr_h1 = await self._get_live_atr(db, signal.instrument_id, "H1")
+            if live_atr_h1 and live_atr_h1 > 0:
+                logger.warning(
+                    f"[Tracker] ATR: no live data for {signal.timeframe}, "
+                    f"using H1 ATR for signal {signal.id}"
+                )
+                return live_atr_h1
+
+        # 3. Snapshot ATR
         try:
             if signal.indicators_snapshot:
                 indicators = json.loads(signal.indicators_snapshot)
                 for key in ("atr", "ATR", "atr_14", "ATR_14"):
                     atr_val = indicators.get(key)
                     if atr_val and float(atr_val) > 0:
+                        logger.warning(
+                            f"[Tracker] ATR: no live data, using snapshot for signal {signal.id}"
+                        )
                         return Decimal(str(atr_val))
         except Exception:
             pass
 
-        # Fallback: 14× pip_size as a minimal ATR estimate
-        if instrument and instrument.pip_size:
-            return instrument.pip_size * Decimal("14")
-        return Decimal("0.0014")
+        # 4. Last resort: 14 × pip_size
+        logger.warning(
+            f"[Tracker] ATR: all sources failed, using 14×pip_size for signal {signal.id}"
+        )
+        return pip_size * Decimal("14")
 
     # ── Main entry point ──────────────────────────────────────────────────────
 
@@ -318,12 +481,22 @@ class SignalTracker:
 
             return
 
-        # ── Get live price ────────────────────────────────────────────────────
+        # ── Get live price + candle High/Low (SIM-09) ────────────────────────
         if current_price is None:
             current_price = await self._get_current_price(db, signal.instrument_id)
         if current_price is None:
             logger.debug(f"[Tracker] No price data for signal {signal.id}")
             return
+
+        # SIM-09: fetch last candle high/low for the signal's timeframe
+        _close, candle_high, candle_low = await self._get_candle_prices(
+            db, signal.instrument_id, signal.timeframe
+        )
+        # Use current_price if candle data unavailable (candle_high/low = 0 means no data)
+        if candle_high == Decimal("0"):
+            candle_high = current_price
+        if candle_low == Decimal("0"):
+            candle_low = current_price
 
         entry_price = signal.entry_price or current_price
 
@@ -349,8 +522,11 @@ class SignalTracker:
 
             actual_entry = position.entry_price or entry_price
 
-            # Update unrealized P&L
-            await self._update_virtual_unrealized(db, signal, current_price, actual_entry)
+            # SIM-13: accrue daily swap at rollover time
+            await self._apply_daily_swap(db, signal, position, instrument, now)
+
+            # Update unrealized P&L (SIM-12: pass position for sizing)
+            await self._update_virtual_unrealized(db, signal, current_price, actual_entry, position)
             # Update MFE/MAE in DB (SIM-01)
             await self._update_mfe_mae(db, signal, current_price, actual_entry)
 
@@ -359,66 +535,123 @@ class SignalTracker:
                 atr = await self._get_atr(db, signal, instrument)
                 current_sl = position.current_stop_loss or signal.stop_loss
 
-                lifecycle = TradeLifecycleManager()
-                action = lifecycle.check(
-                    direction=signal.direction,
-                    entry=actual_entry,
-                    stop_loss=current_sl,
-                    take_profit_1=signal.take_profit_1,
-                    take_profit_2=signal.take_profit_2,
-                    take_profit_3=signal.take_profit_3,
-                    current_price=current_price,
-                    atr=atr,
-                    regime=signal.regime or "RANGING",
-                    partial_closed=bool(position.partial_closed),
-                    breakeven_moved=bool(position.breakeven_moved),
-                    trailing_stop=position.trailing_stop,
+                # SIM-09: candle-based SL/TP pre-check (worst case: SL wins)
+                sl_hit = self._check_sl_hit(
+                    current_price, current_sl, signal.direction, candle_low, candle_high
+                )
+                tp1_hit, _ = self._check_tp_hit(
+                    current_price, signal.take_profit_1, signal.direction, candle_high, candle_low
                 )
 
-                act = action["action"]
-
-                if act.startswith("exit_"):
-                    if act == "exit_sl" and position.trailing_stop:
-                        exit_reason = "trailing_sl_hit"
+                if sl_hit or tp1_hit:
+                    # SIM-09: worst case rule — if both hit, prefer SL
+                    if sl_hit and tp1_hit:
+                        exit_reason = "trailing_sl_hit" if position.trailing_stop else "sl_hit"
+                        exit_price = current_sl
+                    elif sl_hit:
+                        exit_reason = "trailing_sl_hit" if position.trailing_stop else "sl_hit"
+                        exit_price = current_sl
                     else:
-                        exit_reason = act.replace("exit_", "") + "_hit"
+                        exit_reason = "tp1_hit"
+                        exit_price = signal.take_profit_1
                     await self._close_signal(
-                        db, signal, current_price, now, exit_reason, position, pip_size
+                        db, signal, exit_price, now, exit_reason, position, pip_size,
+                        candle_high_at_exit=candle_high, candle_low_at_exit=candle_low,
+                        market=market,
+                    )
+                else:
+                    lifecycle = TradeLifecycleManager()
+                    action = lifecycle.check(
+                        direction=signal.direction,
+                        entry=actual_entry,
+                        stop_loss=current_sl,
+                        take_profit_1=signal.take_profit_1,
+                        take_profit_2=signal.take_profit_2,
+                        take_profit_3=signal.take_profit_3,
+                        current_price=current_price,
+                        atr=atr,
+                        regime=signal.regime or "RANGING",
+                        partial_closed=bool(position.partial_closed),
+                        breakeven_moved=bool(position.breakeven_moved),
+                        trailing_stop=position.trailing_stop,
                     )
 
-                elif act == "breakeven":
-                    await update_virtual_position(db, signal.id, {
-                        "current_stop_loss": action["new_stop_loss"],
-                        "breakeven_moved":   True,
-                    })
-                    logger.debug(
-                        f"[Tracker] Signal {signal.id} breakeven: SL → {action['new_stop_loss']}"
-                    )
+                    act = action["action"]
 
-                elif act == "partial_close" and not position.partial_closed:
-                    # SIM-07: close 50% at TP1 zone
-                    await self._partial_close(
-                        db, signal, position, current_price, now, pip_size
-                    )
+                    if act.startswith("exit_"):
+                        if act == "exit_sl" and position.trailing_stop:
+                            exit_reason = "trailing_sl_hit"
+                        else:
+                            exit_reason = act.replace("exit_", "") + "_hit"
+                        await self._close_signal(
+                            db, signal, current_price, now, exit_reason, position, pip_size,
+                            candle_high_at_exit=candle_high, candle_low_at_exit=candle_low,
+                            market=market,
+                        )
 
-                elif act == "trailing_update":
-                    await update_virtual_position(db, signal.id, {
-                        "trailing_stop":    action["new_stop_loss"],
-                        "current_stop_loss": action["new_stop_loss"],
-                    })
+                    elif act == "breakeven":
+                        await update_virtual_position(db, signal.id, {
+                            "current_stop_loss": action["new_stop_loss"],
+                            "breakeven_moved":   True,
+                        })
+                        logger.debug(
+                            f"[Tracker] Signal {signal.id} breakeven: SL → {action['new_stop_loss']}"
+                        )
+
+                    elif act == "partial_close" and not position.partial_closed:
+                        # SIM-07: close 50% at TP1 zone
+                        await self._partial_close(
+                            db, signal, position, current_price, now, pip_size
+                        )
+
+                    elif act == "trailing_update":
+                        await update_virtual_position(db, signal.id, {
+                            "trailing_stop":    action["new_stop_loss"],
+                            "current_stop_loss": action["new_stop_loss"],
+                        })
 
             else:
-                # Fallback: simple SL/TP check (no lifecycle)
-                tp2_hit = self._check_tp_hit(current_price, signal.take_profit_2, signal.direction)
-                tp1_hit = self._check_tp_hit(current_price, signal.take_profit_1, signal.direction)
-                sl_hit  = self._check_sl_hit(current_price, signal.stop_loss,    signal.direction)
+                # Fallback: simple SL/TP check with candle H/L (SIM-09)
+                tp2_hit, _ = self._check_tp_hit(
+                    current_price, signal.take_profit_2, signal.direction, candle_high, candle_low
+                )
+                tp1_hit, _ = self._check_tp_hit(
+                    current_price, signal.take_profit_1, signal.direction, candle_high, candle_low
+                )
+                sl_hit = self._check_sl_hit(
+                    current_price, signal.stop_loss, signal.direction, candle_low, candle_high
+                )
 
-                if tp2_hit:
-                    await self._close_signal(db, signal, current_price, now, "tp2_hit", position, pip_size)
+                # Determine exit_price (level, not current_price, for audit accuracy)
+                if sl_hit and (tp1_hit or tp2_hit):
+                    # Worst case: SL wins
+                    exit_price_fb = signal.stop_loss or current_price
+                    await self._close_signal(
+                        db, signal, exit_price_fb, now, "sl_hit", position, pip_size,
+                        candle_high_at_exit=candle_high, candle_low_at_exit=candle_low,
+                        market=market,
+                    )
+                elif tp2_hit:
+                    exit_price_fb = signal.take_profit_2 or current_price
+                    await self._close_signal(
+                        db, signal, exit_price_fb, now, "tp2_hit", position, pip_size,
+                        candle_high_at_exit=candle_high, candle_low_at_exit=candle_low,
+                        market=market,
+                    )
                 elif tp1_hit:
-                    await self._close_signal(db, signal, current_price, now, "tp1_hit", position, pip_size)
+                    exit_price_fb = signal.take_profit_1 or current_price
+                    await self._close_signal(
+                        db, signal, exit_price_fb, now, "tp1_hit", position, pip_size,
+                        candle_high_at_exit=candle_high, candle_low_at_exit=candle_low,
+                        market=market,
+                    )
                 elif sl_hit:
-                    await self._close_signal(db, signal, current_price, now, "sl_hit",  position, pip_size)
+                    exit_price_fb = signal.stop_loss or current_price
+                    await self._close_signal(
+                        db, signal, exit_price_fb, now, "sl_hit", position, pip_size,
+                        candle_high_at_exit=candle_high, candle_low_at_exit=candle_low,
+                        market=market,
+                    )
 
     # ── Lifecycle helpers ─────────────────────────────────────────────────────
 
@@ -429,7 +662,7 @@ class SignalTracker:
         actual_entry_price: Decimal,
         entry_filled_at: datetime.datetime,
     ) -> None:
-        """Create virtual portfolio position at spread-adjusted entry (SIM-02)."""
+        """Create virtual portfolio position at spread-adjusted entry (SIM-02, SIM-16)."""
         try:
             if await get_virtual_position(db, signal.id) is not None:
                 return  # idempotent
@@ -438,26 +671,135 @@ class SignalTracker:
             if signal.position_size_pct and signal.position_size_pct > 0:
                 size_pct = Decimal(str(signal.position_size_pct))
 
+            # SIM-16: snapshot current balance at entry time
+            account = await get_virtual_account(db)
+            account_balance_at_entry = account.current_balance if account else ACCOUNT_SIZE
+
             await create_virtual_position(db, data={
-                "signal_id":        signal.id,
-                "size_pct":         size_pct,
-                "entry_price":      actual_entry_price,
-                "status":           "open",
-                "entry_filled_at":  entry_filled_at,
-                "current_stop_loss": signal.stop_loss,
-                "size_remaining_pct": Decimal("1.0"),
-                "mfe":              Decimal("0"),
-                "mae":              Decimal("0"),
-                "breakeven_moved":  False,
-                "partial_closed":   False,
+                "signal_id":                signal.id,
+                "size_pct":                 size_pct,
+                "entry_price":              actual_entry_price,
+                "status":                   "open",
+                "entry_filled_at":          entry_filled_at,
+                "current_stop_loss":        signal.stop_loss,
+                "size_remaining_pct":       Decimal("1.0"),
+                "mfe":                      Decimal("0"),
+                "mae":                      Decimal("0"),
+                "breakeven_moved":          False,
+                "partial_closed":           False,
+                "account_balance_at_entry": account_balance_at_entry,
             })
             logger.info(
-                f"[Tracker] Virtual position opened for signal {signal.id} @ {actual_entry_price}"
+                f"[Tracker] Virtual position opened for signal {signal.id} @ {actual_entry_price} "
+                f"(balance_at_entry={account_balance_at_entry})"
             )
         except Exception as exc:
             logger.warning(
                 f"[Tracker] Failed to open virtual position for signal {signal.id}: {exc}"
             )
+
+    async def _update_account_balance(
+        self,
+        db: AsyncSession,
+        realized_pnl_usd: Decimal,
+    ) -> None:
+        """SIM-16: update virtual_account balance after a (partial) close."""
+        try:
+            account = await get_virtual_account(db)
+            if account is None:
+                logger.warning("[Tracker] _update_account_balance: no virtual_account row found")
+                return
+
+            new_balance = account.current_balance + realized_pnl_usd
+            new_peak = max(account.peak_balance, new_balance)
+
+            await update_virtual_account(db, {
+                "current_balance":    new_balance,
+                "peak_balance":       new_peak,
+                "total_realized_pnl": account.total_realized_pnl + realized_pnl_usd,
+                "total_trades":       account.total_trades + 1,
+                "updated_at":         datetime.datetime.now(datetime.timezone.utc),
+            })
+        except Exception as exc:
+            logger.error(f"[Tracker] _update_account_balance failed: {exc}")
+
+    async def _apply_daily_swap(
+        self,
+        db: AsyncSession,
+        signal: Any,
+        position: Any,
+        instrument: Any,
+        now: datetime.datetime,
+    ) -> None:
+        """SIM-13: Accrue daily swap for open positions at rollover time (22:00 UTC).
+
+        Conditions:
+        1. Position is open or partial
+        2. Current time >= 22:00 UTC
+        3. Swap not yet accrued today (last_swap_date != today)
+        """
+        try:
+            if position.status not in ("open", "partial"):
+                return
+            if now.hour < ROLLOVER_HOUR_UTC:
+                return
+            today = now.date()
+            if position.last_swap_date and position.last_swap_date >= today:
+                return
+
+            market = instrument.market if instrument else "unknown"
+            symbol = instrument.symbol if instrument else ""
+            direction_key = signal.direction.lower()
+
+            swap_pips = Decimal("0")
+
+            if market == "crypto":
+                funding_rate = await get_latest_funding_rate(db, instrument.id)
+                if funding_rate is not None:
+                    # Long pays when rate > 0; short profits
+                    swap_pct = funding_rate * (
+                        Decimal("-1") if signal.direction == "LONG" else Decimal("1")
+                    )
+                    # Convert pct to pip equivalent (approximate)
+                    pip_size = instrument.pip_size if instrument.pip_size else Decimal("0.01")
+                    entry = position.entry_price or Decimal("1")
+                    swap_pips = (entry * swap_pct / pip_size).quantize(Decimal("0.0001"))
+                # else: zero funding rate → no swap
+            elif symbol in SWAP_DAILY_PIPS:
+                daily_rates = SWAP_DAILY_PIPS[symbol]
+                rate = daily_rates.get(direction_key, Decimal("0"))
+                multiplier = Decimal("3") if now.weekday() == TRIPLE_SWAP_WEEKDAY else Decimal("1")
+                swap_pips = (rate * multiplier).quantize(Decimal("0.0001"))
+            else:
+                # Instrument not in table — no swap
+                logger.warning(
+                    f"[Tracker] Swap: no rate for {symbol} ({market}), skipping signal {signal.id}"
+                )
+                return
+
+            # Convert pips to USD
+            pip_size = instrument.pip_size if instrument.pip_size else Decimal("0.0001")
+            size_pct = position.size_pct or Decimal("2.0")
+            _raw_bal2 = position.account_balance_at_entry
+            balance = _raw_bal2 if isinstance(_raw_bal2, Decimal) else ACCOUNT_SIZE
+            # swap_usd = swap_pips × pip_size × (balance × size_pct / 100) / pip_size (simplified)
+            swap_usd = swap_pips * pip_size * (balance * size_pct / Decimal("100")) / pip_size
+            swap_usd = swap_usd.quantize(Decimal("0.0001"))
+
+            new_accrued_pips = (position.accrued_swap_pips or Decimal("0")) + swap_pips
+            new_accrued_usd = (position.accrued_swap_usd or Decimal("0")) + swap_usd
+
+            await update_virtual_position(db, signal.id, {
+                "accrued_swap_pips": new_accrued_pips,
+                "accrued_swap_usd":  new_accrued_usd,
+                "last_swap_date":    today,
+            })
+            logger.info(
+                f"[Tracker] Swap accrued for signal {signal.id}: "
+                f"{swap_pips} pips / {swap_usd} USD (total: {new_accrued_pips} pips)"
+            )
+        except Exception as exc:
+            logger.error(f"[Tracker] _apply_daily_swap failed for signal {signal.id}: {exc}")
 
     async def _update_virtual_unrealized(
         self,
@@ -465,16 +807,35 @@ class SignalTracker:
         signal: Signal,
         current_price: Decimal,
         entry_price: Decimal,
+        position: Optional[Any] = None,
     ) -> None:
+        """SIM-12: update unrealized P&L with position sizing and partial close awareness."""
         try:
             if signal.direction == "LONG":
-                pnl_pct = (current_price - entry_price) / entry_price * Decimal("100")
+                move_pct = (current_price - entry_price) / entry_price * Decimal("100")
             else:
-                pnl_pct = (entry_price - current_price) / entry_price * Decimal("100")
-            await update_virtual_position(db, signal.id, {
+                move_pct = (entry_price - current_price) / entry_price * Decimal("100")
+
+            updates: dict[str, Any] = {
                 "current_price":      current_price,
-                "unrealized_pnl_pct": pnl_pct.quantize(Decimal("0.0001")),
-            })
+                "unrealized_pnl_pct": move_pct.quantize(Decimal("0.0001")),
+            }
+
+            # SIM-12: compute unrealized_pnl_usd with effective position size
+            if position is not None:
+                size_pct = position.size_pct or Decimal("2.0")
+                remaining = position.size_remaining_pct or Decimal("1.0")
+                effective_size = size_pct * remaining
+                _raw_b = position.account_balance_at_entry
+                balance = _raw_b if isinstance(_raw_b, Decimal) else ACCOUNT_SIZE
+                unrealized_usd = (
+                    balance
+                    * (effective_size / Decimal("100"))
+                    * (move_pct / Decimal("100"))
+                )
+                updates["unrealized_pnl_usd"] = unrealized_usd.quantize(Decimal("0.01"))
+
+            await update_virtual_position(db, signal.id, updates)
         except Exception as exc:
             logger.debug(
                 f"[Tracker] Unrealized P&L update failed for signal {signal.id}: {exc}"
@@ -503,9 +864,17 @@ class SignalTracker:
             "current_stop_loss":   entry,    # SL → entry after partial close
             "breakeven_moved":     True,
         })
+
+        # SIM-16: update account balance for the 50% partial close P&L
+        _raw_bal = getattr(position, "account_balance_at_entry", None)
+        account_balance = _raw_bal if isinstance(_raw_bal, Decimal) else None
+        partial_pnl_usd = self._pnl_usd(pnl_pct, signal.position_size_pct, account_balance) * Decimal("0.5")
+        await self._update_account_balance(db, partial_pnl_usd.quantize(Decimal("0.01")))
+
         logger.info(
             f"[Tracker] Signal {signal.id} partial close @ {exit_price}: "
-            f"50% at {pnl_pct:.4f}%, SL moved to entry {entry}"
+            f"50% at {pnl_pct:.4f}%, SL moved to entry {entry}, "
+            f"partial_pnl_usd={partial_pnl_usd:.2f}"
         )
 
     async def _close_signal(
@@ -517,8 +886,31 @@ class SignalTracker:
         exit_reason: str,
         position: Any,
         pip_size: Decimal,
+        candle_high_at_exit: Optional[Decimal] = None,
+        candle_low_at_exit: Optional[Decimal] = None,
+        market: Optional[str] = None,
     ) -> None:
-        """Close signal: create signal_result and close virtual position."""
+        """Close signal: create signal_result and close virtual position.
+
+        SIM-09: candle_high_at_exit / candle_low_at_exit stored for audit.
+        SIM-10: slippage applied for SL exits (market orders).
+        SIM-14: composite_score copied from signal.
+        """
+        # SIM-10: apply slippage for SL exits
+        exit_slippage_pips: Optional[Decimal] = None
+        if exit_reason in ("sl_hit", "trailing_sl_hit") and market:
+            slippage_adjusted = self._apply_sl_slippage(
+                exit_price, signal.direction, market, pip_size
+            )
+            if market == "crypto":
+                raw_slip_usd = exit_price - slippage_adjusted if signal.direction == "LONG" else slippage_adjusted - exit_price
+                exit_slippage_pips = (raw_slip_usd / pip_size).quantize(Decimal("0.0001"))
+            else:
+                exit_slippage_pips = -SL_SLIPPAGE_PIPS.get(market, Decimal("1.0"))
+                if signal.direction == "SHORT":
+                    exit_slippage_pips = -exit_slippage_pips
+            exit_price = slippage_adjusted
+
         actual_entry = (
             (position.entry_price if position else None)
             or signal.entry_price
@@ -542,8 +934,10 @@ class SignalTracker:
         mfe = (position.mfe if position else None) or Decimal("0")
         mae = (position.mae if position else None) or Decimal("0")
 
-        # SIM-06: P&L USD with position size
-        pnl_usd_val = self._pnl_usd(pnl_pct, signal.position_size_pct)
+        # SIM-06/SIM-16: P&L USD with position size and account balance snapshot
+        _raw_acct = getattr(position, "account_balance_at_entry", None) if position else None
+        account_balance = _raw_acct if isinstance(_raw_acct, Decimal) else None
+        pnl_usd_val = self._pnl_usd(pnl_pct, signal.position_size_pct, account_balance)
 
         # SIM-07: blended P&L when partial close happened
         partial_pnl_pct = position.partial_pnl_pct if position else None
@@ -551,13 +945,13 @@ class SignalTracker:
         full_close_pnl_usd: Optional[Decimal] = None
         if partial_pnl_pct is not None and position and position.partial_closed:
             partial_close_pnl_usd = (
-                self._pnl_usd(partial_pnl_pct, signal.position_size_pct) * Decimal("0.5")
+                self._pnl_usd(partial_pnl_pct, signal.position_size_pct, account_balance) * Decimal("0.5")
             )
             full_close_pnl_usd = (
-                self._pnl_usd(pnl_pct, signal.position_size_pct) * Decimal("0.5")
+                self._pnl_usd(pnl_pct, signal.position_size_pct, account_balance) * Decimal("0.5")
             )
             blended_pct = (partial_pnl_pct + pnl_pct) / Decimal("2")
-            pnl_usd_val = self._pnl_usd(blended_pct, signal.position_size_pct)
+            pnl_usd_val = self._pnl_usd(blended_pct, signal.position_size_pct, account_balance)
 
         result_data: dict[str, Any] = {
             "signal_id":               signal.id,
@@ -573,7 +967,23 @@ class SignalTracker:
             "max_favorable_excursion": mfe,
             "max_adverse_excursion":   mae,
             "duration_minutes":        duration_minutes,
+            # SIM-09: candle audit fields
+            "candle_high_at_exit":     candle_high_at_exit,
+            "candle_low_at_exit":      candle_low_at_exit,
+            # SIM-10: slippage
+            "exit_slippage_pips":      exit_slippage_pips,
+            # SIM-13: accumulated swap
+            "swap_pips":               (position.accrued_swap_pips if position else None) or Decimal("0"),
+            "swap_usd":                (position.accrued_swap_usd if position else None) or Decimal("0"),
+            # SIM-14: denormalized composite_score
+            "composite_score":         Decimal(str(signal.composite_score)) if signal.composite_score else None,
         }
+
+        # SIM-13: total P&L includes accrued swap
+        accrued_swap_usd = Decimal(str(position.accrued_swap_usd or 0)) if position else Decimal("0")
+        if accrued_swap_usd != Decimal("0"):
+            total_pnl_with_swap = pnl_usd_val + accrued_swap_usd
+            result_data["pnl_usd"] = total_pnl_with_swap.quantize(Decimal("0.01"))
         if partial_close_pnl_usd is not None:
             result_data["partial_close_pnl_usd"] = partial_close_pnl_usd.quantize(Decimal("0.01"))
             result_data["full_close_pnl_usd"]    = full_close_pnl_usd.quantize(Decimal("0.01"))
@@ -594,6 +1004,15 @@ class SignalTracker:
                 logger.warning(
                     f"[Tracker] Failed to close virtual position for signal {signal.id}: {exc}"
                 )
+
+        # SIM-16: update account balance for the final close P&L
+        # For partial close: only the remaining 50% is settled here;
+        # the first 50% was already applied in _partial_close().
+        if position and position.partial_closed:
+            final_pnl = full_close_pnl_usd if full_close_pnl_usd is not None else pnl_usd_val
+            await self._update_account_balance(db, final_pnl.quantize(Decimal("0.01")))
+        else:
+            await self._update_account_balance(db, pnl_usd_val.quantize(Decimal("0.01")))
 
         logger.info(
             f"[Tracker] Signal {signal.id} completed: {exit_reason}, "

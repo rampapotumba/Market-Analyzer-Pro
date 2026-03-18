@@ -7,6 +7,7 @@ from typing import Optional
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -157,6 +158,14 @@ class SignalResult(Base):
     pnl_usd: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 4))
     partial_close_pnl_usd: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 4))
     full_close_pnl_usd: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 4))
+
+    # v3 simulator fields (SIM-09, SIM-10, SIM-13, SIM-14)
+    candle_high_at_exit: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 8))
+    candle_low_at_exit: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 8))
+    exit_slippage_pips: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
+    swap_pips: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 4))
+    swap_usd: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 4))
+    composite_score: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
 
     signal: Mapped["Signal"] = relationship("Signal", back_populates="result")
 
@@ -450,6 +459,39 @@ class VirtualPortfolio(Base):
     partial_close_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True))
     partial_pnl_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
     entry_filled_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True))
+
+    # v3 simulator fields (SIM-12, SIM-13, SIM-16)
+    unrealized_pnl_usd: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 4))
+    accrued_swap_pips: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 4), default=Decimal("0"))
+    accrued_swap_usd: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 4), default=Decimal("0"))
+    last_swap_date: Mapped[Optional[datetime.date]] = mapped_column(Date())
+    account_balance_at_entry: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 4))
+
+
+# ── Virtual account (SIM-16: dynamic balance) ────────────────────────────────
+
+class VirtualAccount(Base):
+    __tablename__ = "virtual_account"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    initial_balance: Mapped[Decimal] = mapped_column(
+        Numeric(14, 4), nullable=False, default=Decimal("1000.0")
+    )
+    current_balance: Mapped[Decimal] = mapped_column(
+        Numeric(14, 4), nullable=False, default=Decimal("1000.0")
+    )
+    peak_balance: Mapped[Decimal] = mapped_column(
+        Numeric(14, 4), nullable=False, default=Decimal("1000.0")
+    )
+    total_realized_pnl: Mapped[Decimal] = mapped_column(
+        Numeric(14, 4), nullable=False, default=Decimal("0.0")
+    )
+    total_trades: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
 
 
 # ── Backtesting ───────────────────────────────────────────────────────────────

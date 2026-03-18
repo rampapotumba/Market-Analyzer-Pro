@@ -18,6 +18,7 @@ from src.database.crud import (
     get_signal_by_id,
     get_signals,
     get_upcoming_economic_events,
+    get_virtual_account,
 )
 from src.database.engine import async_session_factory
 from src.database.models import (
@@ -31,6 +32,7 @@ from src.database.models import (
     RegimeState,
     Signal,
     SignalResult,
+    VirtualAccount,
     VirtualPortfolio,
 )
 
@@ -831,21 +833,287 @@ async def simulator_stats(db: AsyncSession = Depends(get_session)):
         gross_losses_val = abs(float(gl_q.scalar() or 0))
     profit_factor = round(gross_wins_val / gross_losses_val, 2) if gross_losses_val > 0 else None
 
+    # SIM-15: additional stats fields
+    cancelled_q = await db.execute(
+        select(func.count(SignalResult.id)).where(SignalResult.exit_reason == "cancelled")
+    )
+    cancelled_count = cancelled_q.scalar() or 0
+
+    avg_dur_q = await db.execute(
+        select(func.avg(SignalResult.duration_minutes)).where(_real_trades)
+    )
+    avg_duration_minutes = float(avg_dur_q.scalar() or 0)
+
+    avg_mfe_q = await db.execute(
+        select(func.avg(SignalResult.max_favorable_excursion)).where(_real_trades)
+    )
+    avg_mfe = float(avg_mfe_q.scalar() or 0)
+
+    avg_mae_q = await db.execute(
+        select(func.avg(SignalResult.max_adverse_excursion)).where(_real_trades)
+    )
+    avg_mae = float(avg_mae_q.scalar() or 0)
+
+    swap_q = await db.execute(
+        select(func.sum(SignalResult.swap_usd)).where(_real_trades)
+    )
+    total_swap_usd = float(swap_q.scalar() or 0)
+
+    # best_exit_reason: exit_reason with best avg_pnl_usd
+    best_exit_q = await db.execute(
+        select(SignalResult.exit_reason, func.avg(SignalResult.pnl_usd).label("avg_pnl"))
+        .where(_real_trades, SignalResult.exit_reason.isnot(None))
+        .group_by(SignalResult.exit_reason)
+        .order_by(func.avg(SignalResult.pnl_usd).desc())
+        .limit(1)
+    )
+    best_exit_row = best_exit_q.first()
+    best_exit_reason = best_exit_row[0] if best_exit_row else None
+
+    # SIM-16: virtual account fields
+    account = await get_virtual_account(db)
+    account_initial = float(account.initial_balance) if account else ACCOUNT_SIZE_FLOAT
+    account_current = float(account.current_balance) if account else ACCOUNT_SIZE_FLOAT
+    account_peak = float(account.peak_balance) if account else ACCOUNT_SIZE_FLOAT
+    account_drawdown_pct = round(
+        (account_peak - account_current) / account_peak * 100, 2
+    ) if account_peak > 0 else 0.0
+    account_total_return_pct = round(
+        (account_current - account_initial) / account_initial * 100, 2
+    ) if account_initial > 0 else 0.0
+
+    # SIM-12: unrealized_pnl_usd from stored field
+    unrealized_usd_q = await db.execute(
+        select(func.sum(VirtualPortfolio.unrealized_pnl_usd)).where(
+            VirtualPortfolio.status.in_(["open", "partial"])
+        )
+    )
+    unrealized_usd_stored = float(unrealized_usd_q.scalar() or 0)
+    # Fallback to pnl_pct-based calculation for old positions
+    if unrealized_usd_stored == 0 and unrealized_pct != 0:
+        unrealized_usd_stored = pnl_usd(unrealized_pct)
+
     return {
-        "account_size_usd":    ACCOUNT_SIZE_FLOAT,
-        "total_trades":        total,
-        "open_positions":      open_positions,
-        "wins":                wins,
-        "losses":              losses,
-        "breakevens":          breakevens,
-        "win_rate_pct":        win_rate,
-        "total_pnl_usd":       round(total_pnl_usd_stored, 2),
-        "total_pnl_pct":       round(total_pnl_pct, 4),
-        "unrealized_pnl_usd":  pnl_usd(unrealized_pct),
-        "avg_win_usd":         round(avg_win_usd, 2),
-        "avg_loss_usd":        round(avg_loss_usd, 2),
-        "profit_factor":       profit_factor,
+        "account_size_usd":           ACCOUNT_SIZE_FLOAT,
+        "total_trades":               total,
+        "open_positions":             open_positions,
+        "wins":                       wins,
+        "losses":                     losses,
+        "breakevens":                 breakevens,
+        "win_rate_pct":               win_rate,
+        "total_pnl_usd":              round(total_pnl_usd_stored, 2),
+        "total_pnl_pct":              round(total_pnl_pct, 4),
+        "unrealized_pnl_usd":         round(unrealized_usd_stored, 2),
+        "avg_win_usd":                round(avg_win_usd, 2),
+        "avg_loss_usd":               round(avg_loss_usd, 2),
+        "profit_factor":              profit_factor,
+        # SIM-15 new fields
+        "cancelled_count":            cancelled_count,
+        "avg_duration_minutes":       round(avg_duration_minutes, 1),
+        "avg_mfe_pips":               round(avg_mfe, 4),
+        "avg_mae_pips":               round(avg_mae, 4),
+        "total_swap_usd":             round(total_swap_usd, 2),
+        "best_exit_reason":           best_exit_reason,
+        # SIM-16 account fields
+        "account_initial_balance":    round(account_initial, 2),
+        "account_current_balance":    round(account_current, 2),
+        "account_peak_balance":       round(account_peak, 2),
+        "account_drawdown_pct":       account_drawdown_pct,
+        "account_total_return_pct":   account_total_return_pct,
     }
+
+
+@router_v2.get("/simulator/score-analysis")
+async def simulator_score_analysis(db: AsyncSession = Depends(get_session)):
+    """SIM-14: Score → Outcome analytics grouped by composite_score buckets."""
+    from src.config import settings
+
+    BUCKETS = [
+        ("strong_sell", None,  -15.0),
+        ("sell",        -15.0, -10.0),
+        ("weak_sell",   -10.0,  -7.0),
+        ("neutral",      -7.0,   7.0),
+        ("weak_buy",      7.0,  10.0),
+        ("buy",          10.0,  15.0),
+        ("strong_buy",   15.0,  None),
+    ]
+
+    BUCKET_LABELS = {
+        "strong_sell": "≤−15 (STRONG_SELL)",
+        "sell":        "−15..−10 (SELL)",
+        "weak_sell":   "−10..−7 (WEAK_SELL)",
+        "neutral":     "−7..+7 (NEUTRAL)",
+        "weak_buy":    "+7..+10 (WEAK_BUY)",
+        "buy":         "+10..+15 (BUY)",
+        "strong_buy":  "≥+15 (STRONG_BUY)",
+    }
+
+    # Fetch all closed trades with composite_score
+    stmt = (
+        select(SignalResult)
+        .where(
+            SignalResult.exit_reason != "cancelled",
+            SignalResult.composite_score.isnot(None),
+            SignalResult.exit_at.isnot(None),
+        )
+    )
+    rows = list((await db.execute(stmt)).scalars().all())
+
+    def assign_bucket(score: float) -> str:
+        if score <= -15:
+            return "strong_sell"
+        elif score <= -10:
+            return "sell"
+        elif score <= -7:
+            return "weak_sell"
+        elif score < 7:
+            return "neutral"
+        elif score <= 10:
+            return "weak_buy"
+        elif score <= 15:
+            return "buy"
+        else:
+            return "strong_buy"
+
+    # Group by bucket
+    from collections import defaultdict
+    groups: dict[str, list[SignalResult]] = defaultdict(list)
+    for r in rows:
+        bucket_key = assign_bucket(float(r.composite_score))
+        groups[bucket_key].append(r)
+
+    score_buckets = []
+    for bucket_name, range_min, range_max in BUCKETS:
+        bucket_rows = groups[bucket_name]
+        total = len(bucket_rows)
+        wins = sum(1 for r in bucket_rows if r.result == "win")
+        losses = sum(1 for r in bucket_rows if r.result == "loss")
+        breakevens = total - wins - losses
+
+        gross_wins = sum(float(r.pnl_usd or 0) for r in bucket_rows if (r.pnl_usd or 0) > 0)
+        gross_losses = abs(sum(float(r.pnl_usd or 0) for r in bucket_rows if (r.pnl_usd or 0) < 0))
+        profit_factor_b = round(gross_wins / gross_losses, 2) if gross_losses > 0 else None
+
+        avg_pnl_usd = round(sum(float(r.pnl_usd or 0) for r in bucket_rows) / total, 4) if total > 0 else 0.0
+        avg_pnl_pips = round(sum(float(r.pnl_pips or 0) for r in bucket_rows) / total, 2) if total > 0 else 0.0
+        avg_dur = round(sum(r.duration_minutes or 0 for r in bucket_rows) / total, 1) if total > 0 else 0.0
+        avg_mfe = round(sum(float(r.max_favorable_excursion or 0) for r in bucket_rows) / total, 4) if total > 0 else 0.0
+        avg_mae = round(sum(float(r.max_adverse_excursion or 0) for r in bucket_rows) / total, 4) if total > 0 else 0.0
+
+        score_buckets.append({
+            "bucket_name":          bucket_name,
+            "range_label":          BUCKET_LABELS[bucket_name],
+            "range_min":            range_min,
+            "range_max":            range_max,
+            "total":                total,
+            "wins":                 wins,
+            "losses":               losses,
+            "breakevens":           breakevens,
+            "win_rate_pct":         round(wins / total * 100, 1) if total > 0 else 0.0,
+            "profit_factor":        profit_factor_b,
+            "avg_pnl_usd":          avg_pnl_usd,
+            "avg_pnl_pips":         avg_pnl_pips,
+            "avg_duration_minutes": avg_dur,
+            "avg_mfe_pips":         avg_mfe,
+            "avg_mae_pips":         avg_mae,
+            "insufficient_data":    total < 3,
+        })
+
+    # Threshold recommendations
+    eligible = [b for b in score_buckets if not b["insufficient_data"] and b["total"] >= 5]
+    pf_positive = [b for b in eligible if b["profit_factor"] and b["profit_factor"] > 1.0]
+    suggested_min = (
+        min(b["range_min"] for b in pf_positive if b["range_min"] is not None)
+        if pf_positive else None
+    )
+    best_win_rate_bucket = max(eligible, key=lambda b: b["win_rate_pct"]) if eligible else None
+
+    return {
+        "score_buckets": score_buckets,
+        "threshold_recommendations": {
+            "current_buy_threshold": float(settings.BUY_THRESHOLD) if hasattr(settings, "BUY_THRESHOLD") else 7.0,
+            "suggested_min_score_for_positive_edge": suggested_min,
+            "score_with_best_win_rate": {
+                "score_min": best_win_rate_bucket["range_min"],
+                "win_rate": best_win_rate_bucket["win_rate_pct"],
+            } if best_win_rate_bucket else None,
+        },
+    }
+
+
+@router_v2.get("/simulator/breakdown")
+async def simulator_breakdown(
+    by: str = Query(..., description="timeframe|direction|exit_reason|market|month"),
+    db: AsyncSession = Depends(get_session),
+):
+    """SIM-15: Breakdown analytics by dimension."""
+    ALLOWED_DIMS = {"timeframe", "direction", "exit_reason", "market", "month"}
+    if by not in ALLOWED_DIMS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid dimension '{by}'. Allowed: {', '.join(sorted(ALLOWED_DIMS))}",
+        )
+
+    # Fetch all closed trades (join Signal + Instrument for market/timeframe/direction)
+    stmt = (
+        select(SignalResult, Signal, Instrument)
+        .join(Signal, SignalResult.signal_id == Signal.id)
+        .join(Instrument, Signal.instrument_id == Instrument.id)
+        .where(SignalResult.exit_reason != "cancelled")
+        .where(SignalResult.exit_at.isnot(None))
+    )
+    trade_rows = list((await db.execute(stmt)).all())
+
+    def get_key(sr: SignalResult, sig: Signal, instr: Instrument) -> Optional[str]:
+        if by == "timeframe":
+            return sig.timeframe
+        elif by == "direction":
+            return sig.direction
+        elif by == "exit_reason":
+            return sr.exit_reason or "unknown"
+        elif by == "market":
+            return instr.market
+        elif by == "month":
+            return sr.exit_at.strftime("%Y-%m") if sr.exit_at else None
+        return None
+
+    from collections import defaultdict
+    groups: dict[str, list[tuple]] = defaultdict(list)
+    for sr, sig, instr in trade_rows:
+        key = get_key(sr, sig, instr)
+        if key is not None:
+            groups[key].append((sr, sig, instr))
+
+    rows_out = []
+    for key, trades in sorted(groups.items()):
+        total = len(trades)
+        wins = sum(1 for sr, _, _ in trades if sr.result == "win")
+        losses = sum(1 for sr, _, _ in trades if sr.result == "loss")
+        breakevens = total - wins - losses
+
+        gross_wins = sum(float(sr.pnl_usd or 0) for sr, _, _ in trades if (sr.pnl_usd or 0) > 0)
+        gross_losses = abs(sum(float(sr.pnl_usd or 0) for sr, _, _ in trades if (sr.pnl_usd or 0) < 0))
+        pf = round(gross_wins / gross_losses, 2) if gross_losses > 0 else None
+
+        avg_pnl = round(sum(float(sr.pnl_usd or 0) for sr, _, _ in trades) / total, 4) if total > 0 else 0.0
+        avg_dur = round(sum(sr.duration_minutes or 0 for sr, _, _ in trades) / total, 1) if total > 0 else 0.0
+        scores = [float(sr.composite_score) for sr, _, _ in trades if sr.composite_score is not None]
+        avg_score = round(sum(scores) / len(scores), 2) if scores else None
+
+        rows_out.append({
+            "key":                  key,
+            "total":                total,
+            "wins":                 wins,
+            "losses":               losses,
+            "breakevens":           breakevens,
+            "win_rate_pct":         round(wins / total * 100, 1) if total > 0 else 0.0,
+            "profit_factor":        pf,
+            "avg_pnl_usd":          avg_pnl,
+            "avg_duration_minutes": avg_dur,
+            "avg_composite_score":  avg_score,
+        })
+
+    return {"dimension": by, "rows": rows_out}
 
 
 @router_v2.get("/simulator/trades")
@@ -919,6 +1187,12 @@ async def simulator_open_positions(db: AsyncSession = Depends(get_session)):
 
     positions = []
     for pos, signal, instr in rows:
+        # SIM-12: use stored unrealized_pnl_usd; fallback to pnl_pct computation
+        unrealized_usd_val = (
+            float(pos.unrealized_pnl_usd)
+            if pos.unrealized_pnl_usd is not None
+            else pnl_usd(float(pos.unrealized_pnl_pct or 0))
+        )
         positions.append({
             "signal_id": signal.id,
             "symbol": instr.symbol,
@@ -930,7 +1204,8 @@ async def simulator_open_positions(db: AsyncSession = Depends(get_session)):
             "stop_loss": float(signal.stop_loss or 0),
             "take_profit_1": float(signal.take_profit_1 or 0),
             "unrealized_pnl_pct": float(pos.unrealized_pnl_pct or 0),
-            "unrealized_pnl_usd": pnl_usd(float(pos.unrealized_pnl_pct or 0)),
+            "unrealized_pnl_usd": round(unrealized_usd_val, 2),
+            "account_balance_at_entry": float(pos.account_balance_at_entry) if pos.account_balance_at_entry else None,
             "opened_at": pos.opened_at.isoformat() if pos.opened_at else None,
         })
 

@@ -1,435 +1,202 @@
-# Market Analyzer Pro — Задачи (v2 + v3)
+# Trade Simulator v3 — Задачи
 
-> Отмечай задачи как выполненные [x] по мере продвижения.
-> Порядок — по фазам. Внутри фазы — сверху вниз. Не перескакивай между фазами.
-> **v2 (Phase 2.x) — завершено. v3 (Phase 3.x) — текущая работа.**
-
----
-
-## Phase 2.1 — Фундамент (6-8 недель)
-
-### 2.1.1 Инфраструктура
-
-- [x] Мигрировать БД на PostgreSQL 16 + TimescaleDB
-  - [x] Обновить `DATABASE_URL` в config.py (asyncpg)
-  - [x] Создать Alembic миграцию: все v2 таблицы
-  - [x] Настроить hypertables: `price_data`, `order_flow_data`
-  - [x] Обновить `engine.py` для asyncpg
-- [x] Интегрировать Redis как кэш
-  - [x] Создать `src/cache.py` — Redis TTL-кэш обёртка
-  - [x] Заменить in-memory dict кэши на Redis
-  - [x] Кэширование API-ответов (FRED, Finnhub, GDELT)
-- [x] Перейти на Celery
-  - [x] Создать `src/celery_app.py` с beat schedule
-  - [x] Перенести задачи из APScheduler в Celery tasks
-  - [x] Celery worker + beat в docker-compose
-  - [x] Мониторинг задач (flower или custom)
-
-### 2.1.2 Центральные банки и процентные дифференциалы
-
-- [x] Реализовать `central_bank_collector.py`
-  - [x] ECB Data Warehouse API
-  - [x] BOJ API
-  - [x] BOE API
-  - [x] RBA, BOC, SNB, RBNZ
-- [x] Реализовать `interest_rate_diff.py`
-  - [x] `InterestRateDifferential` класс
-  - [x] `calculate_differential(symbol)` для всех пар
-  - [x] `calculate_differential_trend(symbol, lookback=6m)`
-- [x] Alembic миграция: `central_bank_rates`
-
-### 2.1.3 Фундаментальный анализ v2
-
-- [x] `forex_fa_engine.py`
-  - [x] `ForexFAEngine._score_currency()` — скор для одной валюты
-  - [x] `ForexFAEngine.analyze()` — дифференциальный FA
-  - [x] `_differential_trend()` — тренд дифференциала
-- [x] `stock_fa_engine.py`
-  - [x] `get_company_metrics()` — P/E, EPS, margins
-  - [x] `get_analyst_consensus()` — Finnhub recommendations
-  - [x] `get_earnings_surprise()` — средний surprise 4Q
-  - [x] `get_insider_activity()` — SEC Form 4
-  - [x] `calculate_stock_fa_score()` — weighted (25/25/20/15/15)
-- [x] `crypto_fa_engine.py`
-  - [x] On-chain (NVT, addresses): 25%
-  - [x] Market structure (dominance, ETF): 20%
-  - [x] Funding ecosystem (revenue, TVL): 15%
-  - [x] Cycle analysis (halving, MVRV): 25%
-  - [x] Macro correlation: 15%
-- [x] `fundamentals_collector.py` — Finnhub + yfinance
-- [x] Alembic миграция: `company_fundamentals`
-
-### 2.1.4 Regime Detector
-
-- [x] `regime_detector.py`
-  - [x] `detect_regime()` — ADX + MA + ATR percentile + VIX
-  - [x] `_detect_trend()` — ADX thresholds
-  - [x] `_detect_volatility_regime()` — ATR 252d percentile
-  - [x] `get_regime_weights()` — 7 режимов
-  - [x] `get_atr_multiplier()` — SL/TP множители
-- [x] Alembic миграция: `regime_state`
-- [x] Celery task: detect_all (каждый час)
-
-### 2.1.5 Backtesting Engine
-
-- [x] `backtest_engine.py`
-  - [x] `run_walk_forward()` — IS(18m) → OOS(6m) × 5+
-  - [x] `optimize_weights()` — grid search, Sharpe оптимизация
-  - [x] `calculate_report()` — все метрики
-- [x] `monte_carlo.py` — 10000 симуляций, CI drawdown (в backtest_engine.py)
-- [x] `weight_validator.py` — auto revalidation (в backtest_engine.py)
-- [x] Alembic миграции: `backtest_runs`, `backtest_trades`
-- [x] Celery task: weekly backtest
-
-### 2.1.6 Тесты Phase 2.1
-
-- [x] `test_regime_detector.py`
-- [x] `test_forex_fa.py`
-- [x] `test_stock_fa.py`
-- [x] `test_crypto_fa.py`
-- [x] `test_backtest_engine.py`
-- [x] `test_interest_rate_diff.py`
-- [x] Coverage ≥ 90% для analysis/ и signals/
+> Отмечай `[x]` по мере выполнения. Работай сверху вниз, по фазам.  
+> Перед каждой задачей читай `docs/SPEC_SIMULATOR_V3.md` (раздел SIM-XX).  
+> После каждого блока — запусти тесты: `pytest tests/test_simulator_v3.py -v`
 
 ---
 
-## Phase 2.2 — Сентимент и Order Flow (4-5 недель)
+## Phase 1 — Фундамент: схема БД и динамический баланс (P0)
 
-### 2.2.1 FinBERT микросервис
+### 1.1 Alembic миграция
 
-- [x] `services/finbert/Dockerfile`
-- [x] `services/finbert/main.py` — POST /score, POST /batch, GET /health
-- [x] `services/finbert/requirements.txt`
-- [x] Добавить в docker-compose
-- [x] `FinBERTClient` в src/analysis/
+- [x] Изучи текущие модели в `src/database/models.py` — найди `SignalResult`, `VirtualPortfolio` и их текущие поля
+- [x] Изучи существующие миграции в `alembic/versions/` — определи формат именования и последнюю ревизию
+- [x] Создай `alembic/versions/xxxx_simulator_v3.py` — **одна миграция** со всеми изменениями:
+  - `signal_results`: добавить `candle_high_at_exit NUMERIC(18,8)`, `candle_low_at_exit NUMERIC(18,8)`, `exit_slippage_pips NUMERIC(8,4)`, `swap_pips NUMERIC(14,4)`, `swap_usd NUMERIC(14,4)`, `composite_score NUMERIC(8,4)` — все nullable
+  - `virtual_portfolio`: добавить `unrealized_pnl_usd NUMERIC(14,4)` nullable, `accrued_swap_pips NUMERIC(14,4) DEFAULT 0`, `accrued_swap_usd NUMERIC(14,4) DEFAULT 0`, `last_swap_date DATE` nullable, `account_balance_at_entry NUMERIC(14,4)` nullable
+  - Новая таблица `virtual_account`: `id SERIAL PK`, `initial_balance NUMERIC(14,4) NOT NULL DEFAULT 1000.0`, `current_balance NUMERIC(14,4) NOT NULL DEFAULT 1000.0`, `peak_balance NUMERIC(14,4) NOT NULL DEFAULT 1000.0`, `total_realized_pnl NUMERIC(14,4) NOT NULL DEFAULT 0.0`, `total_trades INTEGER NOT NULL DEFAULT 0`, `updated_at TIMESTAMPTZ DEFAULT NOW()`
+  - `INSERT INTO virtual_account ...` — начальная запись
+  - Включи `downgrade()` для отката (drop table + drop columns)
+- [ ] Тест: выполни `alembic upgrade head` без ошибок
 
-### 2.2.2 Sentiment Engine v2
+### 1.2 SQLAlchemy модели
 
-- [x] `sentiment_engine_v2.py`
-  - [x] Multi-source weighted scoring
-  - [x] FinBERT вместо TextBlob
-  - [x] Нормализация весов при отсутствии источника
+- [x] В `src/database/models.py`: добавь новые поля в класс `SignalResult` (6 полей)
+- [x] В `src/database/models.py`: добавь новые поля в класс `VirtualPortfolio` (5 полей)
+- [x] В `src/database/models.py`: создай класс `VirtualAccount` (модель новой таблицы)
+- [x] Тест: импорт моделей без ошибок, все поля соответствуют миграции
 
-### 2.2.3 Social Sentiment
+### 1.3 CRUD-функции для VirtualAccount
 
-- [x] `social_collector.py`
-  - [x] Reddit (PRAW)
-  - [x] Fear & Greed (Alternative.me)
-  - [x] Stocktwits
-  - [x] Options PCR (Yahoo)
-- [x] Alembic миграция: `social_sentiment` (в v2 схеме)
+- [x] В `src/database/crud.py`: добавь `async def get_virtual_account(db: AsyncSession) -> Optional[VirtualAccount]`
+- [x] В `src/database/crud.py`: добавь `async def update_virtual_account(db: AsyncSession, data: dict) -> None`
+- [x] В `src/database/crud.py`: добавь `async def create_virtual_account_if_not_exists(db: AsyncSession) -> VirtualAccount`
+- [x] Тест: `test_sim16_account_initialized_on_first_run` — создание записи при отсутствии
 
-### 2.2.4 Order Flow
+### 1.4 SIM-16: Динамический баланс — открытие позиции
 
-- [x] `order_flow_collector.py`
-  - [x] CVD (aggTrades)
-  - [x] Funding Rate
-  - [x] Open Interest
-  - [x] Liquidations
-  - [x] WebSocket буфер → БД (OrderFlowWebSocketCollector + Celery task)
-- [x] Alembic миграция: `order_flow_data` (hypertable, в v2 схеме)
+- [x] Найди в `src/tracker/signal_tracker.py` метод, отвечающий за открытие позиции (создание записи в `virtual_portfolio`)
+- [x] Добавь получение `virtual_account.current_balance` перед созданием позиции
+- [x] Записывай `account_balance_at_entry = current_balance` в `virtual_portfolio`
+- [x] Тест: `test_sim16_position_sizing_from_balance` — при балансе $900, P&L считается от $900
 
-### 2.2.5 TA Engine v2
+### 1.5 SIM-16: Динамический баланс — закрытие позиции
 
-- [x] `ta_engine_v2.py`
-  - [x] OF signals: CVD, OI, liquidations, funding
-  - [x] RSI/MACD divergence
-  - [x] OBV, MFI, VWAP
-  - [x] Ichimoku cloud
-  - [x] Pivot Points
-  - [x] Market structure: HH/HL, BOS, CHoCH
+- [x] Создай функцию `_update_account_balance(db, realized_pnl_usd)` в `signal_tracker.py` (см. спеку §16.5)
+- [x] Интегрируй вызов `_update_account_balance()` в `_close_signal()` — после расчёта P&L
+- [x] При partial close (SIM-07): вызывай `_update_account_balance()` с `partial_close_pnl_usd`
+- [x] Обнови `peak_balance` = max(peak, new_balance) при каждом обновлении
+- [x] Тест: `test_sim16_account_balance_updates_on_close` — убыточная сделка уменьшает баланс
+- [x] Тест: `test_sim16_account_balance_compounds` — две сделки подряд, баланс накапливается
+- [x] Тест: `test_sim16_partial_close_updates_balance_twice` — два обновления при partial close
+- [x] Тест: `test_sim16_drawdown_calculation` — peak=$1100, current=$950 → drawdown=13.64%
 
-### 2.2.6 Geo Engine v2
+### 1.6 SIM-16: Обновление `_pnl_usd` с учётом баланса
 
-- [x] `geo_engine_v2.py`
-  - [x] GDELT API
-  - [x] Country → instrument mapping
-  - [x] `fetch_gdelt_tone()`
-  - [x] `calculate_geopolitical_risk()`
-  - [x] `detect_risk_events()`
-  - [x] Circuit breaker (fallback → 0)
-
-### 2.2.7 Earnings Calendar
-
-- [x] `earnings_collector.py`
-  - [x] Finnhub + Yahoo earnings dates
-  - [x] `get_earnings_risk()` — days, expected_move, consensus
-  - [x] Правило: 2d → skip, 5d → -30%
-
-### 2.2.8 On-Chain
-
-- [x] `onchain_collector.py`
-  - [x] Glassnode API
-  - [x] CryptoQuant exchange flows
-  - [x] MVRV, dominance, ETF flows
-- [x] Alembic миграция: `onchain_data` (в v2 схеме)
-
-### 2.2.9 Тесты Phase 2.2
-
-- [x] `test_ta_engine_v2.py`
-- [x] `test_sentiment_v2.py`
-- [x] `test_social_collector.py`
-- [x] `test_order_flow.py`
-- [x] `test_geo_engine_v2.py`
-- [x] `test_onchain.py`
+- [x] Найди `_pnl_usd()` в `trade_simulator.py` (или `signal_tracker.py`)
+- [x] Добавь параметр `account_balance: Optional[Decimal] = None`
+- [x] Если `account_balance is not None` → использовать его вместо `ACCOUNT_SIZE`
+- [x] Во всех вызовах `_pnl_usd()` при закрытии — передавай `position.account_balance_at_entry`
+- [x] Тест: `test_sim16_legacy_position_fallback` — `account_balance_at_entry=NULL` → fallback к VIRTUAL_ACCOUNT_SIZE_USD
 
 ---
 
-## Phase 2.3 — Risk & Portfolio (3-4 недели)
+## Phase 2 — Точность исполнения SL/TP (P0)
 
-### 2.3.1 Risk Manager v2
+### 2.1 SIM-09: Получение candle High/Low
 
-- [x] `risk_manager_v2.py`
-  - [x] Regime-adaptive ATR multiplier
-  - [x] SL alignment to S/R
-  - [x] TP1/TP2/TP3 по режиму
+- [x] Изучи, как сейчас получается `current_price` в тике симулятора (signal_tracker.py)
+- [x] Создай метод `_get_candle_prices(db, instrument_id, timeframe) -> tuple[Decimal, Decimal, Decimal]` — возвращает (last_close, candle_high, candle_low) последней завершённой свечи
+- [x] Источник: таблица `price_data` (поля `high`, `low`, `close`), фильтр по `instrument_id` + `timeframe`, ORDER BY timestamp DESC, LIMIT 1 (убедись, что берёшь **завершённую** свечу, а не текущую открытую)
+- [x] Тест: mock price_data с 3 свечами → возвращается корректная последняя
 
-### 2.3.2 Portfolio Risk
+### 2.2 SIM-09: Проверка SL/TP по High/Low
 
-- [x] `portfolio_risk.py`
-  - [x] Correlation matrix
-  - [x] Position size adjustment
-  - [x] Max open per market (3/2/5)
-  - [x] Portfolio heat ≤ 6%
+- [x] Найди метод проверки SL/TP в signal_tracker.py (обычно в цикле тика)
+- [x] Расширь логику: SL check LONG — `current_price <= SL OR candle_low <= SL`
+- [x] Расширь логику: TP check LONG — `current_price >= TP OR candle_high >= TP`
+- [x] Аналогично для SHORT (инвертированные проверки, см. спеку §SIM-09)
+- [x] При одновременном пробое SL и TP → `exit_reason = "sl_hit"` (worst case)
+- [x] При SL hit по candle_low: `exit_price = stop_loss` (точно по уровню, до slippage)
+- [x] При TP hit по candle_high: `exit_price = take_profit_level` (точно по уровню)
+- [x] Сохраняй `candle_high_at_exit` и `candle_low_at_exit` в `signal_results`
+- [x] Тест: `test_sim09_sl_via_candle_low` — LONG: last > SL, candle_low < SL → sl_hit
+- [x] Тест: `test_sim09_tp_via_candle_high` — LONG: last < TP, candle_high > TP → tp1_hit
+- [x] Тест: `test_sim09_both_hit_worst_case` — гэп пробил оба → sl_hit
 
-### 2.3.3 Trade Lifecycle
+### 2.3 SIM-10: Slippage при SL exit
 
-- [x] `trade_lifecycle.py`
-  - [x] Breakeven after RR 1:1
-  - [x] Partial close 50% at TP1
-  - [x] Trailing: 0.5×ATR (trend), 0.3×ATR (range)
-
-### 2.3.4 Virtual Portfolio
-
-- [x] CRUD для `virtual_portfolio`
-- [x] Интеграция с signal_tracker
-- [x] PnL: open/closed, realized/unrealized
-- [x] Alembic миграция: `virtual_portfolio`
-
-### 2.3.5 Signal Engine v2
-
-- [x] `signal_engine_v2.py`
-  - [x] Regime-aware composite
-  - [x] OF modifier (крипто)
-  - [x] Earnings discount (акции)
-  - [x] Confidence v2
-  - [x] Portfolio heat check
-  - [x] LLM validation
-
-### 2.3.6 Webhooks
-
-- [x] `notifications/webhook.py`
-  - [x] MT5 webhook
-  - [x] 3Commas webhook
-  - [x] TradingView webhook
-
-### 2.3.7 Тесты Phase 2.3
-
-- [x] `test_risk_manager_v2.py`
-- [x] `test_portfolio_risk.py`
-- [x] `test_trade_lifecycle.py`
-- [x] `test_signal_engine_v2.py`
-- [x] `test_webhook.py`
+- [x] Добавь константы в signal_tracker.py: `SL_SLIPPAGE_PIPS`, `SL_SLIPPAGE_CRYPTO_PCT` (значения из спеки §SIM-10)
+- [x] Создай `_apply_sl_slippage(sl_price, direction, market, pip_size) -> Decimal` (формула из спеки)
+- [x] Применяй slippage при `exit_reason in ("sl_hit", "trailing_sl_hit")`
+- [x] НЕ применяй при `tp1_hit`, `tp2_hit`, `tp3_hit`, `expired`
+- [x] Сохраняй `exit_slippage_pips` в `signal_results`
+- [x] Тест: `test_sim10_sl_slippage_forex` — LONG EURUSD: exit = SL - 1 pip
+- [x] Тест: `test_sim10_sl_slippage_crypto` — LONG BTC: exit = SL × (1 - 0.001)
+- [x] Тест: `test_sim10_tp_no_slippage` — TP hit: exit = точно TP
 
 ---
 
-## Phase 2.4 — Dashboard & API (3-4 недели)
+## Phase 3 — Unrealized P&L + живой ATR (P1)
 
-### 2.4.1 REST API v2
+### 3.1 SIM-12: Unrealized P&L с position sizing
 
-- [x] `api/routes_v2.py` — все endpoints из ARCHITECTURE.md
+- [x] Найди `_update_virtual_unrealized()` в signal_tracker.py
+- [x] Добавь параметр `position: VirtualPortfolio` (для доступа к `size_pct`, `size_remaining_pct`, `account_balance_at_entry`)
+- [x] Рассчитай `effective_size = size_pct * remaining` (учёт partial close)
+- [x] Рассчитай `unrealized_usd = balance * (effective_size / 100) * (move_pct / 100)` где `balance = position.account_balance_at_entry or ACCOUNT_SIZE`
+- [x] Сохраняй `unrealized_pnl_usd` в `virtual_portfolio` (новое поле)
+- [x] `unrealized_pnl_pct` по-прежнему хранит % движения цены (для отображения)
+- [x] Тест: `test_sim12_unrealized_usd_with_size` — size=2%, move=+1.5% → +$0.30
+- [x] Тест: `test_sim12_unrealized_after_partial` — remaining=0.5, move=+2% → +$0.20
 
-### 2.4.2 WebSocket v2
+### 3.2 SIM-11: Живой ATR для trailing stop
 
-- [x] signals, prices, portfolio streams
-
-### 2.4.3 Next.js Frontend
-
-- [x] Init Next.js 14 + TypeScript + Tailwind
-- [x] Страницы: Dashboard, Signals, Instruments, Portfolio, Backtests, Macro, Accuracy, Settings
-- [x] Компоненты: RegimeWidget, PortfolioHeatBar, DifferentialChart, EquityCurve, ComponentBreakdown
-
-### 2.4.4 Telegram v2
-
-- [x] Улучшенный формат уведомлений
-
-### 2.4.5 Мониторинг
-
-- [x] Prometheus + prometheus-fastapi-instrumentator
-- [x] Grafana dashboard
-- [x] Алерты: collector down, high latency
-
-### 2.4.6 Тесты Phase 2.4
-
-- [x] API integration tests
-- [x] WebSocket tests
-- [x] Frontend E2E (Playwright)
+- [x] Создай `_get_live_atr(db, instrument_id, timeframe, period=14) -> Optional[Decimal]` в signal_tracker.py
+- [x] Реализуй Wilder's ATR: `TR = max(H-L, |H-prevC|, |L-prevC|)`, smoothing `(prev×13 + TR) / 14`
+- [x] Нужно `period + 1` свечей (15 для ATR(14))
+- [x] Реализуй fallback chain: live ATR(signal TF) → live ATR(H1) → snapshot ATR → 14 × pip_size
+- [x] Замени текущее чтение ATR из snapshot на вызов `_get_live_atr()` с fallback
+- [x] Тест: `test_sim11_live_atr_calculation` — 15 свечей → корректный ATR(14) по Wilder
+- [x] Тест: `test_sim11_atr_fallback_chain` — нет данных → snapshot → 14×pip_size
 
 ---
 
-## Phase 2.5 — Hardening (2-3 недели)
+## Phase 4 — Аналитика сигналов (P0-P1)
 
-- [x] Нагрузочное тестирование
-- [x] Rate limit обработка с backoff для всех API
-- [x] Circuit breaker для нестабильных API (`src/utils/circuit_breaker.py`)
-- [x] Data quality мониторинг (`src/utils/data_quality.py`)
-- [x] Финальный walk-forward по всем инструментам
-- [x] OpenAPI документация
-- [x] Deployment guide (`docs/DEPLOYMENT.md`)
-- [x] Nginx: rate limiting, CORS, security headers
-- [x] Docker secrets для production
+### 4.1 SIM-14: Score → Outcome эндпоинт
 
----
+- [x] Убедись, что `composite_score` копируется в `signal_results` при `_close_signal()` (из `signal.composite_score`)
+- [x] В `src/database/crud.py`: создай запрос для агрегации по score buckets — GROUP BY диапазонам, COUNT, SUM(pnl_usd WHERE win), SUM(pnl_usd WHERE loss), AVG(duration), AVG(mfe), AVG(mae)
+- [x] Бакеты: `strong_sell ≤-15`, `sell -15..-10`, `weak_sell -10..-7`, `neutral -7..+7`, `weak_buy +7..+10`, `buy +10..+15`, `strong_buy ≥+15`
+- [x] В `src/api/routes_v2.py`: создай `GET /api/v2/simulator/score-analysis`
+- [x] Реализуй `threshold_recommendations`: `suggested_min_score_for_positive_edge` (min bucket с PF > 1.0 и total ≥ 5), `score_with_best_win_rate` (max win_rate при total ≥ 5)
+- [x] Бакеты с < 3 сделками → `insufficient_data: true`
+- [x] Тест: `test_sim14_score_buckets_assignment` — composite=8.5 → бакет "weak_buy"
+- [x] Тест: `test_sim14_threshold_recommendation` — бакет с PF > 1.0 определяет suggested_min
 
-## Phase 3.1 — Критические исправления (приоритет 1)
+### 4.2 SIM-15: Breakdown эндпоинт
 
-> v3 — калибровка, не расширение. Исправляем системные баги v2.
-> Первоисточник: `docs/SPEC_V3.md`
+- [x] В `src/database/crud.py`: создай универсальный запрос для breakdown по измерению (timeframe, direction, exit_reason, market, month)
+- [x] В `src/api/routes_v2.py`: создай `GET /api/v2/simulator/breakdown?by=...`
+- [x] Валидация: `by` ∈ {timeframe, direction, exit_reason, market, month}, иначе 400
+- [x] Для `by=month`: GROUP BY `date_trunc('month', exit_at)`
+- [x] Для `by=market`: JOIN с `instruments` таблицей
+- [x] Каждая строка: key, total, wins, losses, breakevens, win_rate_pct, profit_factor, avg_pnl_usd, avg_duration_minutes, avg_composite_score
+- [x] `profit_factor = gross_wins / |gross_losses|` (0 если нет losses)
+- [x] Тест: mock 10 сделок с разными TF → breakdown возвращает корректные группы
 
-### 3.1.1 MTF Filter: исправить порог направления
+### 4.3 SIM-15: Расширение `/simulator/stats`
 
-- [x] В `src/signals/mtf_filter.py`: `_get_direction_from_score` порог ±30 → ±BUY_THRESHOLD (7.0)
-- [x] Вариант: передавать `buy_threshold` / `sell_threshold` через `__init__` (избежать circular import)
-- [x] Тест: `_get_direction_from_score(10.0)` → 1, `(-8.0)` → -1, `(3.0)` → 0
-
-### 3.1.2 Signal Engine: LLM_SCORE_THRESHOLD
-
-- [x] Добавить `LLM_SCORE_THRESHOLD: float = 10.0` в `src/config.py`
-- [x] В `signal_engine_v2.py`: заменить хардкод LLM порога на `settings.LLM_SCORE_THRESHOLD`
-- [x] Тест: LLM вызывается при composite > 10.0
-
-### 3.1.3 Signal Engine: FA маршрутизация по рынку
-
-- [x] В `signal_engine_v2.py` блок FA: `market == "forex"` → `ForexFAEngine`, `"stocks"` → `StockFAEngine`
-- [x] Commodities fallback → legacy `FAEngine`
-- [x] Проверить что `ForexFAEngine.analyze()` возвращает нормализованный score (если ±10, применить scale-up ×6)
-- [x] Тест: для EURUSD вызывается `ForexFAEngine`, для AAPL — `StockFAEngine`
-
-### 3.1.4 Sentiment: инструментальная фильтрация
-
-- [x] В `src/database/crud.py`: добавить `get_news_events_for_instrument(session, symbol, market, limit, hours_back)`
-- [x] Добавить `_get_instrument_keywords(symbol, market)` — маппинг инструмент → ключевые слова
-- [x] В `signal_engine_v2.py`: заменить `get_news_events(db, limit=30)` на `get_news_events_for_instrument(db, symbol, market)`
-- [x] Тест: EURUSD получает новости с "EUR"/"ECB", BTCUSDT — с "bitcoin"/"BTC"
-- [x] Тест: при < 5 результатах добавляются общие macro новости
-
-### 3.1.5 Position Size: убрать хардкод
-
-- [x] В `src/config.py`: добавить `SIGNAL_ACCOUNT_SIZE_USD: float = 10000.0`, `VIRTUAL_ACCOUNT_SIZE_USD: float = 1000.0`
-- [x] В `signal_engine_v2.py`: заменить `Decimal("10000")` на `Decimal(str(settings.SIGNAL_ACCOUNT_SIZE_USD))`
-- [x] В `trade_simulator` (если есть): заменить хардкод $1000 на `settings.VIRTUAL_ACCOUNT_SIZE_USD`
-- [x] Обновить `.env.example`
+- [x] Добавь в ответ `/simulator/stats` новые поля:
+  - `cancelled_count` — кол-во cancelled сигналов
+  - `avg_duration_minutes` — средняя длительность закрытых сделок
+  - `avg_mfe_pips`, `avg_mae_pips` — средние MFE/MAE
+  - `total_swap_usd` — сумма swap по закрытым сделкам
+  - `best_exit_reason` — exit_reason с лучшим avg_pnl_usd
+  - `account_initial_balance`, `account_current_balance`, `account_peak_balance` (из SIM-16)
+  - `account_drawdown_pct` = (peak - current) / peak × 100
+  - `account_total_return_pct` = (current - initial) / initial × 100
+- [x] Тест: stats возвращает все новые поля без ошибок при пустой БД (нули/NULL)
 
 ---
 
-## Phase 3.2 — TA Engine улучшения (приоритет 2)
+## Phase 5 — Overnight Swap (P2)
 
-### 3.2.1 RSI: контекстный сигнал через ADX
+### 5.1 SIM-13: Swap таблица и логика начисления
 
-- [x] В `ta_engine.py`: реализовать `_rsi_signal(rsi, adx)` с ADX-контекстом
-  - [x] ADX ≥ 25 (тренд): RSI 40-55 = pullback buy (strength), RSI < 30 = strength × 0.4
-  - [x] ADX < 25 (флэт): RSI < 30 = classic bullish, RSI > 70 = classic bearish
-- [x] Интегрировать `_rsi_signal()` в `generate_ta_signals()`
-- [x] Тест: RSI=25 при ADX=30 → strength × 0.4 (не полный buy)
-
-### 3.2.2 ADX fallback: корректная реализация без TA-Lib
-
-- [x] В `ta_engine.py`: заменить fallback `return 25, 25, 25` на Directional Movement calculation
-  - [x] True Range → ATR
-  - [x] +DM / -DM → smoothed → +DI / -DI
-  - [x] DX → smoothed → ADX
-- [x] Тест: ADX fallback с реальными данными — plus_di ≠ minus_di
-
-### 3.2.3 S/R: кластерная детекция
-
-- [x] В `ta_engine.py`: заменить `min()/max()` на `_find_support_resistance()` с pivot clustering
-  - [x] Pivot highs/lows (window=3)
-  - [x] Кластеризация по ATR × 0.3
-  - [x] Touch count → touch_boost = 1.0 + min(0.5, (touches-1) × 0.15)
-- [x] Добавить `nearest_resistance_touches`, `nearest_support_touches` в indicators
-- [x] Тест: 4+ касания дают touch_boost > 1.0
-
-### 3.2.4 Volume signal: направление через SMA20
-
-- [x] В `ta_engine.py`: volume direction = close vs SMA20 (вместо MACD direction)
-- [x] Тест: volume > 1.5× avg при цене > SMA20 → bullish signal
-
-### 3.2.5 Таймфрейм-адаптивные периоды индикаторов
-
-- [x] В `ta_engine.py`: добавить `TF_INDICATOR_PERIODS` таблицу (M15, H1, H4, D1, _default)
-- [x] `TAEngine.__init__`: принимать `timeframe` → `self._periods`
-- [x] Заменить все хардкоды периодов на `self._periods["rsi"]`, `self._periods["sma_long"]` и т.д.
-- [x] В `signal_engine_v2.py`: передавать `timeframe` при создании `TAEngine`
-- [x] Тест: `TAEngine(df, "H4")._periods["sma_long"] == 100`
+- [x] Добавь константы в signal_tracker.py: `SWAP_DAILY_PIPS`, `TRIPLE_SWAP_WEEKDAY = 2`, `ROLLOVER_HOUR_UTC = 22` (значения из спеки §13.1)
+- [x] Создай `_apply_daily_swap(db, signal, position, instrument, now)` (спека §13.2)
+- [x] Условия начисления: status=open/partial, now >= 22:00 UTC, last_swap_date != today
+- [x] Среда: умножить на 3 (тройной своп)
+- [x] Для crypto: `get_latest_funding_rate(db, instrument_id)` из `order_flow_data`
+- [x] Добавь `get_latest_funding_rate()` в `crud.py`
+- [x] Обновляй `accrued_swap_pips`, `accrued_swap_usd`, `last_swap_date` в `virtual_portfolio`
+- [x] При закрытии: записывай `swap_pips`, `swap_usd` в `signal_results`; `total_pnl_usd = price_pnl_usd + accrued_swap_usd`
+- [x] Тест: `test_sim13_swap_wednesday_triple` — Wed rollover: 3× swap
+- [x] Тест: `test_sim13_swap_positive_carry` — USDJPY long: swap_pips > 0
+- [x] Тест: `test_sim13_swap_crypto_funding` — BTC long, funding=+0.01% → вычтен
 
 ---
 
-## Phase 3.3 — Risk Manager адаптация (приоритет 2)
+## Phase 6 — Регрессионные тесты и финальная проверка
 
-### 3.3.1 Режим-адаптивные SL/TP
+### 6.1 Backward compatibility тесты
 
-- [x] В `risk_manager_v2.py`: добавить таблицы `REGIME_SL_MULTIPLIERS`, `REGIME_TP1_RR`, `REGIME_TP2_RR`
-- [x] Реализовать `calculate_levels_for_regime(entry, atr, direction, regime)`
-- [x] Тест: RANGING → TP1_RR = 1.5 (не 2.0), HIGH_VOLATILITY → SL_mult = 2.5
+- [x] Тест: старые `signal_results` без `candle_high_at_exit` (NULL) → логика не падает
+- [x] Тест: `composite_score = NULL` → не включается в score_analysis, без ошибки
+- [x] Тест: `unrealized_pnl_usd = NULL` для старых позиций → API возвращает 0
+- [x] Тест: `account_balance_at_entry = NULL` → fallback к VIRTUAL_ACCOUNT_SIZE_USD
 
-### 3.3.2 Подключение режима в Signal Engine
+### 6.2 Интеграционная проверка
 
-- [x] В `signal_engine_v2.py`: получать `current_regime` через `RegimeDetector`
-- [x] Передавать `regime` в `risk_manager.calculate_levels_for_regime()`
-- [x] Сохранять `regime` в сигнале (для новой колонки БД)
-
-### 3.3.3 Alembic migration: колонка regime
-
-- [x] Создать миграцию: `ALTER TABLE signals ADD COLUMN regime VARCHAR(32) NULL` (уже в v2 схеме)
-- [x] Индекс: `ix_signals_regime` (уже в v2 схеме)
-- [x] Тест: миграция up/down
+- [ ] Запусти `alembic upgrade head` на чистой БД → без ошибок
+- [x] Запусти все тесты: `pytest tests/ -v` → 961 passed, 35 pre-existing failures (v3 tests: 28/28 ✓)
+- [x] Проверь API: `GET /simulator/stats` → новые поля присутствуют
+- [x] Проверь API: `GET /simulator/score-analysis` → корректная структура
+- [x] Проверь API: `GET /simulator/breakdown?by=timeframe` → корректная структура
 
 ---
 
-## Phase 3.4 — Signal Cooldown (приоритет 3)
-
-### 3.4.1 Direction-reversal bypass
-
-- [x] В `signal_engine_v2.py`: при активном cooldown проверять направление
-  - [x] Загрузить последний сигнал из БД
-  - [x] Проверить направление последнего сигнала vs текущего composite
-  - [x] Если направление развернулось — bypass cooldown
-- [x] Логирование: "Cooldown bypassed: direction reversal LONG → SHORT"
-
-### 3.4.2 Тесты cooldown
-
-- [x] Тест: cooldown + reversal → сигнал генерируется
-- [x] Тест: cooldown + то же направление → сигнал блокируется
-
----
-
-## Phase 3.5 — Тесты и валидация
-
-### 3.5.1 Юнит-тесты
-
-- [x] `tests/test_ta_engine_v3.py` — RSI context, S/R clusters, ADX fallback, TF periods
-- [x] `tests/test_fa_routing_v3.py` — FA маршрутизация по рынку
-- [x] `tests/test_sentiment_filtering_v3.py` — инструментальная фильтрация новостей
-- [x] `tests/test_mtf_filter_v3.py` — исправленные пороги
-- [x] `tests/test_risk_manager_v3.py` — режим-адаптивные SL/TP
-- [x] `tests/test_signal_cooldown_v3.py` — direction reversal bypass
-
-### 3.5.2 Интеграционные тесты
-
-- [ ] `tests/test_signal_engine_v3_integration.py` — полный прогон generate_signal:
-  - [ ] EURUSD/H1: ForexFAEngine вызван, LLM при composite > 10, MTF ненейтральный
-  - [ ] BTCUSDT/H1: CryptoFAEngine вызван
-
-### 3.5.3 Regression тесты
-
-- [ ] `tests/test_signal_regression_v3.py` — snapshot expected ranges
-  - [ ] ForexFA score > 5 (legacy был < 5)
-  - [ ] MTF direction не всегда neutral
-
-### 3.5.4 Coverage
-
-- [ ] `src/analysis/ta_engine.py` ≥ 90%
-- [ ] `src/signals/signal_engine_v2.py` (изменённые блоки) ≥ 85%
-- [ ] `src/signals/mtf_filter.py` = 100%
-- [ ] `src/signals/risk_manager_v2.py` ≥ 90%
-- [ ] `src/database/crud.py` (`get_news_events_for_instrument`) ≥ 85%
+## Итого: 8 SIM задач, ~50 подзадач, ~25 тестов

@@ -109,19 +109,25 @@ async def open_position_for_signal(signal, db) -> bool:
         if signal.position_size_pct and signal.position_size_pct > 0:
             size_pct = Decimal(str(signal.position_size_pct))
 
+        # SIM-16: snapshot current balance at entry time
+        from src.database.crud import get_virtual_account as _get_account  # noqa: PLC0415
+        account = await _get_account(db)
+        account_balance_at_entry = account.current_balance if account else ACCOUNT_SIZE
+
         now = _dt.datetime.now(_dt.timezone.utc)
         await create_virtual_position(db, data={
-            "signal_id":         signal.id,
-            "size_pct":          size_pct,
-            "entry_price":       actual_price,
-            "status":            "open",
-            "entry_filled_at":   now,
-            "current_stop_loss": signal.stop_loss,
-            "size_remaining_pct": Decimal("1.0"),
-            "mfe":               Decimal("0"),
-            "mae":               Decimal("0"),
-            "breakeven_moved":   False,
-            "partial_closed":    False,
+            "signal_id":                signal.id,
+            "size_pct":                 size_pct,
+            "entry_price":              actual_price,
+            "status":                   "open",
+            "entry_filled_at":          now,
+            "current_stop_loss":        signal.stop_loss,
+            "size_remaining_pct":       Decimal("1.0"),
+            "mfe":                      Decimal("0"),
+            "mae":                      Decimal("0"),
+            "breakeven_moved":          False,
+            "partial_closed":           False,
+            "account_balance_at_entry": account_balance_at_entry,
         })
         logger.info(
             f"[Simulator] Opened #{signal.id}: {signal.direction} "

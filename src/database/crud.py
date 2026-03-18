@@ -16,10 +16,12 @@ from src.database.models import (
     Instrument,
     MacroData,
     NewsEvent,
+    OrderFlowData,
     PriceData,
     Signal,
     SignalResult,
     SystemEvent,
+    VirtualAccount,
     VirtualPortfolio,
 )
 
@@ -595,6 +597,72 @@ async def cleanup_system_events(session: AsyncSession, days: int = 3) -> int:
     )
     await session.flush()
     return result.rowcount or 0
+
+
+# ── VirtualAccount (SIM-16) ───────────────────────────────────────────────────
+
+
+async def get_virtual_account(session: AsyncSession) -> Optional[VirtualAccount]:
+    """Return the single virtual account record (id=1)."""
+    result = await session.execute(
+        select(VirtualAccount).order_by(VirtualAccount.id.asc()).limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def update_virtual_account(session: AsyncSession, data: dict[str, Any]) -> None:
+    """Update fields of the virtual account (assumes exactly one row)."""
+    account = await get_virtual_account(session)
+    if account is None:
+        return
+    await session.execute(
+        update(VirtualAccount).where(VirtualAccount.id == account.id).values(**data)
+    )
+    await session.flush()
+
+
+async def create_virtual_account_if_not_exists(session: AsyncSession) -> VirtualAccount:
+    """Create the virtual account row if it does not exist yet."""
+    from src.config import settings  # noqa: PLC0415
+
+    account = await get_virtual_account(session)
+    if account is not None:
+        return account
+
+    initial = Decimal(str(settings.VIRTUAL_ACCOUNT_SIZE_USD))
+    account = VirtualAccount(
+        initial_balance=initial,
+        current_balance=initial,
+        peak_balance=initial,
+        total_realized_pnl=Decimal("0"),
+        total_trades=0,
+    )
+    session.add(account)
+    await session.flush()
+    await session.refresh(account)
+    return account
+
+
+# ── OrderFlowData (SIM-13: funding rate) ──────────────────────────────────────
+
+
+async def get_latest_funding_rate(
+    session: AsyncSession, instrument_id: int
+) -> Optional[Decimal]:
+    """Return the most recent funding_rate from order_flow_data for the instrument."""
+    result = await session.execute(
+        select(OrderFlowData.funding_rate)
+        .where(
+            and_(
+                OrderFlowData.instrument_id == instrument_id,
+                OrderFlowData.funding_rate.isnot(None),
+            )
+        )
+        .order_by(OrderFlowData.timestamp.desc())
+        .limit(1)
+    )
+    row = result.scalar_one_or_none()
+    return Decimal(str(row)) if row is not None else None
 
 
 async def get_portfolio_pnl(session: AsyncSession) -> dict[str, Any]:
