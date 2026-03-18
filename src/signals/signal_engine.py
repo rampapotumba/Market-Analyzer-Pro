@@ -348,7 +348,7 @@ class SignalEngine:
                 return None
 
         # FIX-07: Session filter — skip EU/NA forex pairs during Asian low-liquidity hours
-        market_type = getattr(instrument, "market_type", "") or ""
+        market_type = getattr(instrument, "market", "") or ""
         if _is_low_liquidity_session(instrument.symbol, market_type, now):
             logger.info(
                 f"[SignalEngine] Asian session filter: skipping {instrument.symbol} "
@@ -656,7 +656,7 @@ class SignalEngine:
             return None
 
         # 14c. H1 signals only for crypto and forex
-        market_type = getattr(instrument, "market_type", "") or ""
+        market_type = getattr(instrument, "market", "") or ""
         if timeframe == "H1" and market_type not in settings.H1_ALLOWED_MARKETS:
             logger.debug(
                 f"[SignalEngine] H1 signal skipped for {instrument.symbol} "
