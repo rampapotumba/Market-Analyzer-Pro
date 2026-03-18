@@ -75,9 +75,36 @@ class SignalV2(BaseModel):
     portfolio_heat: Optional[float]
     status: str
     created_at: datetime.datetime
+    # LLM (Claude) analysis
+    llm_score: Optional[float] = None
+    llm_bias: Optional[str] = None
+    llm_confidence: Optional[float] = None
 
     class Config:
         from_attributes = True
+
+
+class SignalDetailV2(SignalV2):
+    """Extended signal response with Claude's full reasoning."""
+    llm_reasoning: Optional[str] = None
+    llm_key_factors: list[str] = []
+
+    @classmethod
+    def from_signal(cls, signal: Any) -> "SignalDetailV2":
+        data = {c: getattr(signal, c, None) for c in SignalV2.model_fields}
+        reasoning = {}
+        if signal.reasoning:
+            try:
+                reasoning = json.loads(signal.reasoning)
+            except (ValueError, TypeError):
+                pass
+        data["llm_reasoning"] = reasoning.get("llm_reasoning") or None
+        data["llm_key_factors"] = [
+            f.removeprefix("Claude: ")
+            for f in reasoning.get("factors", [])
+            if f.startswith("Claude: ")
+        ]
+        return cls(**data)
 
 
 class InstrumentV2(BaseModel):
@@ -247,7 +274,7 @@ async def list_signals_v2(
     return result
 
 
-@router_v2.get("/signals/{signal_id}", response_model=SignalV2)
+@router_v2.get("/signals/{signal_id}", response_model=SignalDetailV2)
 async def get_signal_v2(
     signal_id: int,
     db: AsyncSession = Depends(get_session),
@@ -255,7 +282,7 @@ async def get_signal_v2(
     signal = await get_signal_by_id(db, signal_id)
     if signal is None:
         raise HTTPException(status_code=404, detail="Signal not found")
-    return signal
+    return SignalDetailV2.from_signal(signal)
 
 
 @router_v2.post("/signals/{signal_id}/feedback")
