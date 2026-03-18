@@ -76,12 +76,25 @@ class Settings(BaseSettings):
     GEO_WEIGHT: float = 0.10
 
     # ── Signal thresholds ─────────────────────────────────
-    # Calibrated to actual composite score range (≈ ±20 max in real markets)
-    STRONG_BUY_THRESHOLD: float = 15.0
-    BUY_THRESHOLD: float = 7.0
-    SELL_THRESHOLD: float = -7.0
-    STRONG_SELL_THRESHOLD: float = -15.0
-    MIN_CONFIDENCE: float = 10.0
+    # Calibrated to actual composite score range (≈ ±25 max in real markets)
+    STRONG_BUY_THRESHOLD: float = 20.0
+    BUY_THRESHOLD: float = 10.0
+    SELL_THRESHOLD: float = -10.0
+    STRONG_SELL_THRESHOLD: float = -20.0
+    MIN_CONFIDENCE: float = 50.0  # signals below this confidence are discarded
+
+    # ── Timeframe-specific composite minimums ─────────────
+    # H1 already gated by market_type filter below.
+    # Higher TFs require stronger conviction to avoid noise.
+    TF_MIN_COMPOSITE: dict = {
+        "H1":  10.0,
+        "H4":  12.0,
+        "D1":  15.0,
+        "W1":  20.0,
+        "MN1": 20.0,
+    }
+    # H1 signals only for fast-moving markets (crypto + forex)
+    H1_ALLOWED_MARKETS: list = ["crypto", "forex"]
 
     # ── Account Size (v3) ────────────────────────────────
     SIGNAL_ACCOUNT_SIZE_USD: float = 10000.0    # v3: was hardcoded $10k in signal_engine

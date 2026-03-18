@@ -638,6 +638,32 @@ class SignalEngine:
             )
             return None
 
+        # 14a. Minimum confidence gate
+        if confidence < settings.MIN_CONFIDENCE:
+            logger.debug(
+                f"[SignalEngine] Low confidence for {instrument.symbol}/{timeframe}: "
+                f"{confidence:.1f}% < {settings.MIN_CONFIDENCE}% — skipping"
+            )
+            return None
+
+        # 14b. Timeframe-specific composite minimum
+        tf_min = settings.TF_MIN_COMPOSITE.get(timeframe, settings.BUY_THRESHOLD)
+        if abs(composite_score) < tf_min:
+            logger.debug(
+                f"[SignalEngine] Composite too weak for {instrument.symbol}/{timeframe}: "
+                f"|{composite_score:.1f}| < {tf_min} — skipping"
+            )
+            return None
+
+        # 14c. H1 signals only for crypto and forex
+        market_type = getattr(instrument, "market_type", "") or ""
+        if timeframe == "H1" and market_type not in settings.H1_ALLOWED_MARKETS:
+            logger.debug(
+                f"[SignalEngine] H1 signal skipped for {instrument.symbol} "
+                f"(market={market_type}, H1 only for crypto/forex)"
+            )
+            return None
+
         # 15. Cancel previous open signals for this instrument+timeframe
         cancelled = await cancel_open_signals(db, instrument.id, timeframe)
         if cancelled:
