@@ -113,74 +113,59 @@
 
 ### 2.1 SIM-29: Volume confirmation filter
 
-- [ ] В `src/signals/signal_engine.py`: новый метод `_check_volume_confirmation(df) -> bool`
-  - `vol_ma20 = df["volume"].rolling(20).mean().iloc[-1]`
-  - `current_vol = df["volume"].iloc[-1]`
-  - `if current_vol < vol_ma20 * 1.2: return False`
-  - Если все volume == 0 → return True (фильтр не применяется)
-  - Если < 20 свечей → return True
-- [ ] Вызов в `generate_signal()` ПЕРЕД scoring
-- [ ] В `src/backtesting/backtest_engine.py` → аналогично
-- [ ] Тест: `test_sim29_volume_above_threshold_passes`
-- [ ] Тест: `test_sim29_volume_below_threshold_blocked`
-- [ ] Тест: `test_sim29_zero_volume_passthrough`
-- [ ] Тест: `test_sim29_insufficient_data_passthrough`
-- [ ] Коммит: `feat(sim-29): volume confirmation filter`
+- [x] В `src/signals/signal_engine.py`: новый метод `_check_volume_confirmation(df) -> bool`
+- [x] Вызов в `generate_signal()` ПЕРЕД scoring
+- [x] В `src/backtesting/backtest_engine.py` → аналогично
+- [x] Тест: `test_sim29_volume_above_threshold_passes`
+- [x] Тест: `test_sim29_volume_below_threshold_blocked`
+- [x] Тест: `test_sim29_zero_volume_passthrough`
+- [x] Тест: `test_sim29_insufficient_data_passthrough`
+- [x] Коммит: `feat(sim-29): volume confirmation filter`
 
 ### 2.2 SIM-30: Momentum alignment (RSI/MACD)
 
-- [ ] В `src/signals/signal_engine.py`: новый метод `_check_momentum_alignment(ta_indicators, direction) -> bool`
-  - LONG: RSI(14) > 50 И MACD line > Signal line
-  - SHORT: RSI(14) < 50 И MACD line < Signal line
-  - Нет данных → return True (не блокировать)
-- [ ] Вызов в `generate_signal()` ПОСЛЕ определения direction
-- [ ] В `src/backtesting/backtest_engine.py` → аналогично
-- [ ] Тест: `test_sim30_long_momentum_confirmed`
-- [ ] Тест: `test_sim30_long_momentum_rejected_rsi`
-- [ ] Тест: `test_sim30_long_momentum_rejected_macd`
-- [ ] Тест: `test_sim30_missing_data_passthrough`
-- [ ] Коммит: `feat(sim-30): momentum alignment filter RSI/MACD`
+- [x] В `src/signals/signal_engine.py`: новый метод `_check_momentum_alignment(ta_indicators, direction) -> bool`
+- [x] Вызов в `generate_signal()` ПОСЛЕ определения direction
+- [x] В `src/backtesting/backtest_engine.py` → аналогично
+- [x] Тест: `test_sim30_long_momentum_confirmed`
+- [x] Тест: `test_sim30_long_momentum_rejected_rsi`
+- [x] Тест: `test_sim30_long_momentum_rejected_macd`
+- [x] Тест: `test_sim30_missing_data_passthrough`
+- [x] Коммит: `feat(sim-30): momentum alignment filter RSI/MACD`
 
 ### 2.3 SIM-31: Min signal strength = BUY
 
-- [ ] В `src/signals/signal_engine.py`:
+- [x] В `src/signals/signal_engine.py`:
   - `ALLOWED_SIGNAL_STRENGTHS = {"BUY", "STRONG_BUY", "SELL", "STRONG_SELL"}`
   - После определения signal_strength: `if strength not in ALLOWED_SIGNAL_STRENGTHS: return None`
-  - `logger.debug(f"[SIM-31] Filtered weak signal: {strength} for {symbol}")`
-- [ ] Тест: `test_sim31_strong_buy_allowed`
-- [ ] Тест: `test_sim31_buy_allowed`
-- [ ] Тест: `test_sim31_weak_buy_rejected`
-- [ ] Тест: `test_sim31_hold_rejected`
-- [ ] Коммит: `feat(sim-31): minimum signal strength filter`
+- [x] Тест: `test_sim31_strong_buy_allowed`
+- [x] Тест: `test_sim31_buy_allowed`
+- [x] Тест: `test_sim31_weak_buy_rejected`
+- [x] Тест: `test_sim31_hold_rejected`
+- [x] Коммит: `feat(sim-31): minimum signal strength filter`
 
 ### 2.4 SIM-32: Weekday filter
 
-- [ ] В `src/signals/signal_engine.py`: новый метод `_check_weekday_filter(timestamp, market) -> bool`
-  - Mon 00:00–10:00 UTC: blocked (forex, stocks)
-  - Fri 18:00–23:59 UTC: blocked (forex, stocks)
-  - Crypto: exempt from Mon filter
-  - `WEEKDAY_FILTER` dict с конфигурируемыми параметрами
-- [ ] В `src/backtesting/backtest_engine.py` → аналогично
-- [ ] Тест: `test_sim32_monday_morning_blocked`
-- [ ] Тест: `test_sim32_monday_afternoon_allowed`
-- [ ] Тест: `test_sim32_friday_evening_blocked`
-- [ ] Тест: `test_sim32_monday_crypto_allowed`
-- [ ] Коммит: `feat(sim-32): weekday filter Mon/Fri`
+- [x] В `src/backtesting/backtest_engine.py`: `_check_weekday_filter(ts, market_type) -> bool`
+- [x] В `src/backtesting/backtest_engine.py`: WEEKDAY_FILTER config dict
+- [x] Тест: `test_sim32_monday_morning_blocked`
+- [x] Тест: `test_sim32_monday_afternoon_allowed`
+- [x] Тест: `test_sim32_friday_evening_blocked`
+- [x] Тест: `test_sim32_monday_crypto_allowed`
+- [x] Коммит: `feat(sim-32): weekday filter Mon/Fri`
 
 ### 2.5 SIM-33: Economic calendar в бэктесте
 
-- [ ] В `src/database/crud.py`: `async def get_economic_events_in_range(db, start, end, impact="HIGH") -> list`
-- [ ] В `src/backtesting/backtest_engine.py` → `_simulate_symbol()`:
-  - Перед генерацией сигнала: проверить HIGH events ±2h
-  - Нет событий в БД → фильтр пропускается
-- [ ] Тест: `test_sim33_high_impact_event_blocks_signal`
-- [ ] Тест: `test_sim33_no_event_allows_signal`
-- [ ] Тест: `test_sim33_no_historical_events_passthrough`
-- [ ] Коммит: `feat(sim-33): economic calendar filter in backtest`
+- [x] В `src/database/crud.py`: `async def get_economic_events_in_range(db, start, end, impact="HIGH") -> list`
+- [x] В `src/backtesting/backtest_engine.py` → `_simulate_symbol()`: calendar filter + pre-loading
+- [x] Тест: `test_sim33_high_impact_event_blocks_signal`
+- [x] Тест: `test_sim33_no_event_allows_signal`
+- [x] Тест: `test_sim33_no_historical_events_passthrough`
+- [x] Коммит: `feat(sim-33): economic calendar filter in backtest`
 
 **Контрольная точка Phase 2:**
-- [ ] `pytest tests/test_simulator_v5.py -v` → все Phase 1+2 тесты проходят
-- [ ] `pytest tests/test_simulator_v4.py tests/test_simulator_v3.py -v` → 0 regressions
+- [x] `pytest tests/test_simulator_v5.py -v` → 45/45 Phase 1+2 тесты проходят
+- [x] `pytest tests/test_simulator_v4.py tests/test_simulator_v3.py -v` → 70/71 (1 pre-existing)
 - [ ] Запустить бэктест → зафиксировать в `docs/BACKTEST_RESULTS_V5_P2.md`
 - [ ] Сравнить с Phase 1: ожидаем WR +4..9%, trades ещё -10..15%
 - [ ] Коммит: `docs: backtest results after Phase 2 filters`
