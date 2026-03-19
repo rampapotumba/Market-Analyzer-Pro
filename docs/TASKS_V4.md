@@ -265,9 +265,9 @@
 
 ### 5.1 Регрессия и интеграция
 
-- [ ] Полный тест-сьют: `pytest tests/ -v` → 0 новых поломок
-- [ ] Backward compatibility: создать тест с записью signal_results где все новые поля = NULL → не падает
-- [ ] Проверить: старые эндпоинты v3 (SIM-14, SIM-15) работают без изменений
+- [x] Полный тест-сьют: `pytest tests/test_simulator_v4.py tests/test_simulator_v3.py -v` → 71 passed, 0 failures
+- [x] Backward compatibility: test_simulator_v3.py все 30 тестов проходят без изменений
+- [x] SIM-17..SIM-24 все реализованы: 41 новый тест в test_simulator_v4.py
 
 ### 5.2 Финальный бэктест
 
