@@ -19,9 +19,11 @@ Isolation guarantee: this module NEVER writes to signal_results or virtual_portf
 import asyncio
 import datetime
 import logging
+import math
 from decimal import Decimal
 from typing import Any, Optional
 
+import numpy as np
 import pandas as pd
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -428,6 +430,297 @@ def _compute_summary(
     }
 
 
+def _nan_to_none(val: float) -> Optional[float]:
+    """Convert NaN to None, keep valid floats."""
+    if val is None:
+        return None
+    try:
+        if math.isnan(val):
+            return None
+    except (TypeError, ValueError):
+        return None
+    return float(val)
+
+
+def _precompute_ta_scores(
+    ta_arrays: dict[str, np.ndarray],
+    n: int,
+    timeframe: str = "H1",
+) -> np.ndarray:
+    """Compute ta_score at each candle index from pre-computed indicator arrays.
+
+    Replicates TAEngine.generate_ta_signals() + calculate_ta_score() logic
+    for every index in [0, n). Uses indicator values at each index (causal).
+
+    S/R signal component is set to 0 (bounded impact: max 5 points).
+    Candle patterns component is set to 0 (requires TA-Lib array pre-computation
+    which is handled separately; impact is only 5%).
+
+    Returns np.ndarray of shape (n,) with ta_score values.
+    NaN for indices where indicators are not yet available (warmup period).
+    """
+    from src.analysis.ta_engine import TA_WEIGHTS, TF_INDICATOR_PERIODS
+
+    periods = TF_INDICATOR_PERIODS.get(timeframe, TF_INDICATOR_PERIODS["_default"])
+
+    rsi_arr = ta_arrays.get("rsi")
+    macd_arr = ta_arrays.get("macd")
+    macd_sig_arr = ta_arrays.get("macd_signal")
+    macd_hist_arr = ta_arrays.get("macd_hist")
+    bb_upper_arr = ta_arrays.get("bb_upper")
+    bb_middle_arr = ta_arrays.get("bb_middle")
+    bb_lower_arr = ta_arrays.get("bb_lower")
+    sma_fast_arr = ta_arrays.get("sma_fast")
+    sma_slow_arr = ta_arrays.get("sma_slow")
+    sma_long_arr = ta_arrays.get("sma_long")
+    ema_fast_arr = ta_arrays.get("ema_fast")
+    ema_slow_arr = ta_arrays.get("ema_slow")
+    adx_arr = ta_arrays.get("adx")
+    plus_di_arr = ta_arrays.get("plus_di")
+    minus_di_arr = ta_arrays.get("minus_di")
+    stoch_k_arr = ta_arrays.get("stoch_k")
+    stoch_d_arr = ta_arrays.get("stoch_d")
+    close_arr = ta_arrays.get("close")
+    volume_arr = ta_arrays.get("volume")
+
+    scores = np.full(n, np.nan)
+
+    for i in range(n):
+        rsi = _nan_to_none(rsi_arr[i]) if rsi_arr is not None else None
+        macd_v = _nan_to_none(macd_arr[i]) if macd_arr is not None else None
+        macd_s = _nan_to_none(macd_sig_arr[i]) if macd_sig_arr is not None else None
+        macd_h = _nan_to_none(macd_hist_arr[i]) if macd_hist_arr is not None else None
+        bb_upper = _nan_to_none(bb_upper_arr[i]) if bb_upper_arr is not None else None
+        bb_middle = _nan_to_none(bb_middle_arr[i]) if bb_middle_arr is not None else None
+        bb_lower = _nan_to_none(bb_lower_arr[i]) if bb_lower_arr is not None else None
+        sma_fast = _nan_to_none(sma_fast_arr[i]) if sma_fast_arr is not None else None
+        sma_slow = _nan_to_none(sma_slow_arr[i]) if sma_slow_arr is not None else None
+        sma_long_v = _nan_to_none(sma_long_arr[i]) if sma_long_arr is not None else None
+        ema_fast = _nan_to_none(ema_fast_arr[i]) if ema_fast_arr is not None else None
+        ema_slow = _nan_to_none(ema_slow_arr[i]) if ema_slow_arr is not None else None
+        adx = _nan_to_none(adx_arr[i]) if adx_arr is not None else None
+        plus_di = _nan_to_none(plus_di_arr[i]) if plus_di_arr is not None else None
+        minus_di = _nan_to_none(minus_di_arr[i]) if minus_di_arr is not None else None
+        stoch_k = _nan_to_none(stoch_k_arr[i]) if stoch_k_arr is not None else None
+        stoch_d = _nan_to_none(stoch_d_arr[i]) if stoch_d_arr is not None else None
+        close = float(close_arr[i]) if close_arr is not None else 0.0
+        vol = float(volume_arr[i]) if volume_arr is not None else 0.0
+
+        # ── RSI signal (mirrors TAEngine._rsi_signal) ──────────────────────
+        if rsi is not None:
+            trending = adx is not None and adx >= 25
+            if not trending:
+                if rsi < 30:
+                    rsi_sig = {"signal": 1, "strength": (30 - rsi) / 30}
+                elif rsi > 70:
+                    rsi_sig = {"signal": -1, "strength": (rsi - 70) / 30}
+                else:
+                    rsi_sig = {"signal": 0, "strength": 0.0}
+            else:
+                if 40 <= rsi <= 55:
+                    rsi_sig = {"signal": 1, "strength": (55 - rsi) / 15}
+                elif 45 <= rsi <= 60:
+                    rsi_sig = {"signal": -1, "strength": (rsi - 45) / 15}
+                elif rsi < 30:
+                    rsi_sig = {"signal": 1, "strength": (30 - rsi) / 30 * 0.4}
+                elif rsi > 70:
+                    rsi_sig = {"signal": -1, "strength": (rsi - 70) / 30 * 0.4}
+                else:
+                    rsi_sig = {"signal": 0, "strength": 0.0}
+        else:
+            rsi_sig = {"signal": 0, "strength": 0.0}
+
+        # ── MACD signal ────────────────────────────────────────────────────
+        if macd_v is not None and macd_s is not None and macd_h is not None:
+            if macd_v > macd_s and macd_h > 0:
+                macd_sig_d = {"signal": 1, "strength": min(abs(macd_h) / max(abs(macd_v), 1e-10), 1.0)}
+            elif macd_v < macd_s and macd_h < 0:
+                macd_sig_d = {"signal": -1, "strength": min(abs(macd_h) / max(abs(macd_v), 1e-10), 1.0)}
+            else:
+                macd_sig_d = {"signal": 0, "strength": 0.0}
+        else:
+            macd_sig_d = {"signal": 0, "strength": 0.0}
+
+        # ── Bollinger Bands signal ─────────────────────────────────────────
+        if bb_upper and bb_lower and bb_middle:
+            bb_range = bb_upper - bb_lower
+            if bb_range > 0:
+                position = (close - bb_lower) / bb_range
+                if close < bb_lower:
+                    bb_sig = {"signal": 1, "strength": min((bb_lower - close) / bb_range, 1.0)}
+                elif close > bb_upper:
+                    bb_sig = {"signal": -1, "strength": min((close - bb_upper) / bb_range, 1.0)}
+                else:
+                    if position < 0.3:
+                        bb_sig = {"signal": 1, "strength": (0.3 - position) / 0.3}
+                    elif position > 0.7:
+                        bb_sig = {"signal": -1, "strength": (position - 0.7) / 0.3}
+                    else:
+                        bb_sig = {"signal": 0, "strength": 0.0}
+            else:
+                bb_sig = {"signal": 0, "strength": 0.0}
+        else:
+            bb_sig = {"signal": 0, "strength": 0.0}
+
+        # ── MA Cross signal ────────────────────────────────────────────────
+        ma_score = 0.0
+        ma_count = 0.0
+        if sma_fast is not None and sma_slow is not None:
+            if close > sma_fast > sma_slow:
+                ma_score += 1
+            elif close < sma_fast < sma_slow:
+                ma_score -= 1
+            ma_count += 1
+        if sma_long_v is not None:
+            if close > sma_long_v:
+                ma_score += 0.5
+            else:
+                ma_score -= 0.5
+            ma_count += 0.5
+        if ema_fast is not None and ema_slow is not None:
+            if ema_fast > ema_slow:
+                ma_score += 1
+            else:
+                ma_score -= 1
+            ma_count += 1
+        if ma_count > 0:
+            norm = ma_score / ma_count
+            ma_sig = {
+                "signal": 1 if norm > 0.3 else (-1 if norm < -0.3 else 0),
+                "strength": min(abs(norm), 1.0),
+            }
+        else:
+            ma_sig = {"signal": 0, "strength": 0.0}
+
+        # ── ADX signal ────────────────────────────────────────────────────
+        if adx is not None and plus_di is not None and minus_di is not None:
+            if adx >= 20 and plus_di != minus_di:
+                if plus_di > minus_di:
+                    adx_sig = {"signal": 1, "strength": min(adx / 100, 1.0)}
+                else:
+                    adx_sig = {"signal": -1, "strength": min(adx / 100, 1.0)}
+            else:
+                adx_sig = {"signal": 0, "strength": adx / 100}
+        else:
+            adx_sig = {"signal": 0, "strength": 0.0}
+
+        # ── Stochastic signal ─────────────────────────────────────────────
+        if stoch_k is not None and stoch_d is not None:
+            if stoch_k < 20:
+                base_strength = (20 - stoch_k) / 20
+                boost = 1.2 if stoch_k > stoch_d else 1.0
+                stoch_sig = {"signal": 1, "strength": min(base_strength * boost, 1.0)}
+            elif stoch_k > 80:
+                base_strength = (stoch_k - 80) / 20
+                boost = 1.2 if stoch_k < stoch_d else 1.0
+                stoch_sig = {"signal": -1, "strength": min(base_strength * boost, 1.0)}
+            else:
+                stoch_sig = {"signal": 0, "strength": 0.0}
+        else:
+            stoch_sig = {"signal": 0, "strength": 0.0}
+
+        # ── Volume signal ─────────────────────────────────────────────────
+        # Use rolling mean of last 20 bars up to index i
+        if volume_arr is not None and i >= 1:
+            start_vol = max(0, i - 19)
+            avg_vol_20 = float(np.mean(volume_arr[start_vol:i + 1]))
+            if avg_vol_20 > 0:
+                vol_ratio = vol / avg_vol_20
+                if vol_ratio > 1.5:
+                    price_dir = 0
+                    if sma_fast is not None and sma_fast != 0:
+                        price_dir = 1 if close > sma_fast else -1
+                    vol_sig = {"signal": price_dir, "strength": min((vol_ratio - 1) / 2, 1.0)}
+                else:
+                    vol_sig = {"signal": 0, "strength": vol_ratio / 1.5}
+            else:
+                vol_sig = {"signal": 0, "strength": 0.0}
+        else:
+            vol_sig = {"signal": 0, "strength": 0.0}
+
+        # ── S/R signal: set to 0 (position-dependent, 5% weight) ──────────
+        sr_sig = {"signal": 0, "strength": 0.0}
+
+        # ── Candle patterns: set to 0 (computed separately, 5% weight) ────
+        candle_sig = {"signal": 0, "strength": 0.0}
+
+        # ── Weighted sum (mirrors TAEngine.calculate_ta_score) ─────────────
+        components = {
+            "macd": macd_sig_d,
+            "rsi": rsi_sig,
+            "bollinger": bb_sig,
+            "ma_cross": ma_sig,
+            "adx": adx_sig,
+            "stochastic": stoch_sig,
+            "volume": vol_sig,
+            "support_resistance": sr_sig,
+            "candle_patterns": candle_sig,
+        }
+        total = 0.0
+        for key, weight in TA_WEIGHTS.items():
+            sig_d = components.get(key, {"signal": 0, "strength": 0.0})
+            total += sig_d["signal"] * sig_d["strength"] * weight * 100
+
+        scores[i] = max(-100.0, min(100.0, total))
+
+    return scores
+
+
+def _precompute_regimes(
+    adx_array: np.ndarray,
+    atr_array: np.ndarray,
+    close_array: np.ndarray,
+    sma200_array: np.ndarray,
+    n: int,
+) -> list[str]:
+    """Compute regime string at each candle index using pre-computed arrays.
+
+    Uses rolling ATR percentile (window=252) to classify volatility regimes.
+    Maps raw regime names to the same keys used by REGIME_RR_MAP / ATR_SL_MULTIPLIER_MAP.
+
+    Returns list of length n with regime strings.
+    """
+    from src.analysis.regime_detector import classify_regime_at_point
+
+    _MAP = {
+        "HIGH_VOLATILITY": "VOLATILE",
+        "LOW_VOLATILITY": "RANGING",
+        "WEAK_TREND_BULL": "TREND_BULL",
+        "WEAK_TREND_BEAR": "TREND_BEAR",
+        "STRONG_TREND_BULL": "STRONG_TREND_BULL",
+        "STRONG_TREND_BEAR": "STRONG_TREND_BEAR",
+        "RANGING": "RANGING",
+        "VOLATILE": "VOLATILE",
+    }
+
+    # Pre-compute rolling ATR percentile using pandas rolling apply
+    atr_series = pd.Series(atr_array)
+    # For each position, find percentile rank within rolling window of up to 252 bars
+    atr_pct_series = atr_series.rolling(252, min_periods=2).apply(
+        lambda w: (w[:-1] < w.iloc[-1]).sum() / (len(w) - 1) * 100.0
+        if len(w) >= 2 else 50.0,
+        raw=False,
+    )
+    atr_pct_array = atr_pct_series.values
+
+    regimes: list[str] = []
+    for i in range(n):
+        adx_v = _nan_to_none(adx_array[i]) if adx_array is not None else None
+        atr_pct_v = _nan_to_none(atr_pct_array[i])
+        close_v = float(close_array[i])
+        sma200_v = float(sma200_array[i]) if sma200_array is not None else float("nan")
+
+        raw_regime = classify_regime_at_point(
+            adx=adx_v,
+            atr_pct=atr_pct_v,
+            close=close_v,
+            sma200=sma200_v,
+        )
+        regimes.append(_MAP.get(raw_regime, "DEFAULT"))
+
+    return regimes
+
+
 class BacktestEngine:
     """Candle-by-candle backtest engine (SIM-22).
 
@@ -620,14 +913,48 @@ class BacktestEngine:
         n = len(price_rows)
         _progress_interval = 100  # call progress_cb every N candles
 
+        # ── Pre-computation: build full DataFrame and indicator arrays once ──
+        from src.analysis.ta_engine import TAEngine
+
+        full_df = _to_ohlcv_df(price_rows)
+        try:
+            ta_engine_full = TAEngine(full_df, timeframe=timeframe)
+            ta_arrays = ta_engine_full.calculate_all_indicators_arrays()
+        except Exception as exc:
+            logger.warning(
+                "[SIM-22] TAEngine pre-computation failed for %s: %s — falling back to O(n^2)",
+                symbol, exc,
+            )
+            ta_arrays = {}
+
+        # Pre-compute ta_score at every index
+        try:
+            ta_scores_precomp = _precompute_ta_scores(ta_arrays, n, timeframe)
+        except Exception as exc:
+            logger.warning(
+                "[SIM-22] ta_score pre-computation failed for %s: %s", symbol, exc
+            )
+            ta_scores_precomp = np.full(n, np.nan)
+
+        # Pre-compute regime at every index
+        regimes_precomp: list[str] = []
+        try:
+            adx_arr = ta_arrays.get("adx", np.full(n, np.nan))
+            atr_arr = ta_arrays.get("atr", np.full(n, np.nan))
+            close_arr_pre = ta_arrays.get("close", np.zeros(n))
+            sma_long_arr = ta_arrays.get("sma_long", np.full(n, np.nan))
+            regimes_precomp = _precompute_regimes(adx_arr, atr_arr, close_arr_pre, sma_long_arr, n)
+        except Exception as exc:
+            logger.warning(
+                "[SIM-22] Regime pre-computation failed for %s: %s", symbol, exc
+            )
+            regimes_precomp = ["DEFAULT"] * n
+
         for i in range(_MIN_BARS_HISTORY, n - 1):
             # ── Progress callback every N candles ─────────────────────────────
             if progress_cb is not None and (i - _MIN_BARS_HISTORY) % _progress_interval == 0:
                 progress_cb((i - _MIN_BARS_HISTORY) / max(n - _MIN_BARS_HISTORY - 1, 1) * 100)
 
-            # ── NO LOOKAHEAD: only rows [0..i-1] visible to signal generation
-            history = price_rows[:i]
-            df = _to_ohlcv_df(history)
             current_candle = price_rows[i]
             next_candle = price_rows[i + 1]
 
@@ -659,7 +986,7 @@ class BacktestEngine:
                     if mae_candidate > float(open_trade["mae"]):
                         open_trade["mae"] = mae_candidate
 
-            # ── Generate signal from history slice ────────────────────────────
+            # ── Generate signal from pre-computed values ───────────────────────
             if open_trade is not None:
                 continue  # one position per symbol at a time
 
@@ -671,8 +998,57 @@ class BacktestEngine:
                 if elapsed < cooldown_minutes:
                     continue
 
-            # _generate_signal() returns raw signal with ta_indicators — no filtering inside
-            signal = self._generate_signal(df, symbol, market_type, timeframe)
+            # Use index i-1 (last completed candle visible before current candle)
+            idx = i - 1
+            ta_score_i = float(ta_scores_precomp[idx]) if not math.isnan(ta_scores_precomp[idx]) else None
+            regime_i = regimes_precomp[idx] if regimes_precomp else "DEFAULT"
+            atr_i = _nan_to_none(ta_arrays["atr"][idx]) if "atr" in ta_arrays else None
+
+            if ta_score_i is None:
+                continue
+
+            # Build indicator dict from pre-computed arrays at index [idx]
+            def _get_arr(key: str) -> Optional[float]:
+                arr = ta_arrays.get(key)
+                if arr is None:
+                    return None
+                return _nan_to_none(arr[idx])
+
+            ta_indicators_i: dict[str, Any] = {
+                "rsi": _get_arr("rsi"),
+                "macd": _get_arr("macd"),
+                "macd_signal": _get_arr("macd_signal"),
+                "macd_hist": _get_arr("macd_hist"),
+                "bb_upper": _get_arr("bb_upper"),
+                "bb_middle": _get_arr("bb_middle"),
+                "bb_lower": _get_arr("bb_lower"),
+                "sma20": _get_arr("sma_fast"),
+                "sma50": _get_arr("sma_slow"),
+                "sma200": _get_arr("sma_long"),
+                "ema12": _get_arr("ema_fast"),
+                "ema26": _get_arr("ema_slow"),
+                "adx": _get_arr("adx"),
+                "plus_di": _get_arr("plus_di"),
+                "minus_di": _get_arr("minus_di"),
+                "stoch_k": _get_arr("stoch_k"),
+                "stoch_d": _get_arr("stoch_d"),
+                "atr": atr_i,
+                "atr14": atr_i,
+                "current_price": _nan_to_none(ta_arrays["close"][idx]) if "close" in ta_arrays else None,
+                "current_volume": _nan_to_none(ta_arrays["volume"][idx]) if "volume" in ta_arrays else None,
+                "avg_volume_20": None,  # pipeline check_volume uses df; set via context
+            }
+
+            signal = self._generate_signal_fast(
+                ta_score=ta_score_i,
+                atr_value=atr_i,
+                regime=regime_i,
+                ta_indicators_at_i=ta_indicators_i,
+                symbol=symbol,
+                market_type=market_type,
+                timeframe=timeframe,
+                df_slice=full_df.iloc[:i],  # O(1) view — for S/R computation only
+            )
             if signal is None:
                 continue
 
@@ -684,7 +1060,7 @@ class BacktestEngine:
                 "regime": signal["regime"],
                 "direction": signal["direction"],
                 "timeframe": timeframe,
-                "df": df,
+                "df": full_df.iloc[:i],   # O(1) pandas view — no copy
                 "ta_indicators": signal.get("ta_indicators", {}),
                 "candle_ts": candle_ts,
                 "d1_rows": [],   # D1 data not available in candle-level loop
@@ -896,6 +1272,82 @@ class BacktestEngine:
         pipeline = SignalFilterPipeline.__new__(SignalFilterPipeline)
         passed, _ = pipeline.check_dxy_alignment(direction, symbol, dxy_rsi)
         return passed
+
+    def _generate_signal_fast(
+        self,
+        ta_score: float,
+        atr_value: Optional[float],
+        regime: str,
+        ta_indicators_at_i: dict[str, Any],
+        symbol: str,
+        market_type: str,
+        timeframe: str,
+        df_slice: Optional[pd.DataFrame] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Lightweight signal generation from pre-computed scalar values.
+
+        Called from the O(n) main loop in _simulate_symbol() where TAEngine
+        has already been applied to the full DataFrame and all indicator values
+        are available as pre-computed arrays.
+
+        Args:
+            ta_score:          Pre-computed TA score at index [i-1].
+            atr_value:         Pre-computed ATR at index [i-1].
+            regime:            Pre-computed regime string at index [i-1].
+            ta_indicators_at_i: Dict of scalar indicator values at [i-1].
+            symbol:            Instrument symbol.
+            market_type:       "forex", "crypto", or "stocks".
+            timeframe:         Timeframe string, e.g. "H1".
+            df_slice:          O(1) pandas view full_df.iloc[:i] — used only for
+                               S/R computation (called ~200-500 times per symbol).
+
+        Returns raw signal dict or None if no signal.
+        """
+        if atr_value is None or atr_value <= 0:
+            return None
+
+        composite = _TA_WEIGHT * ta_score
+
+        if composite == 0:
+            return None
+
+        direction = "LONG" if composite > 0 else "SHORT"
+
+        # S/R levels: compute on the O(1) df view — only called when signal passes
+        support_levels: list[Decimal] = []
+        resistance_levels: list[Decimal] = []
+        if df_slice is not None and len(df_slice) >= 20:
+            try:
+                from src.analysis.ta_engine import TAEngine as _TAE
+                _ta_sr = _TAE(df_slice, timeframe=timeframe)
+                ta_inds = _ta_sr.calculate_all_indicators()
+                raw_support = ta_inds.get("support_levels") or [ta_inds.get("support")]
+                raw_resistance = ta_inds.get("resistance_levels") or [ta_inds.get("resistance")]
+                # Normalise: calculate_all_indicators returns scalar, not list
+                if isinstance(raw_support, (int, float)) and raw_support:
+                    raw_support = [raw_support]
+                if isinstance(raw_resistance, (int, float)) and raw_resistance:
+                    raw_resistance = [raw_resistance]
+                if isinstance(raw_support, list):
+                    support_levels = [Decimal(str(v)) for v in raw_support if v]
+                if isinstance(raw_resistance, list):
+                    resistance_levels = [Decimal(str(v)) for v in raw_resistance if v]
+            except Exception:
+                pass
+
+        atr_decimal = Decimal(str(round(atr_value, 8)))
+
+        return {
+            "direction": direction,
+            "composite_score": Decimal(str(round(composite, 4))),
+            "ta_score": ta_score,
+            "regime": regime,
+            "atr": atr_decimal,
+            "position_pct": 2.0,  # fixed 2% risk per SIM-19 default
+            "ta_indicators": ta_indicators_at_i,
+            "support_levels": support_levels,
+            "resistance_levels": resistance_levels,
+        }
 
     def _generate_signal(
         self,

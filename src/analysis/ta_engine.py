@@ -1011,6 +1011,63 @@ class TAEngine:
         except Exception:
             return []
 
+    def calculate_all_indicators_arrays(self) -> dict[str, np.ndarray]:
+        """Compute all core indicator arrays on the full DataFrame.
+
+        Unlike calculate_all_indicators() which returns scalar last values,
+        this returns the full numpy arrays for each core indicator.
+        Used by backtest engine for O(n) pre-computation.
+
+        Returns dict with keys:
+            rsi, macd, macd_signal, macd_hist,
+            bb_upper, bb_middle, bb_lower,
+            sma_fast, sma_slow, sma_long,
+            ema_fast, ema_slow,
+            adx, plus_di, minus_di,
+            stoch_k, stoch_d,
+            atr,
+            volume (raw volume array)
+        """
+        p = self._periods
+
+        rsi = self._calc_rsi(p["rsi"])
+        macd, macd_signal, macd_hist = self._calc_macd()
+        bb_upper, bb_middle, bb_lower = self._calc_bb(p["sma_fast"], 2.0)
+        sma_fast = self._calc_sma(p["sma_fast"])
+        sma_slow = self._calc_sma(p["sma_slow"])
+        sma_long = self._calc_sma(p["sma_long"])
+        ema_fast = self._calc_ema(p["ema_fast"])
+        ema_slow = self._calc_ema(p["ema_slow"])
+        adx, plus_di, minus_di = self._calc_adx(14)
+        stoch_k, stoch_d = self._calc_stochastic(14, 3)
+        atr = self._calc_atr(14)
+
+        return {
+            "rsi": rsi,
+            "macd": macd,
+            "macd_signal": macd_signal,
+            "macd_hist": macd_hist,
+            "bb_upper": bb_upper,
+            "bb_middle": bb_middle,
+            "bb_lower": bb_lower,
+            "sma_fast": sma_fast,
+            "sma_slow": sma_slow,
+            "sma_long": sma_long,
+            "ema_fast": ema_fast,
+            "ema_slow": ema_slow,
+            "adx": adx,
+            "plus_di": plus_di,
+            "minus_di": minus_di,
+            "stoch_k": stoch_k,
+            "stoch_d": stoch_d,
+            "atr": atr,
+            "volume": self._volume.copy(),
+            "close": self._close.copy(),
+            "high": self._high.copy(),
+            "low": self._low.copy(),
+            "open": self._open.copy(),
+        }
+
     def calculate_ta_score_v2(self) -> float:
         """
         Enhanced TA score incorporating Smart Money Concepts (order blocks + FVGs).

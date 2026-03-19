@@ -79,8 +79,8 @@ _ATR_LOW_VOL_PCT = 20.0
 _VIX_HIGH = 30.0
 _VIX_LOW = 15.0
 
-# Minimum candles for detection
-_MIN_BARS = 252
+# Minimum candles for detection (ADX needs ~28, ATR percentile benefits from more)
+_MIN_BARS = 50
 
 
 class RegimeDetector:
@@ -236,8 +236,8 @@ class RegimeDetector:
                     sl_atr_multiplier=Decimal(str(sl_mult)),
                 )
             )
-            async with session.begin():
-                await session.execute(stmt)
+            await session.execute(stmt)
+            await session.commit()
 
             logger.info(
                 "RegimeDetector: %s → %s (ADX=%.1f, ATR_pct=%.0f%%)",
@@ -290,6 +290,53 @@ class RegimeDetector:
 
 
 # ── TA calculations ────────────────────────────────────────────────────────────
+
+def classify_regime_at_point(
+    adx: Optional[float],
+    atr_pct: Optional[float],
+    close: float,
+    sma200: float,
+    vix: Optional[float] = None,
+) -> str:
+    """Classify market regime from scalar indicator values. No DataFrame needed.
+
+    Pure function extracted from RegimeDetector._detect_regime() for use in
+    backtest pre-computation (O(n) optimization).
+
+    Returns one of: STRONG_TREND_BULL, STRONG_TREND_BEAR, WEAK_TREND_BULL,
+    WEAK_TREND_BEAR, RANGING, HIGH_VOLATILITY, LOW_VOLATILITY.
+    """
+    # 1. Volatility regimes take priority if extreme
+    if atr_pct is not None and atr_pct > _ATR_HIGH_VOL_PCT:
+        if vix is None or vix > _VIX_HIGH:
+            return "HIGH_VOLATILITY"
+
+    if atr_pct is not None and atr_pct < _ATR_LOW_VOL_PCT:
+        if vix is None or vix < _VIX_LOW:
+            return "LOW_VOLATILITY"
+
+    # 2. Trend regimes
+    if adx is not None:
+        import math
+        if not math.isnan(sma200) and sma200 > 0:
+            bull: Optional[bool] = bool(close > sma200)
+        else:
+            bull = None
+
+        if adx >= _ADX_STRONG:
+            if bull is True:
+                return "STRONG_TREND_BULL"
+            if bull is False:
+                return "STRONG_TREND_BEAR"
+        if adx >= _ADX_WEAK:
+            if bull is True:
+                return "WEAK_TREND_BULL"
+            if bull is False:
+                return "WEAK_TREND_BEAR"
+
+    # 3. Default: ranging
+    return "RANGING"
+
 
 def _to_df(records: list[PriceData]) -> pd.DataFrame:
     return pd.DataFrame(
