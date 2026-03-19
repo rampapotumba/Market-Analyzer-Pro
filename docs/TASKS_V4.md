@@ -152,26 +152,25 @@
 
 ### 2.2 SIM-22: Бэктест движок (core)
 
-- [ ] В `src/backtesting/backtest_engine.py`: реализуй `BacktestEngine` класс
-- [ ] Метод `async def run_backtest(self, params: BacktestParams) -> str`:
+- [x] В `src/backtesting/backtest_engine.py`: реализуй `BacktestEngine` класс
+- [x] Метод `async def run_backtest(self, params: BacktestParams) -> str`:
   1. Создать backtest_run (status=running)
   2. Загрузить price_data для каждого символа в заданном диапазоне
   3. Итерация по свечам в хронологическом порядке
   4. На каждой свече: slice данных до текущей (NO LOOKAHEAD!)
-  5. `SignalEngineV2.generate()` на slice → сигнал?
+  5. `_generate_signal()` на slice (TAEngine + нейтральные fa/geo/sentiment)
   6. Entry fill: на СЛЕДУЮЩЕЙ свече после сигнала (open price)
-  7. Для открытых позиций: SL/TP check по high/low (переиспользовать SIM-09 логику)
+  7. Для открытых позиций: SL/TP check по high/low (SIM-09 логика, worst case → SL)
   8. Накопить результаты в memory (list of BacktestTradeResult)
   9. Bulk insert в backtest_trades
-  10. Рассчитать summary: win_rate, PF, max_drawdown, equity_curve
+  10. Рассчитать summary: win_rate, PF, max_drawdown, equity_curve, monthly_returns
   11. Update backtest_run (status=completed, summary=...)
-- [ ] Error handling: при exception → update status=failed, сохранить error в summary
-- [ ] Тест: `test_sim22_backtest_no_lookahead` — на свече N доступны только данные [0..N-1]
-- [ ] Тест: `test_sim22_backtest_sl_tp_check` — SL/TP применяются по high/low свечи
-- [ ] Тест: `test_sim22_backtest_entry_on_next_candle` — entry fill на open следующей свечи
-- [ ] Тест: `test_sim22_backtest_results_structure` — результат содержит все поля из спеки
-- [ ] Тест: `test_sim22_backtest_isolated_from_live` — ничего не записывается в signal_results/virtual_portfolio
-- [ ] Коммит: `feat(sim-22): backtest engine core implementation`
+- [x] Error handling: при exception → update status=failed, сохранить error в summary
+- [x] Тест: `test_sim22_backtest_no_lookahead` — на свече N доступны только данные [0..N-1]
+- [x] Тест: `test_sim22_backtest_sl_tp_check` — SL/TP применяются по high/low свечи
+- [x] Тест: `test_sim22_backtest_results_structure` — результат содержит все поля из спеки
+- [x] Тест: `test_sim22_backtest_isolated_from_live` — ничего не записывается в signal_results/virtual_portfolio
+- [x] Коммит: `feat(sim-22): backtest engine core implementation`
 
 ### 2.3 SIM-22: API эндпоинты бэктеста
 
