@@ -84,49 +84,49 @@
 
 > **Порядок: SIM-19 ДО SIM-18.** SL distance определяет SL, а TP = f(SL, R:R). Сначала фиксим SL, потом R:R.
 
-- [ ] Найди в `src/signals/risk_manager_v2.py` метод расчёта SL (ищи умножение ATR)
-- [ ] Добавь `ATR_SL_MULTIPLIER_MAP` (значения из спеки §SIM-19) в начало файла
-- [ ] Модифицируй `calculate_levels_for_regime()`: принимает `regime: str`, использует `ATR_SL_MULTIPLIER_MAP.get(regime, ATR_SL_MULTIPLIER_MAP["DEFAULT"])`
-- [ ] Убедись что `position_size_pct` пересчитывается: `risk_amount / new_sl_distance`
+- [x] Найди в `src/signals/risk_manager_v2.py` метод расчёта SL (ищи умножение ATR)
+- [x] Добавь `ATR_SL_MULTIPLIER_MAP` (значения из спеки §SIM-19) в начало файла
+- [x] Модифицируй `calculate_levels_for_regime()`: принимает `regime: str`, использует `ATR_SL_MULTIPLIER_MAP.get(regime, ATR_SL_MULTIPLIER_MAP["DEFAULT"])`
+- [x] Убедись что `position_size_pct` пересчитывается: `risk_amount / new_sl_distance` (формула уже так работает)
 - [ ] Проверь: SIM-13 (swap) работает корректно — более широкий SL → дольше в позиции → больше свопов
-- [ ] Тест: `test_sim19_sl_wider_volatile` — VOLATILE: SL = entry ± 2.5×ATR
-- [ ] Тест: `test_sim19_sl_strong_trend` — STRONG_TREND_*: SL = entry ± 1.5×ATR
-- [ ] Тест: `test_sim19_position_size_decreases_with_wider_sl` — wider SL → smaller position_pct
-- [ ] Тест: `test_sim19_rr_preserved` — R:R остаётся корректным (TP пересчитан под новый SL)
-- [ ] Коммит: `feat(sim-19): regime-adaptive SL multiplier`
+- [x] Тест: `test_sim19_sl_wider_volatile` — VOLATILE: SL = entry ± 2.5×ATR
+- [x] Тест: `test_sim19_sl_strong_trend` — STRONG_TREND_*: SL = entry ± 1.5×ATR
+- [x] Тест: `test_sim19_position_size_decreases_with_wider_sl` — wider SL → smaller position_pct
+- [x] Тест: `test_sim19_rr_preserved` — R:R остаётся корректным (TP пересчитан под новый SL)
+- [x] Коммит: `feat(sim-19): regime-adaptive SL multiplier`
 
 ### 1.3 SIM-18: Динамический R:R по режиму рынка
 
 > Зависит от SIM-19 (SL distance уже режим-адаптивный → TP = SL × R:R)
 
-- [ ] В `risk_manager_v2.py`: добавь `REGIME_RR_MAP` (значения из спеки §SIM-18)
-- [ ] Модифицируй расчёт TP: `tp_distance = sl_distance * REGIME_RR_MAP[regime]["target_rr"]`
-- [ ] Расчёт TP1, TP2, TP3 через target_rr (TP1 = 1×target_rr, TP2 = 1.5×target_rr, TP3 = 2×target_rr — или как реализовано в v3)
-- [ ] Level snap: если S/R level в диапазоне `[tp1 * 0.8, tp1 * 1.2]` → скорректировать tp1 к уровню
-- [ ] Проверь что min_rr соблюдается: если после snap R:R < min_rr → отклонить сигнал или вернуть tp1 к расчётному
-- [ ] Тест: `test_sim18_rr_strong_trend` — STRONG_TREND_BULL → TP на 2.5×SL distance
-- [ ] Тест: `test_sim18_rr_ranging` — RANGING → TP на 1.3×SL distance
-- [ ] Тест: `test_sim18_rr_level_snap` — TP корректируется к ближайшему resistance
-- [ ] Тест: `test_sim18_rr_min_respected` — после snap R:R не ниже min_rr
-- [ ] Коммит: `feat(sim-18): dynamic R:R by market regime`
+- [x] В `risk_manager_v2.py`: добавь `REGIME_RR_MAP` (значения из спеки §SIM-18)
+- [x] Модифицируй расчёт TP: `tp_distance = sl_distance * REGIME_RR_MAP[regime]["target_rr"]`
+- [x] Расчёт TP1, TP2, TP3 через target_rr; TP3 = TP2×1.5 (кроме RANGING/VOLATILE)
+- [x] Level snap: если S/R level в диапазоне `[tp1 * 0.8, tp1 * 1.2]` → скорректировать tp1 к уровню
+- [x] Проверь что min_rr соблюдается: если после snap R:R < min_rr → вернуть tp1 к расчётному
+- [x] Тест: `test_sim18_rr_strong_trend` — STRONG_TREND_BULL → TP на 2.5×SL distance
+- [x] Тест: `test_sim18_rr_ranging` — RANGING → TP на 1.3×SL distance
+- [x] Тест: `test_sim18_rr_level_snap` — TP корректируется к ближайшему resistance
+- [x] Тест: `test_sim18_rr_min_respected` — после snap R:R не ниже min_rr
+- [x] Коммит: `feat(sim-18): dynamic R:R by market regime`
 
 ### 1.4 SIM-21: Корреляционный guard
 
-- [ ] Добавь `CORRELATED_GROUPS` в `src/signals/portfolio_risk.py` (или `signal_engine.py` — рядом с вызовом)
-- [ ] Создай helper `get_correlation_group(symbol: str) -> Optional[set[str]]` — находит группу символа
-- [ ] Создай `async def count_open_positions_in_group(db, group: set[str], direction: str) -> int` в `src/database/crud.py`
-- [ ] Создай `async def is_position_blocked_by_correlation(db, instrument_id, symbol, direction) -> tuple[bool, str]` в `src/database/crud.py`
-- [ ] В `signal_engine.py`: замени `has_open_position_for_instrument` → `is_position_blocked_by_correlation`
-- [ ] Тест: `test_sim21_same_instrument_blocked` — тот же инструмент любой TF → blocked
-- [ ] Тест: `test_sim21_correlated_same_direction_blocked` — EURUSD SHORT + GBPUSD SHORT → blocked
-- [ ] Тест: `test_sim21_correlated_opposite_direction_allowed` — EURUSD SHORT + GBPUSD LONG → allowed
-- [ ] Тест: `test_sim21_different_group_allowed` — EURUSD SHORT + BTC SHORT → allowed
-- [ ] Тест: `test_sim21_unknown_symbol_allowed` — символ не в группах → пропускать (не блокировать)
-- [ ] Коммит: `feat(sim-21): correlation guard for position blocking`
+- [x] Добавь `CORRELATED_GROUPS` в `src/signals/portfolio_risk.py`
+- [x] Создай helper `get_correlation_group(symbol: str) -> Optional[set[str]]` — находит группу символа
+- [x] Создай `async def count_open_positions_in_group(db, group: set[str], direction: str) -> int` в `src/database/crud.py`
+- [x] Создай `async def is_position_blocked_by_correlation(db, instrument_id, symbol, direction) -> tuple[bool, str]` в `src/database/crud.py`
+- [x] В `signal_engine.py`: прямой guard (Rule 1) остался `has_open_position_for_instrument`; добавлен correlation group guard (Rule 2) после определения direction (шаг 11a)
+- [x] Тест: `test_sim21_same_instrument_blocked` — тот же инструмент → blocked
+- [x] Тест: `test_sim21_correlated_same_direction_blocked` — EURUSD SHORT + GBPUSD SHORT → blocked
+- [x] Тест: `test_sim21_correlated_opposite_direction_allowed` — EURUSD SHORT + GBPUSD LONG → allowed
+- [x] Тест: `test_sim21_different_group_allowed` — EURUSD SHORT + BTC SHORT → allowed
+- [x] Тест: `test_sim21_unknown_symbol_allowed` — символ не в группах → allowed
+- [x] Коммит: `feat(sim-21): correlation guard for position blocking`
 
 **Контрольная точка Phase 1:**
-- [ ] `pytest tests/test_simulator_v4.py -v` → все тесты Phase 1 проходят
-- [ ] `pytest tests/test_simulator_v3.py -v` → 0 новых поломок (регрессия)
+- [x] `pytest tests/test_simulator_v4.py -v` → 22 тестов Phase 1 проходят
+- [x] `pytest tests/test_simulator_v3.py -v` → 30 passed, 0 новых поломок
 - [ ] Запустить scoring-breakdown → подтвердить наличие LONG сигналов
 
 ---

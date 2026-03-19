@@ -37,6 +37,25 @@ REGIME_SL_MULTIPLIERS: dict[str, float] = {
     "LOW_VOLATILITY":    1.0,
 }
 
+# ── SIM-19: Regime-adaptive SL multiplier map (v4) ───────────────────────────
+# Wider SL → fewer premature stop-outs → position size shrinks to keep $ risk constant.
+# Formula: position_size = risk_amount / sl_distance
+# Use ATR_SL_MULTIPLIER_MAP in all v4 code; REGIME_SL_MULTIPLIERS kept for legacy.
+ATR_SL_MULTIPLIER_MAP: dict[str, float] = {
+    "STRONG_TREND_BULL": 1.5,  # trend is clear — SL can be tighter
+    "STRONG_TREND_BEAR": 1.5,
+    "TREND_BULL":        2.0,  # standard
+    "TREND_BEAR":        2.0,
+    "RANGING":           1.5,  # SL behind range boundary, not too wide
+    "VOLATILE":          2.5,  # high volatility — wide buffer needed
+    "DEFAULT":           2.0,  # fallback for any unknown regime
+    # Legacy aliases (old detector regime names → v4 semantics)
+    "WEAK_TREND_BULL":   2.0,
+    "WEAK_TREND_BEAR":   2.0,
+    "HIGH_VOLATILITY":   2.5,
+    "LOW_VOLATILITY":    1.5,
+}
+
 REGIME_TP1_RR: dict[str, float] = {
     "STRONG_TREND_BULL": 2.0,
     "STRONG_TREND_BEAR": 2.0,
@@ -60,6 +79,26 @@ REGIME_TP2_RR: dict[str, float] = {
 _DEFAULT_SL_MULT = 1.5
 _DEFAULT_TP1_RR = 2.0
 _DEFAULT_TP2_RR = 3.5
+
+# ── SIM-18: Dynamic R:R table per market regime ───────────────────────────────
+# target_rr: TP1 = entry ± SL_distance × target_rr
+# min_rr:    reject level-snap if it would reduce R:R below this threshold
+REGIME_RR_MAP: dict[str, dict[str, float]] = {
+    "STRONG_TREND_BULL": {"min_rr": 2.0, "target_rr": 2.5},
+    "STRONG_TREND_BEAR": {"min_rr": 2.0, "target_rr": 2.5},
+    "TREND_BULL":        {"min_rr": 1.5, "target_rr": 2.0},
+    "TREND_BEAR":        {"min_rr": 1.5, "target_rr": 2.0},
+    "RANGING":           {"min_rr": 1.0, "target_rr": 1.3},
+    "VOLATILE":          {"min_rr": 1.5, "target_rr": 2.0},
+    "DEFAULT":           {"min_rr": 1.3, "target_rr": 1.5},
+    # Legacy aliases
+    "WEAK_TREND_BULL":   {"min_rr": 1.5, "target_rr": 2.0},
+    "WEAK_TREND_BEAR":   {"min_rr": 1.5, "target_rr": 2.0},
+    "HIGH_VOLATILITY":   {"min_rr": 1.5, "target_rr": 2.0},
+    "LOW_VOLATILITY":    {"min_rr": 1.3, "target_rr": 1.5},
+}
+
+_TP_SNAP_BAND = Decimal("0.20")  # ±20% of tp1 — look for S/R to snap to
 
 # Regimes where TP3 is unrealistic — lateral/volatile markets rarely sustain 3.75R moves
 _NO_TP3_REGIMES: frozenset[str] = frozenset({"RANGING", "HIGH_VOLATILITY"})
@@ -211,11 +250,12 @@ class RiskManagerV2:
                 "risk_reward_1": None,
             }
 
-        if regime not in REGIMES:
-            regime = "RANGING"
-
-        sl_mult = Decimal(str(REGIME_SL_MULTIPLIERS.get(regime, _DEFAULT_SL_MULT)))
-        tp1_rr = Decimal(str(REGIME_TP1_RR.get(regime, _DEFAULT_TP1_RR)))
+        # SIM-19: use ATR_SL_MULTIPLIER_MAP with DEFAULT fallback (any unknown regime → 2.0)
+        sl_mult = Decimal(str(ATR_SL_MULTIPLIER_MAP.get(regime, ATR_SL_MULTIPLIER_MAP["DEFAULT"])))
+        # SIM-18: use REGIME_RR_MAP for target_rr (TP1) and min_rr (snap validation)
+        rr_cfg = REGIME_RR_MAP.get(regime, REGIME_RR_MAP["DEFAULT"])
+        target_rr = Decimal(str(rr_cfg["target_rr"]))
+        min_rr = Decimal(str(rr_cfg["min_rr"]))
         tp2_rr = Decimal(str(REGIME_TP2_RR.get(regime, _DEFAULT_TP2_RR)))
         # TP3 uses 1.5× TP2 R:R as a trailing target, but not for lateral/volatile regimes
         tp3_rr = tp2_rr * Decimal("1.5") if regime not in _NO_TP3_REGIMES else None
@@ -231,7 +271,16 @@ class RiskManagerV2:
                 buffer=buffer,
             )
             sl_distance = abs(entry - sl)
-            tp1 = entry + sl_distance * tp1_rr
+            tp1_calc = entry + sl_distance * target_rr
+            # SIM-18: level snap — if a resistance level is near TP1, snap to it
+            tp1 = self._snap_tp_to_level(
+                tp1_calc=tp1_calc,
+                entry=entry,
+                sl_distance=sl_distance,
+                min_rr=min_rr,
+                levels=resistance_levels,
+                direction="LONG",
+            )
             tp2 = entry + sl_distance * tp2_rr
             tp3 = (entry + sl_distance * tp3_rr) if tp3_rr is not None else None
         else:  # SHORT
@@ -243,7 +292,16 @@ class RiskManagerV2:
                 buffer=buffer,
             )
             sl_distance = abs(entry - sl)
-            tp1 = entry - sl_distance * tp1_rr
+            tp1_calc = entry - sl_distance * target_rr
+            # SIM-18: level snap — if a support level is near TP1, snap to it
+            tp1 = self._snap_tp_to_level(
+                tp1_calc=tp1_calc,
+                entry=entry,
+                sl_distance=sl_distance,
+                min_rr=min_rr,
+                levels=support_levels,
+                direction="SHORT",
+            )
             tp2 = entry - sl_distance * tp2_rr
             tp3 = (entry - sl_distance * tp3_rr) if tp3_rr is not None else None
 
@@ -267,6 +325,50 @@ class RiskManagerV2:
             "take_profit_3": tp3,
             "risk_reward_1": rr1,
         }
+
+    # ── SIM-18: TP level snap ─────────────────────────────────────────────────
+
+    def _snap_tp_to_level(
+        self,
+        tp1_calc: Decimal,
+        entry: Decimal,
+        sl_distance: Decimal,
+        min_rr: Decimal,
+        levels: Optional[list[Decimal]],
+        direction: str,
+    ) -> Decimal:
+        """Snap TP1 to nearest S/R level within ±20% band.
+
+        If a level exists in [tp1_calc × 0.8, tp1_calc × 1.2]:
+          - Snap tp1 to that level
+          - If resulting R:R < min_rr → revert to tp1_calc (calculated value)
+        """
+        if not levels or sl_distance <= Decimal("0"):
+            return tp1_calc
+
+        lo = tp1_calc * (Decimal("1") - _TP_SNAP_BAND)
+        hi = tp1_calc * (Decimal("1") + _TP_SNAP_BAND)
+
+        candidates = [lvl for lvl in levels if lo <= lvl <= hi]
+        if not candidates:
+            return tp1_calc
+
+        # Pick the closest level to tp1_calc
+        snapped = min(candidates, key=lambda lvl: abs(lvl - tp1_calc))
+        snapped_rr = abs(snapped - entry) / sl_distance
+
+        if snapped_rr < min_rr:
+            logger.debug(
+                "[SIM-18] TP snap rejected: snapped R:R %.2f < min_rr %.2f — reverting to calc",
+                float(snapped_rr), float(min_rr),
+            )
+            return tp1_calc
+
+        logger.debug(
+            "[SIM-18] TP snapped from %.5f to %.5f (R:R %.2f)",
+            float(tp1_calc), float(snapped), float(snapped_rr),
+        )
+        return snapped
 
     # ── S/R alignment ─────────────────────────────────────────────────────────
 
@@ -388,7 +490,7 @@ class RiskManagerV2:
         else:
             pct = (units / account) * Decimal("100")
 
-        max_pct = Decimal(str(settings.MAX_RISK_PER_TRADE_PCT)) * Decimal("10")
+        max_pct = Decimal(str(settings.MAX_RISK_PER_TRADE_PCT))
         pct = min(pct, max_pct)
 
         return pct.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)

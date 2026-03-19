@@ -330,3 +330,316 @@ def test_sim17_long_signal_possible():
         f"Expected composite > 7.0 for bullish TA=30 with neutral others, got {composite:.2f}. "
         "This indicates potential LONG signal blockage."
     )
+
+
+# ── SIM-19: Regime-adaptive SL multiplier ────────────────────────────────────
+
+
+def _make_levels(regime: str, direction: str = "LONG") -> dict:
+    """Helper: calculate SL/TP levels via RiskManagerV2 for a given regime."""
+    from src.signals.risk_manager_v2 import RiskManagerV2
+
+    rm = RiskManagerV2()
+    entry = Decimal("1.10000")
+    atr = Decimal("0.00100")  # 10 pips ATR for EURUSD
+    return rm.calculate_levels_for_regime(
+        entry=entry,
+        atr=atr,
+        direction=direction,
+        regime=regime,
+    )
+
+
+def test_sim19_sl_wider_volatile():
+    """VOLATILE regime: SL = entry ± 2.5×ATR."""
+    from src.signals.risk_manager_v2 import ATR_SL_MULTIPLIER_MAP
+
+    assert ATR_SL_MULTIPLIER_MAP["VOLATILE"] == 2.5
+
+    levels = _make_levels("VOLATILE", "LONG")
+    entry = Decimal("1.10000")
+    atr = Decimal("0.00100")
+    expected_sl = entry - atr * Decimal("2.5")  # 1.10000 - 0.0025 = 1.0975
+
+    assert levels["stop_loss"] == expected_sl.quantize(Decimal("0.00000001")), (
+        f"VOLATILE SL expected {expected_sl}, got {levels['stop_loss']}"
+    )
+
+
+def test_sim19_sl_strong_trend():
+    """STRONG_TREND_BULL: SL = entry ± 1.5×ATR (tighter — trend is clear)."""
+    from src.signals.risk_manager_v2 import ATR_SL_MULTIPLIER_MAP
+
+    assert ATR_SL_MULTIPLIER_MAP["STRONG_TREND_BULL"] == 1.5
+
+    levels = _make_levels("STRONG_TREND_BULL", "LONG")
+    entry = Decimal("1.10000")
+    atr = Decimal("0.00100")
+    expected_sl = entry - atr * Decimal("1.5")  # 1.10000 - 0.0015 = 1.0985
+
+    assert levels["stop_loss"] == expected_sl.quantize(Decimal("0.00000001"))
+
+
+def test_sim19_position_size_decreases_with_wider_sl():
+    """Wider SL (VOLATILE 2.5×ATR) → smaller position than tight SL (STRONG_TREND 1.5×ATR).
+
+    Formula: position_size = risk_amount / sl_distance
+    With constant risk_amount, wider sl_distance → smaller position.
+    We verify:
+      1. sl_distance_volatile > sl_distance_strong_trend
+      2. raw position (before cap) is inversely proportional to sl_distance
+    """
+    from src.signals.risk_manager_v2 import ATR_SL_MULTIPLIER_MAP, RiskManagerV2
+
+    rm = RiskManagerV2()
+    account = Decimal("1000")
+    risk_pct = 1.0
+    # Use entry_price=None so formula is: pct = risk_amount / sl_distance / account × 100
+    # pct = risk_pct / sl_distance  (not subject to entry_price amplification)
+    # With sl_dist=1.5 → pct=0.67%, sl_dist=2.5 → pct=0.40% → both below 2.0% cap
+    atr = Decimal("1.0")
+
+    # STRONG_TREND_BULL: SL = 1.5 × ATR
+    sl_dist_tight = atr * Decimal(str(ATR_SL_MULTIPLIER_MAP["STRONG_TREND_BULL"]))  # 1.5
+    size_tight = rm.calculate_position_size(account, risk_pct, sl_dist_tight, entry_price=None)
+
+    # VOLATILE: SL = 2.5 × ATR
+    sl_dist_wide = atr * Decimal(str(ATR_SL_MULTIPLIER_MAP["VOLATILE"]))  # 2.5
+    size_wide = rm.calculate_position_size(account, risk_pct, sl_dist_wide, entry_price=None)
+
+    assert sl_dist_wide > sl_dist_tight, "VOLATILE SL distance must be wider"
+    assert size_wide < size_tight, (
+        f"Wider SL should produce smaller position: tight={size_tight}, wide={size_wide}"
+    )
+
+
+def test_sim19_rr_preserved():
+    """R:R should be correctly calculated from the new SL distance (not broken after SIM-19)."""
+    levels_volatile = _make_levels("VOLATILE", "LONG")
+    levels_strong = _make_levels("STRONG_TREND_BULL", "LONG")
+
+    entry = Decimal("1.10000")
+
+    for label, levels in [("VOLATILE", levels_volatile), ("STRONG_TREND_BULL", levels_strong)]:
+        sl = levels["stop_loss"]
+        tp1 = levels["take_profit_1"]
+        assert sl is not None and tp1 is not None, f"{label}: SL/TP1 must not be None"
+        sl_dist = abs(entry - sl)
+        tp1_dist = abs(tp1 - entry)
+        rr = float(tp1_dist / sl_dist)
+        assert rr > 0, f"{label}: R:R must be > 0, got {rr}"
+        # Verify rr1 field matches manual calculation
+        assert abs(float(levels["risk_reward_1"]) - rr) < 0.02, (
+            f"{label}: risk_reward_1 {levels['risk_reward_1']} does not match manual {rr:.2f}"
+        )
+
+
+# ── SIM-18: Dynamic R:R by market regime ─────────────────────────────────────
+
+
+def test_sim18_rr_strong_trend():
+    """STRONG_TREND_BULL → TP1 at 2.5×SL distance."""
+    from src.signals.risk_manager_v2 import REGIME_RR_MAP, RiskManagerV2
+
+    assert REGIME_RR_MAP["STRONG_TREND_BULL"]["target_rr"] == 2.5
+
+    rm = RiskManagerV2()
+    entry = Decimal("1.10000")
+    atr = Decimal("0.00100")
+    levels = rm.calculate_levels_for_regime(
+        entry=entry, atr=atr, direction="LONG", regime="STRONG_TREND_BULL"
+    )
+    sl_dist = abs(entry - levels["stop_loss"])
+    tp1_dist = abs(levels["take_profit_1"] - entry)
+    rr = float(tp1_dist / sl_dist)
+
+    assert abs(rr - 2.5) < 0.01, f"STRONG_TREND_BULL target R:R should be 2.5, got {rr:.3f}"
+
+
+def test_sim18_rr_ranging():
+    """RANGING → TP1 at 1.3×SL distance."""
+    from src.signals.risk_manager_v2 import REGIME_RR_MAP, RiskManagerV2
+
+    assert REGIME_RR_MAP["RANGING"]["target_rr"] == 1.3
+
+    rm = RiskManagerV2()
+    entry = Decimal("1.10000")
+    atr = Decimal("0.00100")
+    levels = rm.calculate_levels_for_regime(
+        entry=entry, atr=atr, direction="LONG", regime="RANGING"
+    )
+    sl_dist = abs(entry - levels["stop_loss"])
+    tp1_dist = abs(levels["take_profit_1"] - entry)
+    rr = float(tp1_dist / sl_dist)
+
+    assert abs(rr - 1.3) < 0.01, f"RANGING target R:R should be 1.3, got {rr:.3f}"
+
+
+def test_sim18_rr_level_snap():
+    """TP1 should snap to nearest resistance level within ±20% band."""
+    from src.signals.risk_manager_v2 import RiskManagerV2
+
+    rm = RiskManagerV2()
+    entry = Decimal("1.10000")
+    atr = Decimal("0.00100")
+    # STRONG_TREND_BULL: target_rr=2.5, SL mult=1.5
+    # SL = entry - 1.5×ATR = 1.0985
+    # SL dist = 0.0015
+    # tp1_calc = entry + 0.0015 × 2.5 = 1.10375
+
+    # Place a resistance level close to tp1_calc: 1.1040 (within ±20% of 1.10375)
+    resistance = [Decimal("1.10400")]
+    levels = rm.calculate_levels_for_regime(
+        entry=entry, atr=atr, direction="LONG", regime="STRONG_TREND_BULL",
+        resistance_levels=resistance,
+    )
+
+    # TP1 should be snapped to the resistance level
+    assert levels["take_profit_1"] == Decimal("1.10400"), (
+        f"TP1 should snap to resistance 1.10400, got {levels['take_profit_1']}"
+    )
+
+
+def test_sim18_rr_min_respected():
+    """After snap, if R:R < min_rr, revert to calculated TP1."""
+    from src.signals.risk_manager_v2 import REGIME_RR_MAP, RiskManagerV2
+
+    rm = RiskManagerV2()
+    entry = Decimal("1.10000")
+    atr = Decimal("0.00100")
+    # STRONG_TREND_BULL: min_rr=2.0, target_rr=2.5
+    # SL dist = 1.5 × ATR = 0.0015
+    # tp1_calc = entry + 0.0015 × 2.5 = 1.10375
+    # Place resistance MUCH closer than min_rr: 1.10100 → R:R = 0.1/0.0015 ≈ 0.67 < min_rr=2.0
+
+    bad_resistance = [Decimal("1.10100")]  # way too close → R:R ≈ 0.67
+    levels_snapped = rm.calculate_levels_for_regime(
+        entry=entry, atr=atr, direction="LONG", regime="STRONG_TREND_BULL",
+        resistance_levels=bad_resistance,
+    )
+
+    levels_no_snap = rm.calculate_levels_for_regime(
+        entry=entry, atr=atr, direction="LONG", regime="STRONG_TREND_BULL",
+    )
+
+    # When snap would violate min_rr, tp1 should revert to the calculated value
+    assert levels_snapped["take_profit_1"] == levels_no_snap["take_profit_1"], (
+        f"Bad snap should be rejected: got {levels_snapped['take_profit_1']}, "
+        f"expected {levels_no_snap['take_profit_1']}"
+    )
+
+
+# ── SIM-21: Correlation guard ─────────────────────────────────────────────────
+
+
+def test_sim21_get_correlation_group():
+    """get_correlation_group returns the correct group for known symbols."""
+    from src.signals.portfolio_risk import get_correlation_group, CORRELATED_GROUPS
+
+    group = get_correlation_group("EURUSD=X")
+    assert group is not None
+    assert "GBPUSD=X" in group  # in the same USD-long-side group
+
+    group_btc = get_correlation_group("BTC/USDT")
+    assert group_btc is not None
+    assert "ETH/USDT" in group_btc
+
+    group_none = get_correlation_group("UNKNOWN_SYMBOL")
+    assert group_none is None
+
+
+@pytest.mark.asyncio
+async def test_sim21_same_instrument_blocked(mock_db_session):
+    """Same instrument → always blocked (Rule 1: direct instrument guard)."""
+    from src.database.crud import is_position_blocked_by_correlation
+
+    # Simulate: has_open_position_for_instrument returns True
+    with patch("src.database.crud.has_open_position_for_instrument", new_callable=AsyncMock) as mock_has:
+        mock_has.return_value = True
+
+        blocked, reason = await is_position_blocked_by_correlation(
+            mock_db_session, instrument_id=1, symbol="EURUSD=X", direction="SHORT"
+        )
+
+    assert blocked is True
+    assert "instrument_id=1" in reason or "EURUSD" in reason
+
+
+@pytest.mark.asyncio
+async def test_sim21_correlated_same_direction_blocked(mock_db_session):
+    """EURUSD SHORT open + GBPUSD SHORT → blocked (same group, same direction)."""
+    from src.database.crud import is_position_blocked_by_correlation
+
+    with patch("src.database.crud.has_open_position_for_instrument", new_callable=AsyncMock) as mock_has:
+        mock_has.return_value = False  # GBPUSD has no direct open position
+        with patch("src.database.crud.count_open_positions_in_group", new_callable=AsyncMock) as mock_count:
+            mock_count.return_value = 1  # 1 SHORT already in USD-long group (EURUSD SHORT)
+
+            blocked, reason = await is_position_blocked_by_correlation(
+                mock_db_session, instrument_id=2, symbol="GBPUSD=X", direction="SHORT"
+            )
+
+    assert blocked is True
+    assert "correlation group limit" in reason.lower() or "limit" in reason.lower()
+
+
+@pytest.mark.asyncio
+async def test_sim21_correlated_opposite_direction_allowed(mock_db_session):
+    """EURUSD SHORT open + GBPUSD LONG → allowed (opposite direction = hedge)."""
+    from src.database.crud import is_position_blocked_by_correlation
+
+    with patch("src.database.crud.has_open_position_for_instrument", new_callable=AsyncMock) as mock_has:
+        mock_has.return_value = False
+        with patch("src.database.crud.count_open_positions_in_group", new_callable=AsyncMock) as mock_count:
+            mock_count.return_value = 0  # No LONG positions in the group
+
+            blocked, reason = await is_position_blocked_by_correlation(
+                mock_db_session, instrument_id=2, symbol="GBPUSD=X", direction="LONG"
+            )
+
+    assert blocked is False
+    assert reason == "OK"
+
+
+@pytest.mark.asyncio
+async def test_sim21_different_group_allowed(mock_db_session):
+    """EURUSD SHORT open + BTC/USDT SHORT → allowed (different groups)."""
+    from src.database.crud import is_position_blocked_by_correlation
+    from src.signals.portfolio_risk import get_correlation_group
+
+    # Verify they're in different groups
+    eurusd_group = get_correlation_group("EURUSD=X")
+    btc_group = get_correlation_group("BTC/USDT")
+    assert eurusd_group is not None and btc_group is not None
+    assert eurusd_group != btc_group
+
+    with patch("src.database.crud.has_open_position_for_instrument", new_callable=AsyncMock) as mock_has:
+        mock_has.return_value = False  # BTC has no direct open
+        with patch("src.database.crud.count_open_positions_in_group", new_callable=AsyncMock) as mock_count:
+            mock_count.return_value = 0  # No SHORT in BTC group
+
+            blocked, reason = await is_position_blocked_by_correlation(
+                mock_db_session, instrument_id=3, symbol="BTC/USDT", direction="SHORT"
+            )
+
+    assert blocked is False
+    assert reason == "OK"
+
+
+@pytest.mark.asyncio
+async def test_sim21_unknown_symbol_allowed(mock_db_session):
+    """Symbol not in any group → allowed (no correlation blocking)."""
+    from src.database.crud import is_position_blocked_by_correlation
+    from src.signals.portfolio_risk import get_correlation_group
+
+    assert get_correlation_group("UNKNOWN_PAIR=X") is None  # not in any group
+
+    with patch("src.database.crud.has_open_position_for_instrument", new_callable=AsyncMock) as mock_has:
+        mock_has.return_value = False
+
+        blocked, reason = await is_position_blocked_by_correlation(
+            mock_db_session, instrument_id=99, symbol="UNKNOWN_PAIR=X", direction="LONG"
+        )
+
+    assert blocked is False
+    assert reason == "OK"

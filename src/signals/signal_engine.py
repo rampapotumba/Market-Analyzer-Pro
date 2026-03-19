@@ -30,6 +30,7 @@ from src.database.crud import (
     get_price_data,
     get_upcoming_economic_events,
     has_open_position_for_instrument,
+    is_position_blocked_by_correlation,
 )
 from src.database.models import Instrument, RegimeState, Signal
 from src.signals.mtf_filter import MTFFilter
@@ -334,7 +335,7 @@ class SignalEngine:
                 )
                 return None
 
-        # B. Open-position guard — skip if an active virtual position already exists
+        # B. Open-position guard — same instrument (any direction, any timeframe)
         if await has_open_position_for_instrument(db, instrument.id):
             logger.info(
                 f"[SignalEngine] {instrument.symbol}/{timeframe}: "
@@ -556,7 +557,19 @@ class SignalEngine:
         direction = _determine_direction(composite_score)
         signal_strength = _determine_signal_strength(composite_score)
 
-        # 11. Calculate entry, SL, TP
+        # 11a. SIM-21: Correlation group guard (direction-aware)
+        if direction != "HOLD":
+            _corr_blocked, _corr_reason = await is_position_blocked_by_correlation(
+                db, instrument.id, instrument.symbol, direction
+            )
+            if _corr_blocked:
+                logger.info(
+                    f"[SIM-21] {instrument.symbol}/{timeframe} {direction}: "
+                    f"correlation guard blocked — {_corr_reason}"
+                )
+                return None
+
+        # 11b. Calculate entry, SL, TP
         current_price = Decimal(str(ta_indicators.get("current_price", df["close"].iloc[-1])))
         entry_price = _refine_entry_point(direction, current_price, ta_indicators, atr)
         initial_status = "tracking" if entry_price == current_price else "created"

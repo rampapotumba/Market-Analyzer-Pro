@@ -19,6 +19,27 @@ from src.config import settings
 
 logger = logging.getLogger(__name__)
 
+# ── SIM-21: Correlated instrument groups ──────────────────────────────────────
+# A group = set of symbols that move together.
+# Rule: max 1 open position per group in the SAME direction (opposite allowed — hedge).
+CORRELATED_GROUPS: list[set[str]] = [
+    {"EURUSD=X", "GBPUSD=X", "AUDUSD=X", "NZDUSD=X"},   # USD long side
+    {"USDJPY=X", "USDCAD=X", "USDCHF=X"},                  # USD short side
+    {"BTC/USDT", "ETH/USDT"},                               # crypto correlated
+    {"SPY", "QQQ", "IWM"},                                   # US equity
+]
+
+CROSS_GROUP_MAX = 1  # max open positions per group per direction
+
+
+def get_correlation_group(symbol: str) -> Optional[set[str]]:
+    """Return the correlated group that contains symbol, or None if not in any group."""
+    for group in CORRELATED_GROUPS:
+        if symbol in group:
+            return group
+    return None
+
+
 # ── Defaults ──────────────────────────────────────────────────────────────────
 # Maximum open trades per market type
 _MAX_OPEN: dict[str, int] = {

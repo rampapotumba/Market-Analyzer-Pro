@@ -9,6 +9,7 @@ from typing import Any, Optional, Sequence
 from sqlalchemy import and_, delete, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from src.database.models import (
     AccuracyStats,
@@ -152,7 +153,9 @@ async def get_signal_by_id(
     session: AsyncSession, signal_id: int
 ) -> Optional[Signal]:
     result = await session.execute(
-        select(Signal).where(Signal.id == signal_id)
+        select(Signal)
+        .options(selectinload(Signal.instrument))
+        .where(Signal.id == signal_id)
     )
     return result.scalar_one_or_none()
 
@@ -165,7 +168,12 @@ async def get_signals(
     to_dt: Optional[datetime.datetime] = None,
     limit: int = 50,
 ) -> Sequence[Signal]:
-    stmt = select(Signal).order_by(Signal.created_at.desc()).limit(limit)
+    stmt = (
+        select(Signal)
+        .options(selectinload(Signal.instrument))
+        .order_by(Signal.created_at.desc())
+        .limit(limit)
+    )
     if status:
         stmt = stmt.where(Signal.status == status)
     if market:
@@ -198,9 +206,10 @@ async def get_latest_signal_for_instrument(
 
 async def get_active_signals(session: AsyncSession) -> Sequence[Signal]:
     result = await session.execute(
-        select(Signal).where(
-            Signal.status.in_(["created", "active", "tracking"])
-        ).order_by(Signal.created_at.desc())
+        select(Signal)
+        .options(selectinload(Signal.instrument))
+        .where(Signal.status.in_(["created", "active", "tracking"]))
+        .order_by(Signal.created_at.desc())
     )
     return result.scalars().all()
 
@@ -295,11 +304,16 @@ async def get_macro_data(
 
 async def create_news_event(
     session: AsyncSession, data: dict[str, Any]
-) -> NewsEvent:
-    event = NewsEvent(**data)
-    session.add(event)
-    await session.flush()
-    return event
+) -> Optional[NewsEvent]:
+    """Insert a news event. Returns None if url already exists (dedup by url)."""
+    stmt = (
+        pg_insert(NewsEvent)
+        .values(**data)
+        .on_conflict_do_nothing(index_elements=["url"])
+        .returning(NewsEvent)
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
 
 
 async def get_news_events(
@@ -522,6 +536,81 @@ async def get_open_positions(session: AsyncSession) -> Sequence[VirtualPortfolio
     return result.scalars().all()
 
 
+async def has_open_position_for_instrument(
+    session: AsyncSession, instrument_id: int
+) -> bool:
+    """Return True if any open/partial virtual position exists for the given instrument."""
+    result = await session.execute(
+        select(VirtualPortfolio.signal_id)
+        .join(Signal, Signal.id == VirtualPortfolio.signal_id)
+        .where(
+            Signal.instrument_id == instrument_id,
+            VirtualPortfolio.status.in_(["open", "partial"]),
+        )
+        .limit(1)
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def count_open_positions_in_group(
+    session: AsyncSession,
+    symbols: set[str],
+    direction: str,
+) -> int:
+    """Return number of open/partial positions for any symbol in the group with given direction.
+
+    Used by SIM-21 correlation guard.
+    """
+    from src.database.models import Instrument as _Instrument
+
+    result = await session.execute(
+        select(func.count(VirtualPortfolio.signal_id))
+        .join(Signal, Signal.id == VirtualPortfolio.signal_id)
+        .join(_Instrument, _Instrument.id == Signal.instrument_id)
+        .where(
+            _Instrument.symbol.in_(symbols),
+            Signal.direction == direction,
+            VirtualPortfolio.status.in_(["open", "partial"]),
+        )
+    )
+    return result.scalar_one() or 0
+
+
+async def is_position_blocked_by_correlation(
+    session: AsyncSession,
+    instrument_id: int,
+    symbol: str,
+    direction: str,
+) -> tuple[bool, str]:
+    """Check if a new position is blocked by existing open positions (SIM-21).
+
+    Rules:
+      1. Same instrument (any timeframe) → always blocked.
+      2. Same correlated group + same direction → blocked if count >= CROSS_GROUP_MAX.
+      3. Opposite direction in same group → allowed (hedge).
+      4. Symbol not in any group → allowed.
+
+    Returns (is_blocked, reason_string).
+    """
+    from src.signals.portfolio_risk import CROSS_GROUP_MAX, get_correlation_group
+
+    # Rule 1: direct instrument guard
+    if await has_open_position_for_instrument(session, instrument_id):
+        return True, f"open position exists for instrument_id={instrument_id} ({symbol})"
+
+    # Rule 2: correlation guard
+    group = get_correlation_group(symbol)
+    if group:
+        open_count = await count_open_positions_in_group(session, group, direction)
+        if open_count >= CROSS_GROUP_MAX:
+            return True, (
+                f"correlation group limit reached: "
+                f"{open_count} {direction} position(s) already open in group"
+            )
+
+    return False, "OK"
+
+
 async def update_virtual_position(
     session: AsyncSession, signal_id: int, updates: dict[str, Any]
 ) -> None:
@@ -595,6 +684,23 @@ async def cleanup_system_events(session: AsyncSession, days: int = 3) -> int:
     result = await session.execute(
         delete(SystemEvent).where(SystemEvent.created_at < cutoff)
     )
+    await session.flush()
+    return result.rowcount or 0
+
+
+async def cleanup_news_events(session: AsyncSession, days: int = 2) -> int:
+    """Delete news articles older than `days` days. Returns count deleted."""
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
+    result = await session.execute(
+        delete(NewsEvent).where(NewsEvent.published_at < cutoff)
+    )
+    await session.flush()
+    return result.rowcount or 0
+
+
+async def delete_all_system_events(session: AsyncSession) -> int:
+    """Delete ALL system events. Returns count deleted."""
+    result = await session.execute(delete(SystemEvent))
     await session.flush()
     return result.rowcount or 0
 
