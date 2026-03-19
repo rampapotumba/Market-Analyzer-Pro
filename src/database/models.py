@@ -121,6 +121,9 @@ class Signal(Base):
     earnings_days_ahead: Mapped[Optional[int]] = mapped_column(Integer)      # for stocks
     portfolio_heat: Mapped[Optional[float]] = mapped_column(Numeric(5, 2))   # % of account at risk
 
+    # Market context at signal generation time
+    market_price_at_signal: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 8))  # spot price when signal fired
+
     # LLM (Claude) analysis fields
     llm_score: Mapped[Optional[float]] = mapped_column(Numeric(8, 4))        # -100..+100
     llm_bias: Mapped[Optional[str]] = mapped_column(String(10))              # BULLISH/BEARISH/NEUTRAL
@@ -472,6 +475,10 @@ class VirtualPortfolio(Base):
     last_swap_date: Mapped[Optional[datetime.date]] = mapped_column(Date())
     account_balance_at_entry: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 4))
 
+    # Analysis enrichment fields
+    spread_pips_applied: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))   # spread cost recorded at open
+    breakeven_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 8))      # exact price level of BE stop
+
 
 # ── Virtual account (SIM-16: dynamic balance) ────────────────────────────────
 
@@ -499,56 +506,56 @@ class VirtualAccount(Base):
     )
 
 
-# ── Backtesting ───────────────────────────────────────────────────────────────
+# ── Backtesting v4 (SIM-22) ───────────────────────────────────────────────────
+# Isolated from live tables: signal_results / virtual_portfolio are NEVER
+# written to by the backtest engine.
 
 class BacktestRun(Base):
     __tablename__ = "backtest_runs"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # UUID stored as VARCHAR(36) for cross-DB compatibility (Text on SQLite, UUID on PG)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    params: Mapped[Optional[str]] = mapped_column(Text)            # JSON: BacktestParams
+    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
     started_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
+        DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     completed_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True))
-    instrument_ids: Mapped[Optional[str]] = mapped_column(Text)    # JSON list
-    in_sample_start: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True))
-    in_sample_end: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True))
-    oos_start: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True))
-    oos_end: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True))
-    optimal_weights: Mapped[Optional[str]] = mapped_column(Text)   # JSON {ta,fa,sent,geo}
-    oos_sharpe: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
-    oos_profit_factor: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
-    oos_win_rate: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
-    oos_max_drawdown: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
-    oos_total_trades: Mapped[Optional[int]] = mapped_column(Integer)
-    monte_carlo_ci_drawdown: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))  # 95th pct
-    passed_validation: Mapped[Optional[bool]] = mapped_column(Boolean)
-    notes: Mapped[Optional[str]] = mapped_column(Text)
+    summary: Mapped[Optional[str]] = mapped_column(Text)           # JSON: BacktestResult summary
 
-    trades: Mapped[list["BacktestTrade"]] = relationship("BacktestTrade", back_populates="run")
+    trades: Mapped[list["BacktestTrade"]] = relationship(
+        "BacktestTrade", back_populates="run", cascade="all, delete-orphan"
+    )
 
 
 class BacktestTrade(Base):
     __tablename__ = "backtest_trades"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    run_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("backtest_runs.id"), nullable=False, index=True
+    run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("backtest_runs.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    instrument_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("instruments.id"), nullable=False, index=True
-    )
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
     timeframe: Mapped[str] = mapped_column(String(8), nullable=False)
-    entry_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    exit_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True))
-    direction: Mapped[str] = mapped_column(String(8), nullable=False)  # LONG/SHORT
+    direction: Mapped[str] = mapped_column(String(8), nullable=False)       # LONG/SHORT
     entry_price: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False)
     exit_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 8))
-    pnl_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
-    result: Mapped[Optional[str]] = mapped_column(String(16))  # win/loss/breakeven
+    exit_reason: Mapped[Optional[str]] = mapped_column(String(32))
+    pnl_pips: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 4))
+    pnl_usd: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 4))
+    result: Mapped[Optional[str]] = mapped_column(String(16))               # win/loss/breakeven
     composite_score: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
-    phase: Mapped[str] = mapped_column(String(8), default="oos")  # is/oos
+    entry_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True))
+    exit_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True))
+    duration_minutes: Mapped[Optional[int]] = mapped_column(Integer)
+    mfe: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 8))
+    mae: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 8))
 
     run: Mapped["BacktestRun"] = relationship("BacktestRun", back_populates="trades")
+
+    __table_args__ = (
+        Index("ix_backtest_trades_run_id", "run_id"),
+    )
 
 
 # ── System event log (3-day retention) ───────────────────────────────────────
