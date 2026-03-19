@@ -643,3 +643,172 @@ async def test_sim21_unknown_symbol_allowed(mock_db_session):
 
     assert blocked is False
     assert reason == "OK"
+
+
+# ── SIM-22: Backtest CRUD ─────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_sim22_crud_create_and_get_run(mock_db_session):
+    """create_backtest_run returns a UUID string; get_backtest_run fetches it."""
+    import json
+    import uuid
+    from unittest.mock import AsyncMock, MagicMock
+
+    from src.database.crud import create_backtest_run, get_backtest_run
+
+    # Patch session.add so we can capture what was added
+    added_objects = []
+    mock_db_session.add = MagicMock(side_effect=lambda obj: added_objects.append(obj))
+
+    params = {"symbols": ["EURUSD=X"], "timeframe": "H1", "account_size": "1000"}
+    run_id = await create_backtest_run(mock_db_session, params)
+
+    # run_id must be a valid UUID
+    assert isinstance(run_id, str)
+    uuid.UUID(run_id)  # raises if invalid
+
+    # One BacktestRun was added to the session
+    from src.database.models import BacktestRun
+    assert len(added_objects) == 1
+    run_obj = added_objects[0]
+    assert isinstance(run_obj, BacktestRun)
+    assert run_obj.id == run_id
+    assert run_obj.status == "pending"
+    assert json.loads(run_obj.params) == params
+
+    # get_backtest_run — mock DB returning the run object
+    mock_result = MagicMock()
+    mock_result.scalar_one_or_none.return_value = run_obj
+    mock_db_session.execute = AsyncMock(return_value=mock_result)
+
+    fetched = await get_backtest_run(mock_db_session, run_id)
+    assert fetched is run_obj
+
+
+@pytest.mark.asyncio
+async def test_sim22_crud_update_run(mock_db_session):
+    """update_backtest_run sets status and completed_at when status=completed."""
+    from src.database.crud import update_backtest_run
+
+    await update_backtest_run(mock_db_session, run_id="abc-123", status="completed")
+    mock_db_session.execute.assert_called_once()
+    mock_db_session.flush.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_sim22_crud_bulk_insert_trades(mock_db_session):
+    """create_backtest_trades_bulk adds N BacktestTrade objects."""
+    from src.database.models import BacktestTrade
+
+    added = []
+    mock_db_session.add = MagicMock(side_effect=lambda obj: added.append(obj))
+
+    from src.database.crud import create_backtest_trades_bulk
+
+    trades = [
+        {
+            "symbol": "EURUSD=X",
+            "timeframe": "H1",
+            "direction": "LONG",
+            "entry_price": "1.10000",
+            "exit_price": "1.11000",
+            "exit_reason": "tp_hit",
+            "pnl_pips": "100.0",
+            "pnl_usd": "10.0",
+            "result": "win",
+            "composite_score": "12.5",
+            "entry_at": None,
+            "exit_at": None,
+            "duration_minutes": 60,
+            "mfe": "0.01000",
+            "mae": "0.00200",
+        },
+        {
+            "symbol": "GBPUSD=X",
+            "timeframe": "H1",
+            "direction": "SHORT",
+            "entry_price": "1.30000",
+            "exit_price": "1.29000",
+            "exit_reason": "sl_hit",
+            "pnl_pips": "-100.0",
+            "pnl_usd": "-10.0",
+            "result": "loss",
+            "composite_score": "-8.0",
+            "entry_at": None,
+            "exit_at": None,
+            "duration_minutes": 30,
+            "mfe": "0.00300",
+            "mae": "-0.01200",
+        },
+    ]
+
+    await create_backtest_trades_bulk(mock_db_session, run_id="abc-123", trades=trades)
+
+    assert len(added) == 2
+    assert all(isinstance(obj, BacktestTrade) for obj in added)
+    assert added[0].symbol == "EURUSD=X"
+    assert added[0].result == "win"
+    assert added[1].direction == "SHORT"
+    mock_db_session.flush.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_sim22_crud_get_results_structure(mock_db_session):
+    """get_backtest_results returns dict with all required top-level fields."""
+    import json
+    from decimal import Decimal
+    from unittest.mock import MagicMock
+
+    from src.database.models import BacktestRun, BacktestTrade
+
+    run = BacktestRun()
+    run.id = "test-run-id"
+    run.status = "completed"
+    run.params = json.dumps({"symbols": ["EURUSD=X"], "timeframe": "H1"})
+    run.started_at = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+    run.completed_at = datetime.datetime(2024, 1, 2, tzinfo=datetime.timezone.utc)
+    run.summary = None
+
+    trade1 = BacktestTrade()
+    trade1.id = 1
+    trade1.symbol = "EURUSD=X"
+    trade1.timeframe = "H1"
+    trade1.direction = "LONG"
+    trade1.entry_price = Decimal("1.10000")
+    trade1.exit_price = Decimal("1.11000")
+    trade1.exit_reason = "tp_hit"
+    trade1.pnl_pips = Decimal("100.0")
+    trade1.pnl_usd = Decimal("10.0")
+    trade1.result = "win"
+    trade1.composite_score = Decimal("12.5")
+    trade1.entry_at = None
+    trade1.exit_at = None
+    trade1.duration_minutes = 60
+    trade1.mfe = Decimal("0.01000")
+    trade1.mae = Decimal("0.00200")
+
+    # First call → get_backtest_run (returns run), second call → trades
+    run_result = MagicMock()
+    run_result.scalar_one_or_none.return_value = run
+    trades_result = MagicMock()
+    trades_result.scalars.return_value.all.return_value = [trade1]
+    mock_db_session.execute = AsyncMock(side_effect=[run_result, trades_result])
+
+    from src.database.crud import get_backtest_results
+
+    result = await get_backtest_results(mock_db_session, "test-run-id")
+
+    required_keys = [
+        "run_id", "status", "params", "started_at", "completed_at",
+        "total_trades", "win_rate_pct", "profit_factor", "total_pnl_usd",
+        "avg_duration_minutes", "trades",
+    ]
+    for key in required_keys:
+        assert key in result, f"Missing key: {key}"
+
+    assert result["total_trades"] == 1
+    assert result["win_rate_pct"] == 100.0
+    assert result["total_pnl_usd"] == 10.0
+    assert len(result["trades"]) == 1
+    assert result["trades"][0]["symbol"] == "EURUSD=X"

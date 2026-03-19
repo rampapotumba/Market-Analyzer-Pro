@@ -137,15 +137,18 @@
 
 ### 2.1 SIM-22: CRUD функции бэктеста
 
-- [ ] В `src/database/crud.py`: `async def create_backtest_run(db, params: dict) -> str` (returns run_id UUID)
-- [ ] `async def update_backtest_run(db, run_id: str, status: str, summary: dict = None)`
-- [ ] `async def create_backtest_trade(db, run_id: str, trade: dict)`
-- [ ] `async def create_backtest_trades_bulk(db, run_id: str, trades: list[dict])` — batch insert для производительности
-- [ ] `async def get_backtest_run(db, run_id: str) -> Optional[BacktestRun]`
-- [ ] `async def get_backtest_results(db, run_id: str) -> dict` — run + trades + computed stats
-- [ ] `async def list_backtest_runs(db, limit: int = 20) -> list[BacktestRun]`
-- [ ] Тест: `test_sim22_crud_create_and_get_run` — создать → получить → совпадает
-- [ ] Коммит: `feat(sim-22): backtest CRUD functions`
+- [x] В `src/database/crud.py`: `async def create_backtest_run(db, params: dict) -> str` (returns run_id UUID)
+- [x] `async def update_backtest_run(db, run_id: str, status: str, summary: dict = None)`
+- [x] `async def create_backtest_trade(db, run_id: str, trade: dict)`
+- [x] `async def create_backtest_trades_bulk(db, run_id: str, trades: list[dict])` — batch insert для производительности
+- [x] `async def get_backtest_run(db, run_id: str) -> Optional[BacktestRun]`
+- [x] `async def get_backtest_results(db, run_id: str) -> dict` — run + trades + computed stats
+- [x] `async def list_backtest_runs(db, limit: int = 20) -> list[BacktestRun]`
+- [x] Тест: `test_sim22_crud_create_and_get_run` — создать → получить → совпадает
+- [x] Тест: `test_sim22_crud_update_run` — update_backtest_run изменяет статус
+- [x] Тест: `test_sim22_crud_bulk_insert_trades` — bulk insert добавляет N объектов
+- [x] Тест: `test_sim22_crud_get_results_structure` — get_backtest_results возвращает все поля
+- [x] Коммит: `feat(sim-22): backtest CRUD functions`
 
 ### 2.2 SIM-22: Бэктест движок (core)
 

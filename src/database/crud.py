@@ -3,16 +3,19 @@
 import datetime
 import json
 import logging
+import uuid
 from decimal import Decimal
 from typing import Any, Optional, Sequence
 
-from sqlalchemy import and_, delete, select, update
+from sqlalchemy import and_, delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from src.database.models import (
     AccuracyStats,
+    BacktestRun,
+    BacktestTrade,
     EconomicEvent,
     Instrument,
     MacroData,
@@ -795,3 +798,184 @@ async def get_portfolio_pnl(session: AsyncSession) -> dict[str, Any]:
         "realized_pnl_pct": round(realized_pnl, 4),
         "total_pnl_pct": round(open_pnl + realized_pnl, 4),
     }
+
+
+# ── Backtest CRUD (SIM-22) ────────────────────────────────────────────────────
+
+
+async def create_backtest_run(session: AsyncSession, params: dict) -> str:
+    """Create a new backtest run record. Returns the UUID run_id."""
+    run_id = str(uuid.uuid4())
+    run = BacktestRun(
+        id=run_id,
+        params=json.dumps(params),
+        status="pending",
+    )
+    session.add(run)
+    await session.flush()
+    return run_id
+
+
+async def update_backtest_run(
+    session: AsyncSession,
+    run_id: str,
+    status: str,
+    summary: Optional[dict] = None,
+) -> None:
+    """Update status and optional summary of a backtest run."""
+    values: dict[str, Any] = {"status": status}
+    if status in ("completed", "failed"):
+        values["completed_at"] = datetime.datetime.now(datetime.timezone.utc)
+    if summary is not None:
+        values["summary"] = json.dumps(summary)
+    await session.execute(
+        update(BacktestRun).where(BacktestRun.id == run_id).values(**values)
+    )
+    await session.flush()
+
+
+async def create_backtest_trade(
+    session: AsyncSession, run_id: str, trade: dict
+) -> None:
+    """Insert a single backtest trade."""
+    bt = BacktestTrade(
+        run_id=run_id,
+        symbol=trade.get("symbol"),
+        timeframe=trade.get("timeframe"),
+        direction=trade.get("direction"),
+        entry_price=Decimal(str(trade["entry_price"])) if trade.get("entry_price") is not None else None,
+        exit_price=Decimal(str(trade["exit_price"])) if trade.get("exit_price") is not None else None,
+        exit_reason=trade.get("exit_reason"),
+        pnl_pips=Decimal(str(trade["pnl_pips"])) if trade.get("pnl_pips") is not None else None,
+        pnl_usd=Decimal(str(trade["pnl_usd"])) if trade.get("pnl_usd") is not None else None,
+        result=trade.get("result"),
+        composite_score=Decimal(str(trade["composite_score"])) if trade.get("composite_score") is not None else None,
+        entry_at=trade.get("entry_at"),
+        exit_at=trade.get("exit_at"),
+        duration_minutes=trade.get("duration_minutes"),
+        mfe=Decimal(str(trade["mfe"])) if trade.get("mfe") is not None else None,
+        mae=Decimal(str(trade["mae"])) if trade.get("mae") is not None else None,
+    )
+    session.add(bt)
+    await session.flush()
+
+
+async def create_backtest_trades_bulk(
+    session: AsyncSession, run_id: str, trades: list[dict]
+) -> None:
+    """Bulk-insert backtest trades (one flush after all inserts)."""
+    for trade in trades:
+        bt = BacktestTrade(
+            run_id=run_id,
+            symbol=trade.get("symbol"),
+            timeframe=trade.get("timeframe"),
+            direction=trade.get("direction"),
+            entry_price=Decimal(str(trade["entry_price"])) if trade.get("entry_price") is not None else None,
+            exit_price=Decimal(str(trade["exit_price"])) if trade.get("exit_price") is not None else None,
+            exit_reason=trade.get("exit_reason"),
+            pnl_pips=Decimal(str(trade["pnl_pips"])) if trade.get("pnl_pips") is not None else None,
+            pnl_usd=Decimal(str(trade["pnl_usd"])) if trade.get("pnl_usd") is not None else None,
+            result=trade.get("result"),
+            composite_score=Decimal(str(trade["composite_score"])) if trade.get("composite_score") is not None else None,
+            entry_at=trade.get("entry_at"),
+            exit_at=trade.get("exit_at"),
+            duration_minutes=trade.get("duration_minutes"),
+            mfe=Decimal(str(trade["mfe"])) if trade.get("mfe") is not None else None,
+            mae=Decimal(str(trade["mae"])) if trade.get("mae") is not None else None,
+        )
+        session.add(bt)
+    await session.flush()
+
+
+async def get_backtest_run(
+    session: AsyncSession, run_id: str
+) -> Optional[BacktestRun]:
+    """Return a single BacktestRun by id."""
+    result = await session.execute(
+        select(BacktestRun).where(BacktestRun.id == run_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_backtest_results(session: AsyncSession, run_id: str) -> dict:
+    """
+    Return run metadata + aggregated trade stats as a dict.
+    Summary field (if populated) is merged in as top-level keys.
+    """
+    run = await get_backtest_run(session, run_id)
+    if run is None:
+        return {}
+
+    result = await session.execute(
+        select(BacktestTrade).where(BacktestTrade.run_id == run_id)
+    )
+    trades = result.scalars().all()
+
+    total = len(trades)
+    wins = [t for t in trades if t.result == "win"]
+    losses = [t for t in trades if t.result == "loss"]
+
+    total_pnl = sum(float(t.pnl_usd or 0) for t in trades)
+    gross_win = sum(float(t.pnl_usd or 0) for t in wins)
+    gross_loss = abs(sum(float(t.pnl_usd or 0) for t in losses))
+    profit_factor = (gross_win / gross_loss) if gross_loss > 0 else None
+
+    win_rate = (len(wins) / total * 100) if total > 0 else 0.0
+    avg_dur = (
+        sum(t.duration_minutes or 0 for t in trades) / total if total > 0 else 0
+    )
+
+    summary_override: dict = {}
+    if run.summary:
+        try:
+            summary_override = json.loads(run.summary)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    base = {
+        "run_id": run.id,
+        "status": run.status,
+        "params": json.loads(run.params) if run.params else {},
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+        "total_trades": total,
+        "win_rate_pct": round(win_rate, 2),
+        "profit_factor": round(profit_factor, 4) if profit_factor is not None else None,
+        "total_pnl_usd": round(total_pnl, 4),
+        "avg_duration_minutes": round(avg_dur, 1),
+        "trades": [
+            {
+                "id": t.id,
+                "symbol": t.symbol,
+                "timeframe": t.timeframe,
+                "direction": t.direction,
+                "entry_price": str(t.entry_price) if t.entry_price is not None else None,
+                "exit_price": str(t.exit_price) if t.exit_price is not None else None,
+                "exit_reason": t.exit_reason,
+                "pnl_pips": str(t.pnl_pips) if t.pnl_pips is not None else None,
+                "pnl_usd": str(t.pnl_usd) if t.pnl_usd is not None else None,
+                "result": t.result,
+                "composite_score": str(t.composite_score) if t.composite_score is not None else None,
+                "entry_at": t.entry_at.isoformat() if t.entry_at else None,
+                "exit_at": t.exit_at.isoformat() if t.exit_at else None,
+                "duration_minutes": t.duration_minutes,
+                "mfe": str(t.mfe) if t.mfe is not None else None,
+                "mae": str(t.mae) if t.mae is not None else None,
+            }
+            for t in trades
+        ],
+    }
+    base.update(summary_override)
+    return base
+
+
+async def list_backtest_runs(
+    session: AsyncSession, limit: int = 20
+) -> list[BacktestRun]:
+    """Return the most recent backtest runs, newest first."""
+    result = await session.execute(
+        select(BacktestRun)
+        .order_by(BacktestRun.started_at.desc())
+        .limit(limit)
+    )
+    return list(result.scalars().all())
