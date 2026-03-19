@@ -1128,6 +1128,14 @@ async def simulator_stats(db: AsyncSession = Depends(get_session)):
     best_exit_row = best_exit_q.first()
     best_exit_reason = best_exit_row[0] if best_exit_row else None
 
+    # SIM-24: partial close count
+    partial_close_q = await db.execute(
+        select(func.count(VirtualPortfolio.id)).where(
+            VirtualPortfolio.partial_closed == True  # noqa: E712
+        )
+    )
+    partial_close_count = partial_close_q.scalar() or 0
+
     # SIM-16: virtual account fields
     account = await get_virtual_account(db)
     account_initial = float(account.initial_balance) if account else ACCOUNT_SIZE_FLOAT
@@ -1178,6 +1186,8 @@ async def simulator_stats(db: AsyncSession = Depends(get_session)):
         "account_peak_balance":       round(account_peak, 2),
         "account_drawdown_pct":       account_drawdown_pct,
         "account_total_return_pct":   account_total_return_pct,
+        # SIM-24 partial close diagnostic
+        "partial_close_count":        partial_close_count,
     }
 
 

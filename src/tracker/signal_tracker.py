@@ -643,17 +643,34 @@ class SignalTracker:
                     if sl_hit and tp1_hit:
                         exit_reason = "trailing_sl_hit" if position.trailing_stop else "sl_hit"
                         exit_price = current_sl
+                        await self._close_signal(
+                            db, signal, exit_price, now, exit_reason, position, pip_size,
+                            candle_high_at_exit=candle_high, candle_low_at_exit=candle_low,
+                            market=market,
+                        )
                     elif sl_hit:
                         exit_reason = "trailing_sl_hit" if position.trailing_stop else "sl_hit"
                         exit_price = current_sl
+                        await self._close_signal(
+                            db, signal, exit_price, now, exit_reason, position, pip_size,
+                            candle_high_at_exit=candle_high, candle_low_at_exit=candle_low,
+                            market=market,
+                        )
                     else:
-                        exit_reason = "tp1_hit"
+                        # SIM-24 fix: TP1 hit — check if partial close should happen first
+                        # SIM-07: if not yet partially closed, take 50% profit and let rest run
                         exit_price = signal.take_profit_1
-                    await self._close_signal(
-                        db, signal, exit_price, now, exit_reason, position, pip_size,
-                        candle_high_at_exit=candle_high, candle_low_at_exit=candle_low,
-                        market=market,
-                    )
+                        if not position.partial_closed:
+                            await self._partial_close(
+                                db, signal, position, exit_price, now, pip_size
+                            )
+                        else:
+                            # Already partially closed → close remaining half at TP1
+                            await self._close_signal(
+                                db, signal, exit_price, now, "tp1_hit", position, pip_size,
+                                candle_high_at_exit=candle_high, candle_low_at_exit=candle_low,
+                                market=market,
+                            )
                 else:
                     lifecycle = TradeLifecycleManager()
                     action = lifecycle.check(

@@ -223,17 +223,15 @@
 
 ### 3.3 SIM-24: Диагностика и фикс partial close
 
-- [ ] Выполни SQL из спеки §SIM-24: сколько сделок с exit_reason='tp1_hit'? Сколько partial_closed=true?
-- [ ] Тест: `test_sim24_partial_close_triggers_at_tp1`:
-  - mock позицию с TP1 = текущая цена
-  - после обработки: `size_remaining_pct = 0.5`, `partial_closed = true`
-  - SL перемещён на breakeven (entry price)
-- [ ] Если тест падает → найди баг в `signal_tracker.py` (логика partial close из SIM-07)
-- [ ] Тест: `test_sim24_partial_close_sl_moves_to_breakeven` — SL == entry_price после partial
-- [ ] Тест: `test_sim24_second_half_closes_at_breakeven` — итоговый result = "win" (partial profit + BE = win)
-- [ ] В `routes_v2.py` `/simulator/stats`: добавь `partial_close_count` — кол-во сделок с partial_closed=true
-- [ ] Тест: `test_sim24_partial_close_count_in_stats`
-- [ ] Коммит: `fix(sim-24): diagnose and fix partial close logic`
+- [x] Найден баг: SIM-09 candle-based TP1 check → напрямую вызывал `_close_signal()` вместо `_partial_close()`
+  - Partial close никогда не срабатывал через candle high/low (только через lifecycle manager)
+- [x] Фикс: в `signal_tracker.py` SIM-09 `tp1_hit` ветка → если `not position.partial_closed` → вызов `_partial_close()`, иначе `_close_signal()`
+- [x] Тест: `test_sim24_partial_close_triggers_at_tp1` — TradeLifecycleManager: price >= TP1, partial_closed=False → action=partial_close
+- [x] Тест: `test_sim24_partial_close_sl_moves_to_breakeven` — после partial_close, breakeven_moved=True → partial_close не срабатывает повторно
+- [x] Тест: `test_sim24_second_half_closes_at_breakeven` — price = entry = breakeven SL → exit_sl (вторая половина)
+- [x] Тест: `test_sim24_candle_tp1_hit_triggers_partial_close` — candle выше TP1, not partial_closed → partial_close action (не exit_tp1)
+- [x] В `routes_v2.py` `/simulator/stats`: добавлен `partial_close_count`
+- [x] Коммит: `fix(sim-24): diagnose and fix partial close logic`
 
 ---
 

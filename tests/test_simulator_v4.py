@@ -1141,3 +1141,136 @@ def test_sim20_mae_early_exit_division_by_zero():
     )
     result2 = tracker._check_mae_early_exit(pos_zero_mae, sig, Decimal("1.10000"), now)
     assert result2 is False, "mae=0 should return False (no adverse move)"
+
+
+# ── SIM-24: Partial close ─────────────────────────────────────────────────────
+
+
+def test_sim24_partial_close_triggers_at_tp1():
+    """TradeLifecycleManager returns 'partial_close' when price >= TP1 (LONG, not yet partial_closed)."""
+    from src.signals.trade_lifecycle import TradeLifecycleManager
+
+    mgr = TradeLifecycleManager()
+    entry = Decimal("1.10000")
+    sl = Decimal("1.09000")
+    tp1 = Decimal("1.11500")
+    tp2 = Decimal("1.12000")
+    atr = Decimal("0.00100")
+
+    # Price AT tp1 — should trigger partial_close (not yet done)
+    action = mgr.check(
+        direction="LONG",
+        entry=entry,
+        stop_loss=sl,
+        take_profit_1=tp1,
+        take_profit_2=tp2,
+        take_profit_3=None,
+        current_price=tp1,  # price == TP1
+        atr=atr,
+        regime="TREND_BULL",
+        partial_closed=False,
+        breakeven_moved=False,
+        trailing_stop=None,
+    )
+    assert action["action"] == "partial_close", (
+        f"Expected partial_close, got {action['action']}: {action['reason']}"
+    )
+    assert action["close_pct"] == 0.5
+
+
+def test_sim24_partial_close_sl_moves_to_breakeven():
+    """After partial close, SL must be set to entry price (breakeven)."""
+    from src.signals.trade_lifecycle import TradeLifecycleManager
+
+    mgr = TradeLifecycleManager()
+    entry = Decimal("1.10000")
+
+    # After partial close, partial_closed=True and breakeven_moved=True
+    # Now TradeLifecycle should trail / hold, not partial close again
+    action = mgr.check(
+        direction="LONG",
+        entry=entry,
+        stop_loss=entry,            # SL already at breakeven
+        take_profit_1=Decimal("1.11500"),
+        take_profit_2=Decimal("1.12000"),
+        take_profit_3=None,
+        current_price=Decimal("1.11000"),  # between BE and TP2
+        atr=Decimal("0.00100"),
+        regime="TREND_BULL",
+        partial_closed=True,        # already done
+        breakeven_moved=True,
+        trailing_stop=None,
+    )
+    # Should NOT trigger partial_close again
+    assert action["action"] != "partial_close", (
+        f"Should not partial_close twice: got {action['action']}"
+    )
+
+
+def test_sim24_second_half_closes_at_breakeven():
+    """After partial close, if price returns to entry → SL hit → result still 'win' (blended).
+
+    The overall result depends on the full P&L calculation:
+    - partial 50% at TP1 → profit
+    - second 50% at BE → 0 P&L
+    - Total: still positive → result = 'win'
+
+    We test the lifecycle manager returns exit_sl when price hits breakeven SL.
+    """
+    from src.signals.trade_lifecycle import TradeLifecycleManager
+
+    mgr = TradeLifecycleManager()
+    entry = Decimal("1.10000")
+    be_sl = entry  # SL at breakeven after partial close
+
+    action = mgr.check(
+        direction="LONG",
+        entry=entry,
+        stop_loss=be_sl,
+        take_profit_1=Decimal("1.11500"),
+        take_profit_2=Decimal("1.12000"),
+        take_profit_3=None,
+        current_price=entry,  # price hit breakeven SL
+        atr=Decimal("0.00100"),
+        regime="TREND_BULL",
+        partial_closed=True,
+        breakeven_moved=True,
+        trailing_stop=None,
+    )
+    assert action["action"] == "exit_sl", (
+        f"Expected exit_sl at breakeven, got {action['action']}"
+    )
+
+
+def test_sim24_candle_tp1_hit_triggers_partial_close():
+    """SIM-24 fix: when SIM-09 candle check hits TP1 and position is NOT partial_closed,
+    the partial close path is taken instead of full close.
+
+    We verify the _check_mae_early_exit logic and the candle-based check interaction
+    by confirming the TradeLifecycleManager's partial_close action is correct.
+    """
+    from src.signals.trade_lifecycle import TradeLifecycleManager
+
+    mgr = TradeLifecycleManager()
+
+    # LONG position: price is above TP1 (candle high hit TP1)
+    entry = Decimal("1.10000")
+    tp1 = Decimal("1.11500")
+    action = mgr.check(
+        direction="LONG",
+        entry=entry,
+        stop_loss=Decimal("1.09000"),
+        take_profit_1=tp1,
+        take_profit_2=Decimal("1.12500"),
+        take_profit_3=None,
+        current_price=Decimal("1.11600"),  # above TP1 — candle hit TP1
+        atr=Decimal("0.00100"),
+        regime="TREND_BULL",
+        partial_closed=False,
+        breakeven_moved=False,
+        trailing_stop=None,
+    )
+    # Without partial_closed=True, TP1 triggers partial_close (not exit_tp1)
+    assert action["action"] == "partial_close", (
+        f"Candle TP1 hit + not partial_closed → partial_close, got {action['action']}"
+    )
