@@ -27,7 +27,7 @@ import pandas as pd
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.backtesting.backtest_params import BacktestParams, BacktestTradeResult
-from src.config import BLOCKED_REGIMES, INSTRUMENT_OVERRIDES, MIN_COMPOSITE_SCORE, MIN_COMPOSITE_SCORE_CRYPTO
+from src.config import INSTRUMENT_OVERRIDES
 from src.database.crud import (
     create_backtest_run,
     create_backtest_trades_bulk,
@@ -35,6 +35,7 @@ from src.database.crud import (
     get_price_data,
     update_backtest_run,
 )
+from src.signals.filter_pipeline import SignalFilterPipeline
 from src.signals.risk_manager_v2 import REGIME_RR_MAP, ATR_SL_MULTIPLIER_MAP, RiskManagerV2
 
 logger = logging.getLogger(__name__)
@@ -111,17 +112,26 @@ def _is_asian_session(candle_ts: datetime.datetime) -> bool:
 
 
 def _get_signal_strength(composite: float) -> str:
-    """Map composite score to signal strength bucket (mirrors SIM-14 score buckets)."""
-    if composite >= 20.0:
+    """Map composite score to signal strength bucket (SIM-14 score buckets).
+
+    strong_buy:  >= +15
+    buy:          +10..+15
+    weak_buy:      +7..+10
+    neutral:       -7..+7
+    weak_sell:    -10..-7
+    sell:         -15..-10
+    strong_sell:  <= -15
+    """
+    if composite >= 15.0:
         return "STRONG_BUY"
     elif composite >= 10.0:
         return "BUY"
-    elif composite <= -20.0:
+    elif composite >= 7.0:
+        return "WEAK_BUY"
+    elif composite <= -15.0:
         return "STRONG_SELL"
     elif composite <= -10.0:
         return "SELL"
-    elif composite >= 7.0:
-        return "WEAK_BUY"
     elif composite <= -7.0:
         return "WEAK_SELL"
     else:
@@ -558,15 +568,7 @@ class BacktestEngine:
                 apply_slippage=params.apply_slippage,
                 progress_cb=_progress_cb,
                 economic_events=economic_events,
-                filter_flags={
-                    "ranging": params.apply_ranging_filter,
-                    "d1_trend": params.apply_d1_trend_filter,
-                    "volume": params.apply_volume_filter,
-                    "weekday": params.apply_weekday_filter,
-                    "momentum": params.apply_momentum_filter,
-                    "calendar": params.apply_calendar_filter,
-                    "min_composite_score": params.min_composite_score,
-                },
+                params=params,
             )
             trades.extend(symbol_trades)
 
@@ -586,13 +588,30 @@ class BacktestEngine:
         apply_slippage: bool,
         progress_cb: Any = None,
         economic_events: list | None = None,
-        filter_flags: dict | None = None,
+        params: Optional[BacktestParams] = None,
     ) -> list[BacktestTradeResult]:
         """Simulate one symbol over all its candles. Returns closed trades.
 
         NOTE: sync (no awaits) — called via asyncio.to_thread() to avoid blocking event loop.
         progress_cb(pct: float) is called every 100 candles if provided.
+
+        All signal-level filtering is handled by SignalFilterPipeline.run_all().
+        _generate_signal() only computes the raw signal (TA, composite, regime, ATR).
         """
+        # Build filter pipeline from BacktestParams (SIM-42/SIM-43)
+        pipeline = SignalFilterPipeline(
+            apply_score_filter=True,  # always on
+            apply_regime_filter=params.apply_ranging_filter if params else True,
+            apply_d1_trend_filter=params.apply_d1_trend_filter if params else True,
+            apply_volume_filter=params.apply_volume_filter if params else True,
+            apply_momentum_filter=params.apply_momentum_filter if params else True,
+            apply_weekday_filter=params.apply_weekday_filter if params else True,
+            apply_calendar_filter=params.apply_calendar_filter if params else True,
+            apply_session_filter=params.apply_session_filter if params else True,
+            apply_dxy_filter=True,  # always on when DXY data is available
+            min_composite_score=params.min_composite_score if params else None,
+        )
+
         trades: list[BacktestTradeResult] = []
         open_trade: Optional[dict[str, Any]] = None  # one position at a time per symbol
         last_signal_ts: Optional[datetime.datetime] = None  # cooldown tracking
@@ -646,28 +665,35 @@ class BacktestEngine:
 
             candle_ts: datetime.datetime = current_candle.timestamp
 
-            # Session filter: skip EU/NA forex pairs during Asian hours
-            if market_type == "forex" and symbol in _FOREX_PAIRS_EU_NA:
-                if _is_asian_session(candle_ts):
-                    continue
-
-            # SIM-32: Weekday filter
-            ff = filter_flags or {}
-            if ff.get("weekday", True) and not BacktestEngine._check_weekday_filter(candle_ts, market_type):
-                continue
-
-            # SIM-33: Economic calendar filter
-            if ff.get("calendar", True) and not BacktestEngine._check_economic_calendar(candle_ts, economic_events or []):
-                continue
-
             # Cooldown filter: mirror SignalEngine cooldown per timeframe
             if last_signal_ts is not None:
                 elapsed = (candle_ts - last_signal_ts).total_seconds() / 60
                 if elapsed < cooldown_minutes:
                     continue
 
-            signal = self._generate_signal(df, symbol, market_type, timeframe, filter_flags=ff)
+            # _generate_signal() returns raw signal with ta_indicators — no filtering inside
+            signal = self._generate_signal(df, symbol, market_type, timeframe)
             if signal is None:
+                continue
+
+            # ── Run unified filter pipeline (SIM-42) ─────────────────────────
+            filter_context = {
+                "composite_score": float(signal["composite_score"]),
+                "market_type": market_type,
+                "symbol": symbol,
+                "regime": signal["regime"],
+                "direction": signal["direction"],
+                "timeframe": timeframe,
+                "df": df,
+                "ta_indicators": signal.get("ta_indicators", {}),
+                "candle_ts": candle_ts,
+                "d1_rows": [],   # D1 data not available in candle-level loop
+                "economic_events": economic_events or [],
+                "dxy_rsi": None,  # DXY not available in backtest without external data
+            }
+            passed, reason = pipeline.run_all(filter_context)
+            if not passed:
+                logger.debug("[Pipeline] Signal blocked for %s: %s", symbol, reason)
                 continue
 
             # ── Entry on NEXT candle open (no lookahead) ──────────────────────
@@ -817,6 +843,11 @@ class BacktestEngine:
             regime=open_trade.get("regime"),
         )
 
+    # ── Filter delegation methods ─────────────────────────────────────────────
+    # These are thin wrappers that delegate to SignalFilterPipeline.
+    # Kept for backward compatibility with existing tests and external callers.
+    # The canonical implementation lives in SignalFilterPipeline.
+
     @staticmethod
     def _check_d1_trend_alignment(
         symbol: str,
@@ -824,156 +855,47 @@ class BacktestEngine:
         timeframe: str,
         d1_rows: list,
     ) -> bool:
-        """SIM-27: D1 MA200 trend alignment filter.
-
-        Returns True (allow) or False (block).
-        Graceful degradation: if data insufficient → returns True.
-        M1/M5/M15: filter not applied (returns True).
-        """
-        # M1/M5/M15: filter not applied
-        if timeframe in ("M1", "M5", "M15"):
-            return True
-
-        if not d1_rows or len(d1_rows) < 200:
-            logger.warning(
-                "[SIM-27] Insufficient D1 data (%d/200) for %s, skipping filter",
-                len(d1_rows) if d1_rows else 0,
-                symbol,
-            )
-            return True  # graceful degradation
-
-        closes = [float(r.close) for r in d1_rows[-200:]]
-        ma200 = sum(closes) / len(closes)
-        current_close = closes[-1]
-
-        if direction == "LONG" and current_close < ma200:
-            logger.info(
-                "[SIM-27] Blocked LONG: D1 close %.5f < MA200 %.5f for %s",
-                current_close, ma200, symbol,
-            )
-            return False
-        if direction == "SHORT" and current_close > ma200:
-            logger.info(
-                "[SIM-27] Blocked SHORT: D1 close %.5f > MA200 %.5f for %s",
-                current_close, ma200, symbol,
-            )
-            return False
-        return True
+        """SIM-27: D1 MA200 trend alignment filter. Delegates to SignalFilterPipeline."""
+        pipeline = SignalFilterPipeline.__new__(SignalFilterPipeline)
+        passed, _ = pipeline.check_d1_trend(symbol, direction, timeframe, d1_rows)
+        return passed
 
     @staticmethod
     def _check_volume_confirmation(df: pd.DataFrame) -> bool:
-        """SIM-29: Volume >= 120% of MA20 required. Graceful degradation if no volume data."""
-        if df["volume"].sum() == 0:
-            return True  # broker doesn't provide volume
-        if len(df) < 20:
-            return True  # insufficient data
-        vol_ma20 = df["volume"].rolling(20).mean().iloc[-1]
-        if pd.isna(vol_ma20) or vol_ma20 == 0:
-            return True
-        current_vol = df["volume"].iloc[-1]
-        if current_vol < vol_ma20 * 1.2:
-            logger.debug("[SIM-29] Volume %.0f < 120%% of MA20 %.0f", current_vol, vol_ma20)
-            return False
-        return True
+        """SIM-29: Volume >= 120% of MA20. Delegates to SignalFilterPipeline."""
+        pipeline = SignalFilterPipeline.__new__(SignalFilterPipeline)
+        # Pass "stocks" to avoid the forex skip — this matches original behaviour
+        # (original method had no market_type awareness; callers pass non-forex DFs).
+        passed, _ = pipeline.check_volume(df, market_type="stocks")
+        return passed
 
     @staticmethod
     def _check_momentum_alignment(ta_indicators: dict, direction: str) -> bool:
-        """SIM-30: LONG: RSI>50 AND MACD>Signal; SHORT: RSI<50 AND MACD<Signal."""
-        rsi = ta_indicators.get("rsi_14") or ta_indicators.get("rsi")
-        macd_line = ta_indicators.get("macd_line") or ta_indicators.get("macd")
-        macd_signal = ta_indicators.get("macd_signal") or ta_indicators.get("macd_signal_line")
-
-        if rsi is None or macd_line is None or macd_signal is None:
-            logger.warning("[SIM-30] Missing RSI/MACD data, skipping momentum filter")
-            return True  # graceful degradation
-
-        try:
-            rsi_f = float(rsi)
-            macd_f = float(macd_line)
-            signal_f = float(macd_signal)
-        except (TypeError, ValueError):
-            return True
-
-        logger.debug(
-            "[SIM-30] Momentum check: rsi=%.1f, macd=%.5f, signal=%.5f, direction=%s",
-            rsi_f, macd_f, signal_f, direction,
-        )
-
-        if direction == "LONG":
-            if not (rsi_f > 50 and macd_f > signal_f):
-                logger.debug(
-                    "[SIM-30] Momentum not aligned for LONG: RSI=%.1f, MACD=%.4f, Signal=%.4f",
-                    rsi_f, macd_f, signal_f,
-                )
-                return False
-        elif direction == "SHORT":
-            if not (rsi_f < 50 and macd_f < signal_f):
-                logger.debug(
-                    "[SIM-30] Momentum not aligned for SHORT: RSI=%.1f, MACD=%.4f, Signal=%.4f",
-                    rsi_f, macd_f, signal_f,
-                )
-                return False
-        return True
+        """SIM-30: Momentum alignment filter. Delegates to SignalFilterPipeline."""
+        pipeline = SignalFilterPipeline.__new__(SignalFilterPipeline)
+        passed, _ = pipeline.check_momentum(ta_indicators, direction)
+        return passed
 
     @staticmethod
     def _check_weekday_filter(ts: datetime.datetime, market_type: str) -> bool:
-        """SIM-32: Block Mon 00:00–10:00 UTC (forex/stocks) and Fri 18:00+ UTC."""
-        hour = ts.hour if ts.tzinfo else ts.replace(tzinfo=datetime.timezone.utc).hour
-        weekday = ts.weekday()  # 0=Mon, 4=Fri
-
-        # Monday gap filter (forex/stocks only)
-        if weekday == 0 and hour < WEEKDAY_FILTER["monday_block_until_utc"]:
-            if market_type == "crypto" and WEEKDAY_FILTER["crypto_exempt_monday"]:
-                return True  # crypto exempt
-            logger.debug("[SIM-32] Monday morning blocked: hour=%d, market=%s", hour, market_type)
-            return False
-
-        # Friday close filter (all markets — institutions close positions)
-        if weekday == 4 and hour >= WEEKDAY_FILTER["friday_block_from_utc"]:
-            logger.debug("[SIM-32] Friday evening blocked: hour=%d", hour)
-            return False
-
-        return True
+        """SIM-32: Weekday filter. Delegates to SignalFilterPipeline."""
+        pipeline = SignalFilterPipeline.__new__(SignalFilterPipeline)
+        passed, _ = pipeline.check_weekday(ts, market_type)
+        return passed
 
     @staticmethod
     def _check_economic_calendar(candle_ts: datetime.datetime, economic_events: list) -> bool:
-        """SIM-33: Block signals ±2 hours around HIGH-impact economic events."""
-        if not economic_events:
-            return True  # no data → passthrough
-
-        window = datetime.timedelta(hours=2)
-        for event in economic_events:
-            event_dt = getattr(event, "event_date", None) or getattr(event, "scheduled_at", None)
-            if event_dt is None:
-                continue
-            if abs((candle_ts - event_dt).total_seconds()) <= window.total_seconds():
-                return False
-        return True
-
-    # SIM-38: DXY filter — USD long-side pairs affected by DXY RSI
-    _USD_LONG_SIDE_PAIRS: frozenset[str] = frozenset({
-        "EURUSD=X", "GBPUSD=X", "AUDUSD=X", "NZDUSD=X"
-    })
+        """SIM-33: Economic calendar filter. Delegates to SignalFilterPipeline."""
+        pipeline = SignalFilterPipeline.__new__(SignalFilterPipeline)
+        passed, _ = pipeline.check_calendar(candle_ts, economic_events)
+        return passed
 
     @staticmethod
     def _check_dxy_alignment(direction: str, symbol: str, dxy_rsi: Optional[float]) -> bool:
-        """SIM-38: DXY RSI filter for forex USD pairs. No data → passthrough.
-
-        DXY RSI > 55 → USD strong → block LONG for USD long-side pairs
-        DXY RSI < 45 → USD weak → block SHORT for USD long-side pairs
-        45-55 → neutral, no filter
-        """
-        if dxy_rsi is None:
-            return True  # no DXY data → no filter
-        if symbol not in BacktestEngine._USD_LONG_SIDE_PAIRS:
-            return True  # only applies to USD long-side pairs
-        if dxy_rsi > 55 and direction == "LONG":
-            logger.debug("[SIM-38] DXY RSI=%.1f > 55: blocking LONG for %s", dxy_rsi, symbol)
-            return False
-        if dxy_rsi < 45 and direction == "SHORT":
-            logger.debug("[SIM-38] DXY RSI=%.1f < 45: blocking SHORT for %s", dxy_rsi, symbol)
-            return False
-        return True
+        """SIM-38: DXY RSI filter. Delegates to SignalFilterPipeline."""
+        pipeline = SignalFilterPipeline.__new__(SignalFilterPipeline)
+        passed, _ = pipeline.check_dxy_alignment(direction, symbol, dxy_rsi)
+        return passed
 
     def _generate_signal(
         self,
@@ -981,26 +903,20 @@ class BacktestEngine:
         symbol: str,
         market_type: str,
         timeframe: str,
-        filter_flags: dict | None = None,
     ) -> Optional[dict[str, Any]]:
         """
-        Lightweight signal generation from a DataFrame slice.
+        Lightweight raw signal generation from a DataFrame slice.
 
         Mirrors SignalEngineV2.generate() core logic:
         - ta_score via TAEngine
         - fa/sentiment/geo = 0.0 (no historical data available in backtest)
         - composite = TA weight × ta_score (neutral others)
-        - threshold: |composite| >= 10 to emit signal
 
-        LLM and DB guards are deliberately skipped (no historical context).
+        Returns the raw signal dict with ta_indicators included.
+        ALL signal-level filtering is delegated to SignalFilterPipeline.run_all()
+        in _simulate_symbol(). LLM and DB guards are deliberately skipped.
         """
         from src.analysis.ta_engine import TAEngine
-
-        ff = filter_flags or {}
-
-        # SIM-29: Volume confirmation filter (fast check before expensive TA)
-        if ff.get("volume", True) and not BacktestEngine._check_volume_confirmation(df):
-            return None
 
         try:
             ta_engine = TAEngine(df, timeframe=timeframe)
@@ -1015,26 +931,11 @@ class BacktestEngine:
 
         composite = _TA_WEIGHT * ta_score
 
-        # SIM-25: Composite score threshold
-        threshold = MIN_COMPOSITE_SCORE_CRYPTO if market_type == "crypto" else MIN_COMPOSITE_SCORE
-        # SIM-43: params override for min_composite_score
-        if ff.get("min_composite_score") is not None:
-            threshold = float(ff["min_composite_score"])
-        # SIM-28: Per-instrument override for min_composite_score (highest priority)
-        overrides = INSTRUMENT_OVERRIDES.get(symbol, {})
-        if "min_composite_score" in overrides:
-            threshold = overrides["min_composite_score"]
-        if abs(composite) < threshold:
-            logger.debug("[SIM-25/28] Score %.2f below threshold %.0f for %s", composite, threshold, symbol)
+        # composite == 0 → no clear direction, skip
+        if composite == 0:
             return None
 
         direction = "LONG" if composite > 0 else "SHORT"
-
-        # SIM-31: Minimum signal strength filter
-        signal_strength = _get_signal_strength(composite)
-        if signal_strength not in ALLOWED_SIGNAL_STRENGTHS:
-            logger.debug("[SIM-31] Filtered weak signal: %s for %s (score=%.2f)", signal_strength, symbol, composite)
-            return None
 
         regime = "DEFAULT"
         try:
@@ -1042,37 +943,20 @@ class BacktestEngine:
         except Exception as exc:
             logger.debug("[SIM-22] Regime detection error for %s: %s", symbol, exc)
 
-        # SIM-26: Block RANGING regime
-        if ff.get("ranging", True) and regime in BLOCKED_REGIMES:
-            logger.debug("[SIM-26] Skipping: %s regime for %s", regime, symbol)
-            return None
-
-        # SIM-28: Allowed regimes check (per-instrument override)
-        if ff.get("ranging", True) and "allowed_regimes" in overrides and regime not in overrides["allowed_regimes"]:
-            logger.debug("[SIM-28] Regime %s not in allowed_regimes for %s", regime, symbol)
-            return None
-
-        # SIM-27: D1 MA200 trend alignment filter (passed as kwarg when available)
-        # d1_rows is not available in this signature; callers that need it should use
-        # _check_d1_trend_alignment directly. Here we skip (no D1 data in _generate_signal).
-
-        # SIM-30: Momentum alignment filter
-        ta_indicators_for_filter: dict = {}
+        # Compute all TA indicators for pipeline (SIM-30 momentum, SIM-36 S/R)
+        ta_indicators: dict = {}
         support_levels: list[Decimal] = []
         resistance_levels: list[Decimal] = []
         try:
-            ta_indicators_for_filter = ta_engine.calculate_all_indicators()
-            # SIM-36: Extract S/R levels from TA indicators if available
-            raw_support = ta_indicators_for_filter.get("support_levels") or []
-            raw_resistance = ta_indicators_for_filter.get("resistance_levels") or []
+            ta_indicators = ta_engine.calculate_all_indicators()
+            raw_support = ta_indicators.get("support_levels") or []
+            raw_resistance = ta_indicators.get("resistance_levels") or []
             if isinstance(raw_support, list):
                 support_levels = [Decimal(str(v)) for v in raw_support if v is not None]
             if isinstance(raw_resistance, list):
                 resistance_levels = [Decimal(str(v)) for v in raw_resistance if v is not None]
         except Exception:
             pass
-        if ff.get("momentum", True) and not BacktestEngine._check_momentum_alignment(ta_indicators_for_filter, direction):
-            return None
 
         return {
             "direction": direction,
@@ -1081,6 +965,7 @@ class BacktestEngine:
             "regime": regime,
             "atr": atr,
             "position_pct": 2.0,  # fixed 2% risk per SIM-19 default
+            "ta_indicators": ta_indicators,         # passed to pipeline for SIM-30
             "support_levels": support_levels,       # SIM-36
             "resistance_levels": resistance_levels, # SIM-36
         }

@@ -1,7 +1,8 @@
 """Unified signal filter pipeline (SIM-42).
 
-Consolidates all v5 filters (SIM-25..SIM-33) into a single reusable class
-that works identically in live signal generation and backtest simulation.
+Consolidates all v5 filters (SIM-25..SIM-33, SIM-31, SIM-38) into a single
+reusable class that works identically in live signal generation and backtest
+simulation.
 """
 
 import datetime
@@ -12,6 +13,16 @@ from typing import Optional
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+# SIM-31: Allowed signal strengths (weak signals filtered out).
+# Mirrors ALLOWED_SIGNAL_STRENGTHS in backtest_engine.py.
+ALLOWED_SIGNAL_STRENGTHS: frozenset[str] = frozenset({"BUY", "STRONG_BUY", "SELL", "STRONG_SELL"})
+
+# SIM-38: USD long-side pairs affected by DXY RSI filter.
+# Mirrors BacktestEngine._USD_LONG_SIDE_PAIRS.
+_USD_LONG_SIDE_PAIRS: frozenset[str] = frozenset({
+    "EURUSD=X", "GBPUSD=X", "AUDUSD=X", "NZDUSD=X"
+})
 
 # EU/NA forex pairs blocked during Asian low-liquidity session (00:00–06:59 UTC).
 # Mirrors BacktestEngine._FOREX_PAIRS_EU_NA and SignalEngine._FOREX_PAIRS_EU_NA.
@@ -29,6 +40,35 @@ def _is_asian_session(candle_ts: datetime.datetime) -> bool:
         tzinfo=datetime.timezone.utc
     ).hour
     return _ASIAN_SESSION_UTC_START <= hour < _ASIAN_SESSION_UTC_END
+
+
+def _get_signal_strength(composite: float) -> str:
+    """Map composite score to signal strength bucket (SIM-14 score buckets).
+
+    Mirrors _get_signal_strength() in backtest_engine.py.
+
+    strong_buy:  >= +15
+    buy:          +10..+15
+    weak_buy:      +7..+10
+    neutral:       -7..+7
+    weak_sell:    -10..-7
+    sell:         -15..-10
+    strong_sell:  <= -15
+    """
+    if composite >= 15.0:
+        return "STRONG_BUY"
+    elif composite >= 10.0:
+        return "BUY"
+    elif composite >= 7.0:
+        return "WEAK_BUY"
+    elif composite <= -15.0:
+        return "STRONG_SELL"
+    elif composite <= -10.0:
+        return "SELL"
+    elif composite <= -7.0:
+        return "WEAK_SELL"
+    else:
+        return "HOLD"
 
 
 class SignalFilterPipeline:
@@ -62,6 +102,7 @@ class SignalFilterPipeline:
         apply_weekday_filter: bool = True,
         apply_calendar_filter: bool = True,
         apply_session_filter: bool = True,
+        apply_dxy_filter: bool = True,
         min_composite_score: Optional[float] = None,
     ) -> None:
         self.apply_score_filter = apply_score_filter
@@ -72,6 +113,7 @@ class SignalFilterPipeline:
         self.apply_weekday_filter = apply_weekday_filter
         self.apply_calendar_filter = apply_calendar_filter
         self.apply_session_filter = apply_session_filter
+        self.apply_dxy_filter = apply_dxy_filter
         self.min_composite_score = min_composite_score
 
     def run_all(self, context: dict) -> tuple[bool, str]:
@@ -106,6 +148,7 @@ class SignalFilterPipeline:
         candle_ts = context.get("candle_ts")
         d1_rows = context.get("d1_rows", [])
         economic_events = context.get("economic_events", [])
+        dxy_rsi = context.get("dxy_rsi")
 
         # Session filter: must run first (cheapest check)
         if self.apply_session_filter and candle_ts is not None:
@@ -116,6 +159,13 @@ class SignalFilterPipeline:
         # SIM-25: Score threshold
         if self.apply_score_filter:
             passed, reason = self.check_score_threshold(composite, market_type, symbol)
+            if not passed:
+                return False, reason
+
+        # SIM-31: Signal strength quality gate — controlled by apply_score_filter
+        # because strength is a score-based filter (extension of SIM-25 threshold).
+        if self.apply_score_filter:
+            passed, reason = self.check_signal_strength(composite, direction)
             if not passed:
                 return False, reason
 
@@ -143,6 +193,12 @@ class SignalFilterPipeline:
             if not passed:
                 return False, reason
 
+        # SIM-38: DXY alignment filter
+        if self.apply_dxy_filter:
+            passed, reason = self.check_dxy_alignment(direction, symbol, dxy_rsi)
+            if not passed:
+                return False, reason
+
         # SIM-32: Weekday filter
         if self.apply_weekday_filter and candle_ts is not None:
             passed, reason = self.check_weekday(candle_ts, market_type)
@@ -160,16 +216,24 @@ class SignalFilterPipeline:
     def check_score_threshold(
         self, composite: float, market_type: str, symbol: str
     ) -> tuple[bool, str]:
-        """SIM-25 + SIM-28: composite score must exceed threshold."""
+        """SIM-25 + SIM-28: composite score must exceed threshold.
+
+        Priority (highest to lowest):
+          1. instrument_override (INSTRUMENT_OVERRIDES[symbol])
+          2. constructor min_composite_score (self.min_composite_score)
+          3. market_default (MIN_COMPOSITE_SCORE_CRYPTO for crypto)
+          4. global_default (MIN_COMPOSITE_SCORE)
+        """
         from src.config import INSTRUMENT_OVERRIDES, MIN_COMPOSITE_SCORE, MIN_COMPOSITE_SCORE_CRYPTO
 
         threshold = MIN_COMPOSITE_SCORE_CRYPTO if market_type == "crypto" else MIN_COMPOSITE_SCORE
-        # SIM-28: per-symbol override
+        # Constructor override takes precedence over market default
+        if self.min_composite_score is not None:
+            threshold = self.min_composite_score
+        # SIM-28: per-symbol override has highest priority
         overrides = INSTRUMENT_OVERRIDES.get(symbol, {})
         if "min_composite_score" in overrides:
             threshold = overrides["min_composite_score"]
-        if self.min_composite_score is not None:
-            threshold = self.min_composite_score
         if abs(composite) < threshold:
             return False, f"score_below_threshold:{composite:.1f}<{threshold}"
         return True, "ok"
@@ -279,6 +343,43 @@ class SignalFilterPipeline:
                 continue
             if abs((candle_ts - event_dt).total_seconds()) <= window.total_seconds():
                 return False, "economic_calendar_block"
+        return True, "ok"
+
+    def check_signal_strength(self, composite: float, direction: str) -> tuple[bool, str]:
+        """SIM-31: Signal strength must be BUY/STRONG_BUY or SELL/STRONG_SELL.
+
+        This is NOT flag-controlled — it is a fundamental quality gate that
+        always runs regardless of configuration flags.
+        """
+        strength = _get_signal_strength(composite)
+        if strength not in ALLOWED_SIGNAL_STRENGTHS:
+            logger.debug(
+                "[SIM-31] Filtered weak signal: %s (score=%.2f, direction=%s)",
+                strength, composite, direction,
+            )
+            return False, f"signal_strength_weak:{strength}"
+        return True, "ok"
+
+    def check_dxy_alignment(
+        self, direction: str, symbol: str, dxy_rsi: Optional[float]
+    ) -> tuple[bool, str]:
+        """SIM-38: DXY RSI filter for forex USD long-side pairs.
+
+        DXY RSI > 55 → USD strong → block LONG for EUR/GBP/AUD/NZD vs USD.
+        DXY RSI < 45 → USD weak → block SHORT for the same pairs.
+        45–55 → neutral, no filter.
+        No DXY data → passthrough (graceful degradation).
+        """
+        if dxy_rsi is None:
+            return True, "ok"
+        if symbol not in _USD_LONG_SIDE_PAIRS:
+            return True, "ok"
+        if dxy_rsi > 55 and direction == "LONG":
+            logger.debug("[SIM-38] DXY RSI=%.1f > 55: blocking LONG for %s", dxy_rsi, symbol)
+            return False, f"dxy_strong_blocks_long:{symbol}"
+        if dxy_rsi < 45 and direction == "SHORT":
+            logger.debug("[SIM-38] DXY RSI=%.1f < 45: blocking SHORT for %s", dxy_rsi, symbol)
+            return False, f"dxy_weak_blocks_short:{symbol}"
         return True, "ok"
 
     def check_session_liquidity(

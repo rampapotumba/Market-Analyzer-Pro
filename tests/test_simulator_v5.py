@@ -126,102 +126,45 @@ def test_sim25_threshold_from_config():
 
 
 def test_sim25_score_below_threshold_rejected():
-    """Backtest: score=12 (below 15 threshold) → no signal."""
-    from src.backtesting.backtest_engine import BacktestEngine
+    """Pipeline: score=12 (below 15 threshold) → blocked by check_score_threshold."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
 
-    df = _make_forex_df()
-    engine = BacktestEngine(db=MagicMock())
-
-    with patch("src.analysis.ta_engine.TAEngine") as mock_ta_cls:
-        mock_ta = MagicMock()
-        # composite = 0.45 * 27 = 12.15 < 15
-        mock_ta.calculate_ta_score.return_value = 27.0
-        mock_ta.get_atr.return_value = Decimal("0.0010")
-        mock_ta_cls.return_value = mock_ta
-
-        with patch(
-            "src.backtesting.backtest_engine._detect_regime_from_df",
-            return_value="TREND_BULL",
-        ):
-            result = engine._generate_signal(df, "EURUSD=X", "forex", "H1")
-
-    assert result is None, f"Expected None for score below threshold, got {result}"
+    pipeline = SignalFilterPipeline()
+    # composite = 12.15 < 15 (global MIN_COMPOSITE_SCORE)
+    passed, reason = pipeline.check_score_threshold(12.15, "forex", "EURUSD=X")
+    assert not passed, f"Expected rejection for score 12.15, but got passed=True"
+    assert "score_below_threshold" in reason
 
 
 def test_sim25_score_above_threshold_accepted():
-    """Backtest: score=16 (above 15 threshold) → signal generated."""
-    from src.backtesting.backtest_engine import BacktestEngine
+    """Pipeline: score=16 (above 15 threshold) → passes check_score_threshold."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
 
-    df = _make_forex_df()
-    engine = BacktestEngine(db=MagicMock())
-
-    with patch("src.analysis.ta_engine.TAEngine") as mock_ta_cls, \
-         patch.object(BacktestEngine, "_check_volume_confirmation", return_value=True), \
-         patch.object(BacktestEngine, "_check_momentum_alignment", return_value=True):
-        mock_ta = MagicMock()
-        # composite = 0.45 * 36 = 16.2 > 15
-        mock_ta.calculate_ta_score.return_value = 36.0
-        mock_ta.get_atr.return_value = Decimal("0.0010")
-        mock_ta_cls.return_value = mock_ta
-
-        with patch(
-            "src.backtesting.backtest_engine._detect_regime_from_df",
-            return_value="TREND_BULL",
-        ):
-            result = engine._generate_signal(df, "EURUSD=X", "forex", "H1")
-
-    assert result is not None, "Expected signal for score above threshold"
-    assert result["direction"] == "LONG"
+    pipeline = SignalFilterPipeline()
+    # composite = 16.2 > 15 (global MIN_COMPOSITE_SCORE)
+    passed, reason = pipeline.check_score_threshold(16.2, "forex", "EURUSD=X")
+    assert passed, f"Expected pass for score 16.2, but got reason={reason}"
 
 
 def test_sim25_crypto_higher_threshold_rejected():
-    """Crypto score=17 → rejected (needs 20)."""
-    from src.backtesting.backtest_engine import BacktestEngine
+    """Pipeline: crypto score=17 → blocked (needs 20 for BTC/USDT override)."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
 
-    df = _make_crypto_df()
-    engine = BacktestEngine(db=MagicMock())
-
-    # 0.45 * 38 = 17.1 < 20 (crypto threshold)
-    with patch("src.analysis.ta_engine.TAEngine") as mock_ta_cls:
-        mock_ta = MagicMock()
-        mock_ta.calculate_ta_score.return_value = 38.0
-        mock_ta.get_atr.return_value = Decimal("100.0")
-        mock_ta_cls.return_value = mock_ta
-
-        with patch(
-            "src.backtesting.backtest_engine._detect_regime_from_df",
-            return_value="STRONG_TREND_BULL",
-        ):
-            result = engine._generate_signal(df, "BTC/USDT", "crypto", "H1")
-
-    # BTC/USDT has override min_composite_score=20 in INSTRUMENT_OVERRIDES
-    # so it uses 20 regardless. 17.1 < 20 → rejected.
-    assert result is None, "Crypto score 17 should be rejected (threshold=20)"
+    pipeline = SignalFilterPipeline()
+    # BTC/USDT has override min_composite_score=20. 17.1 < 20 → rejected.
+    passed, reason = pipeline.check_score_threshold(17.1, "crypto", "BTC/USDT")
+    assert not passed, "Crypto score 17 should be rejected (BTC/USDT override threshold=20)"
+    assert "score_below_threshold" in reason
 
 
 def test_sim25_crypto_score_accepted():
-    """Crypto score=46 → accepted (above threshold=20)."""
-    from src.backtesting.backtest_engine import BacktestEngine
+    """Pipeline: crypto score=46 → passes (above BTC/USDT override threshold=20)."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
 
-    df = _make_crypto_df()
-    engine = BacktestEngine(db=MagicMock())
-
-    # 0.45 * 103 ≈ 46.4 > 20
-    with patch("src.analysis.ta_engine.TAEngine") as mock_ta_cls, \
-         patch.object(BacktestEngine, "_check_volume_confirmation", return_value=True), \
-         patch.object(BacktestEngine, "_check_momentum_alignment", return_value=True):
-        mock_ta = MagicMock()
-        mock_ta.calculate_ta_score.return_value = 103.0
-        mock_ta.get_atr.return_value = Decimal("100.0")
-        mock_ta_cls.return_value = mock_ta
-
-        with patch(
-            "src.backtesting.backtest_engine._detect_regime_from_df",
-            return_value="STRONG_TREND_BULL",
-        ):
-            result = engine._generate_signal(df, "BTC/USDT", "crypto", "H1")
-
-    assert result is not None, "Crypto score 46 should be accepted (threshold=20)"
+    pipeline = SignalFilterPipeline()
+    # 46.35 > 20 (BTC/USDT override threshold)
+    passed, reason = pipeline.check_score_threshold(46.35, "crypto", "BTC/USDT")
+    assert passed, f"Crypto score 46 should be accepted (threshold=20), got reason={reason}"
 
 
 # ── SIM-26: RANGING Regime Block ──────────────────────────────────────────────
@@ -236,79 +179,34 @@ def test_sim26_blocked_regimes_configurable():
 
 
 def test_sim26_ranging_blocked():
-    """Backtest: RANGING regime → signal blocked."""
-    from src.backtesting.backtest_engine import BacktestEngine
+    """Pipeline: RANGING regime → blocked by check_regime."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
 
-    df = _make_forex_df()
-    engine = BacktestEngine(db=MagicMock())
-
-    with patch("src.analysis.ta_engine.TAEngine") as mock_ta_cls:
-        mock_ta = MagicMock()
-        # composite = 0.45 * 40 = 18 > 15
-        mock_ta.calculate_ta_score.return_value = 40.0
-        mock_ta.get_atr.return_value = Decimal("0.0010")
-        mock_ta_cls.return_value = mock_ta
-
-        with patch(
-            "src.backtesting.backtest_engine._detect_regime_from_df",
-            return_value="RANGING",
-        ):
-            result = engine._generate_signal(df, "EURUSD=X", "forex", "H1")
-
-    assert result is None, "RANGING regime should block signal"
+    pipeline = SignalFilterPipeline()
+    passed, reason = pipeline.check_regime("RANGING", "EURUSD=X")
+    assert not passed, "RANGING regime should block signal"
+    assert "regime_blocked" in reason
 
 
 def test_sim26_trend_bull_allowed():
-    """TREND_BULL regime → signal allowed."""
-    from src.backtesting.backtest_engine import BacktestEngine
+    """Pipeline: TREND_BULL regime → allowed by check_regime."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
 
-    df = _make_forex_df()
-    engine = BacktestEngine(db=MagicMock())
-
-    with patch("src.analysis.ta_engine.TAEngine") as mock_ta_cls, \
-         patch.object(BacktestEngine, "_check_volume_confirmation", return_value=True), \
-         patch.object(BacktestEngine, "_check_momentum_alignment", return_value=True):
-        mock_ta = MagicMock()
-        # composite = 0.45 * 40 = 18 > 15
-        mock_ta.calculate_ta_score.return_value = 40.0
-        mock_ta.get_atr.return_value = Decimal("0.0010")
-        mock_ta_cls.return_value = mock_ta
-
-        with patch(
-            "src.backtesting.backtest_engine._detect_regime_from_df",
-            return_value="TREND_BULL",
-        ):
-            result = engine._generate_signal(df, "EURUSD=X", "forex", "H1")
-
-    assert result is not None, "TREND_BULL regime should allow signal"
+    pipeline = SignalFilterPipeline()
+    passed, reason = pipeline.check_regime("TREND_BULL", "EURUSD=X")
+    assert passed, f"TREND_BULL regime should allow signal, got reason={reason}"
 
 
 def test_sim26_volatile_allowed():
-    """VOLATILE regime → signal allowed (not in BLOCKED_REGIMES)."""
-    from src.backtesting.backtest_engine import BacktestEngine
+    """Pipeline: VOLATILE regime → allowed (not in BLOCKED_REGIMES)."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
     from src.config import BLOCKED_REGIMES
 
     assert "VOLATILE" not in BLOCKED_REGIMES
 
-    df = _make_forex_df()
-    engine = BacktestEngine(db=MagicMock())
-
-    with patch("src.analysis.ta_engine.TAEngine") as mock_ta_cls, \
-         patch.object(BacktestEngine, "_check_volume_confirmation", return_value=True), \
-         patch.object(BacktestEngine, "_check_momentum_alignment", return_value=True):
-        mock_ta = MagicMock()
-        # composite = 0.45 * 40 = 18 > 15
-        mock_ta.calculate_ta_score.return_value = 40.0
-        mock_ta.get_atr.return_value = Decimal("0.0010")
-        mock_ta_cls.return_value = mock_ta
-
-        with patch(
-            "src.backtesting.backtest_engine._detect_regime_from_df",
-            return_value="VOLATILE",
-        ):
-            result = engine._generate_signal(df, "EURUSD=X", "forex", "H1")
-
-    assert result is not None, "VOLATILE regime should allow signal"
+    pipeline = SignalFilterPipeline()
+    passed, reason = pipeline.check_regime("VOLATILE", "EURUSD=X")
+    assert passed, f"VOLATILE regime should allow signal, got reason={reason}"
 
 
 # ── SIM-28: Instrument Overrides ──────────────────────────────────────────────
@@ -340,122 +238,59 @@ def test_sim28_btc_wider_sl():
 
 
 def test_sim28_btc_higher_threshold():
-    """BTC/USDT: composite=17 rejected (override threshold=20)."""
-    from src.backtesting.backtest_engine import BacktestEngine
+    """Pipeline: BTC/USDT composite=17 → blocked by score filter (override threshold=20)."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
 
-    df = _make_crypto_df()
-    engine = BacktestEngine(db=MagicMock())
-
-    # 0.45 * 38 = 17.1 < override threshold 20
-    with patch("src.analysis.ta_engine.TAEngine") as mock_ta_cls:
-        mock_ta = MagicMock()
-        mock_ta.calculate_ta_score.return_value = 38.0
-        mock_ta.get_atr.return_value = Decimal("100.0")
-        mock_ta_cls.return_value = mock_ta
-
-        with patch(
-            "src.backtesting.backtest_engine._detect_regime_from_df",
-            return_value="STRONG_TREND_BULL",
-        ):
-            result = engine._generate_signal(df, "BTC/USDT", "crypto", "H1")
-
-    assert result is None, "BTC score 17 should be rejected (override threshold=20)"
+    pipeline = SignalFilterPipeline()
+    # 17.1 < 20 (BTC/USDT instrument override)
+    passed, reason = pipeline.check_score_threshold(17.1, "crypto", "BTC/USDT")
+    assert not passed, "BTC score 17 should be rejected (override threshold=20)"
+    assert "score_below_threshold" in reason
 
 
 def test_sim28_btc_only_strong_trend():
-    """BTC/USDT: TREND_BULL regime → blocked (only STRONG_TREND_BULL/BEAR allowed)."""
-    from src.backtesting.backtest_engine import BacktestEngine
+    """Pipeline: BTC/USDT TREND_BULL regime → blocked (only STRONG_TREND_BULL/BEAR allowed)."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
 
-    df = _make_crypto_df()
-    engine = BacktestEngine(db=MagicMock())
-
-    # Score high enough (0.45 * 103 ≈ 46 > 20), but TREND_BULL not in allowed_regimes
-    with patch("src.analysis.ta_engine.TAEngine") as mock_ta_cls:
-        mock_ta = MagicMock()
-        mock_ta.calculate_ta_score.return_value = 103.0
-        mock_ta.get_atr.return_value = Decimal("100.0")
-        mock_ta_cls.return_value = mock_ta
-
-        with patch(
-            "src.backtesting.backtest_engine._detect_regime_from_df",
-            return_value="TREND_BULL",
-        ):
-            result = engine._generate_signal(df, "BTC/USDT", "crypto", "H1")
-
-    assert result is None, "BTC TREND_BULL should be blocked (only STRONG_TREND allowed)"
+    pipeline = SignalFilterPipeline()
+    # Score is fine (46 > 20), but TREND_BULL not in allowed_regimes for BTC/USDT
+    passed, reason = pipeline.check_regime("TREND_BULL", "BTC/USDT")
+    assert not passed, "BTC TREND_BULL should be blocked (only STRONG_TREND allowed)"
+    assert "regime_not_in_allowed" in reason
 
 
 def test_sim28_btc_strong_trend_allowed():
-    """BTC/USDT: STRONG_TREND_BULL regime with score > 20 → allowed."""
-    from src.backtesting.backtest_engine import BacktestEngine
+    """Pipeline: BTC/USDT STRONG_TREND_BULL + score > 20 → both filters pass."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
 
-    df = _make_crypto_df()
-    engine = BacktestEngine(db=MagicMock())
-
-    # 0.45 * 103 ≈ 46 > 20, STRONG_TREND_BULL is in allowed_regimes
-    with patch("src.analysis.ta_engine.TAEngine") as mock_ta_cls, \
-         patch.object(BacktestEngine, "_check_volume_confirmation", return_value=True), \
-         patch.object(BacktestEngine, "_check_momentum_alignment", return_value=True):
-        mock_ta = MagicMock()
-        mock_ta.calculate_ta_score.return_value = 103.0
-        mock_ta.get_atr.return_value = Decimal("100.0")
-        mock_ta_cls.return_value = mock_ta
-
-        with patch(
-            "src.backtesting.backtest_engine._detect_regime_from_df",
-            return_value="STRONG_TREND_BULL",
-        ):
-            result = engine._generate_signal(df, "BTC/USDT", "crypto", "H1")
-
-    assert result is not None, "BTC STRONG_TREND_BULL with score>20 should be allowed"
+    pipeline = SignalFilterPipeline()
+    # Score check: 46.35 > 20 (override threshold)
+    score_passed, _ = pipeline.check_score_threshold(46.35, "crypto", "BTC/USDT")
+    assert score_passed, "BTC score 46 should pass score threshold"
+    # Regime check: STRONG_TREND_BULL is in allowed_regimes
+    regime_passed, _ = pipeline.check_regime("STRONG_TREND_BULL", "BTC/USDT")
+    assert regime_passed, "BTC STRONG_TREND_BULL should pass regime filter"
 
 
 def test_sim28_gbpusd_higher_threshold():
-    """GBPUSD: score=17 (< override 20) → rejected."""
-    from src.backtesting.backtest_engine import BacktestEngine
+    """Pipeline: GBPUSD score=17 → blocked (override threshold=20)."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
 
-    df = _make_forex_df()
-    engine = BacktestEngine(db=MagicMock())
-
-    # 0.45 * 38 = 17.1 < override threshold 20 for GBPUSD=X
-    with patch("src.analysis.ta_engine.TAEngine") as mock_ta_cls:
-        mock_ta = MagicMock()
-        mock_ta.calculate_ta_score.return_value = 38.0
-        mock_ta.get_atr.return_value = Decimal("0.0010")
-        mock_ta_cls.return_value = mock_ta
-
-        with patch(
-            "src.backtesting.backtest_engine._detect_regime_from_df",
-            return_value="TREND_BULL",
-        ):
-            result = engine._generate_signal(df, "GBPUSD=X", "forex", "H1")
-
-    assert result is None, "GBPUSD score 17 should be rejected (override threshold=20)"
+    pipeline = SignalFilterPipeline()
+    # 17.1 < 20 (GBPUSD=X instrument override)
+    passed, reason = pipeline.check_score_threshold(17.1, "forex", "GBPUSD=X")
+    assert not passed, "GBPUSD score 17 should be rejected (override threshold=20)"
+    assert "score_below_threshold" in reason
 
 
 def test_sim28_gbpusd_score_above_override_accepted():
-    """GBPUSD: score=21 (> override 20) → accepted."""
-    from src.backtesting.backtest_engine import BacktestEngine
+    """Pipeline: GBPUSD score=21 → passes (above override threshold=20)."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
 
-    df = _make_forex_df()
-    engine = BacktestEngine(db=MagicMock())
-
-    # 0.45 * 47 = 21.15 > override threshold 20 for GBPUSD=X
-    with patch("src.analysis.ta_engine.TAEngine") as mock_ta_cls, \
-         patch.object(BacktestEngine, "_check_volume_confirmation", return_value=True), \
-         patch.object(BacktestEngine, "_check_momentum_alignment", return_value=True):
-        mock_ta = MagicMock()
-        mock_ta.calculate_ta_score.return_value = 47.0
-        mock_ta.get_atr.return_value = Decimal("0.0010")
-        mock_ta_cls.return_value = mock_ta
-
-        with patch(
-            "src.backtesting.backtest_engine._detect_regime_from_df",
-            return_value="TREND_BULL",
-        ):
-            result = engine._generate_signal(df, "GBPUSD=X", "forex", "H1")
-
-    assert result is not None, "GBPUSD score 21 should be accepted (override threshold=20)"
+    pipeline = SignalFilterPipeline()
+    # 21.15 > 20 (GBPUSD=X instrument override)
+    passed, reason = pipeline.check_score_threshold(21.15, "forex", "GBPUSD=X")
+    assert passed, f"GBPUSD score 21 should be accepted (override threshold=20), got reason={reason}"
 
 
 # ── SIM-27: D1 MA200 Trend Filter ─────────────────────────────────────────────
