@@ -25,6 +25,7 @@ class BacktestParams(BaseModel):
     apply_weekday_filter: bool = True
     apply_momentum_filter: bool = True
     apply_calendar_filter: bool = True
+    apply_session_filter: bool = True
     min_composite_score: Optional[float] = None  # None = use global config
 
     @field_validator("symbols")

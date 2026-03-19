@@ -558,6 +558,15 @@ class BacktestEngine:
                 apply_slippage=params.apply_slippage,
                 progress_cb=_progress_cb,
                 economic_events=economic_events,
+                filter_flags={
+                    "ranging": params.apply_ranging_filter,
+                    "d1_trend": params.apply_d1_trend_filter,
+                    "volume": params.apply_volume_filter,
+                    "weekday": params.apply_weekday_filter,
+                    "momentum": params.apply_momentum_filter,
+                    "calendar": params.apply_calendar_filter,
+                    "min_composite_score": params.min_composite_score,
+                },
             )
             trades.extend(symbol_trades)
 
@@ -577,6 +586,7 @@ class BacktestEngine:
         apply_slippage: bool,
         progress_cb: Any = None,
         economic_events: list | None = None,
+        filter_flags: dict | None = None,
     ) -> list[BacktestTradeResult]:
         """Simulate one symbol over all its candles. Returns closed trades.
 
@@ -642,11 +652,12 @@ class BacktestEngine:
                     continue
 
             # SIM-32: Weekday filter
-            if not BacktestEngine._check_weekday_filter(candle_ts, market_type):
+            ff = filter_flags or {}
+            if ff.get("weekday", True) and not BacktestEngine._check_weekday_filter(candle_ts, market_type):
                 continue
 
             # SIM-33: Economic calendar filter
-            if not BacktestEngine._check_economic_calendar(candle_ts, economic_events or []):
+            if ff.get("calendar", True) and not BacktestEngine._check_economic_calendar(candle_ts, economic_events or []):
                 continue
 
             # Cooldown filter: mirror SignalEngine cooldown per timeframe
@@ -655,7 +666,7 @@ class BacktestEngine:
                 if elapsed < cooldown_minutes:
                     continue
 
-            signal = self._generate_signal(df, symbol, market_type, timeframe)
+            signal = self._generate_signal(df, symbol, market_type, timeframe, filter_flags=ff)
             if signal is None:
                 continue
 
@@ -689,6 +700,7 @@ class BacktestEngine:
                 "position_pct": signal["position_pct"],
                 "mfe": 0.0,
                 "mae": 0.0,
+                "regime": signal["regime"],
             }
             # Skip to next candle
             i += 1
@@ -726,6 +738,7 @@ class BacktestEngine:
                 duration_minutes=dur,
                 mfe=Decimal(str(round(open_trade["mfe"], 8))),
                 mae=Decimal(str(round(open_trade["mae"], 8))),
+                regime=open_trade.get("regime"),
             ))
 
         return trades
@@ -801,6 +814,7 @@ class BacktestEngine:
             duration_minutes=dur,
             mfe=Decimal(str(round(open_trade["mfe"], 8))),
             mae=Decimal(str(round(open_trade["mae"], 8))),
+            regime=open_trade.get("regime"),
         )
 
     @staticmethod
@@ -879,6 +893,11 @@ class BacktestEngine:
             signal_f = float(macd_signal)
         except (TypeError, ValueError):
             return True
+
+        logger.debug(
+            "[SIM-30] Momentum check: rsi=%.1f, macd=%.5f, signal=%.5f, direction=%s",
+            rsi_f, macd_f, signal_f, direction,
+        )
 
         if direction == "LONG":
             if not (rsi_f > 50 and macd_f > signal_f):
@@ -962,6 +981,7 @@ class BacktestEngine:
         symbol: str,
         market_type: str,
         timeframe: str,
+        filter_flags: dict | None = None,
     ) -> Optional[dict[str, Any]]:
         """
         Lightweight signal generation from a DataFrame slice.
@@ -976,8 +996,10 @@ class BacktestEngine:
         """
         from src.analysis.ta_engine import TAEngine
 
+        ff = filter_flags or {}
+
         # SIM-29: Volume confirmation filter (fast check before expensive TA)
-        if not BacktestEngine._check_volume_confirmation(df):
+        if ff.get("volume", True) and not BacktestEngine._check_volume_confirmation(df):
             return None
 
         try:
@@ -995,7 +1017,10 @@ class BacktestEngine:
 
         # SIM-25: Composite score threshold
         threshold = MIN_COMPOSITE_SCORE_CRYPTO if market_type == "crypto" else MIN_COMPOSITE_SCORE
-        # SIM-28: Per-instrument override for min_composite_score
+        # SIM-43: params override for min_composite_score
+        if ff.get("min_composite_score") is not None:
+            threshold = float(ff["min_composite_score"])
+        # SIM-28: Per-instrument override for min_composite_score (highest priority)
         overrides = INSTRUMENT_OVERRIDES.get(symbol, {})
         if "min_composite_score" in overrides:
             threshold = overrides["min_composite_score"]
@@ -1018,12 +1043,12 @@ class BacktestEngine:
             logger.debug("[SIM-22] Regime detection error for %s: %s", symbol, exc)
 
         # SIM-26: Block RANGING regime
-        if regime in BLOCKED_REGIMES:
+        if ff.get("ranging", True) and regime in BLOCKED_REGIMES:
             logger.debug("[SIM-26] Skipping: %s regime for %s", regime, symbol)
             return None
 
         # SIM-28: Allowed regimes check (per-instrument override)
-        if "allowed_regimes" in overrides and regime not in overrides["allowed_regimes"]:
+        if ff.get("ranging", True) and "allowed_regimes" in overrides and regime not in overrides["allowed_regimes"]:
             logger.debug("[SIM-28] Regime %s not in allowed_regimes for %s", regime, symbol)
             return None
 
@@ -1046,7 +1071,7 @@ class BacktestEngine:
                 resistance_levels = [Decimal(str(v)) for v in raw_resistance if v is not None]
         except Exception:
             pass
-        if not BacktestEngine._check_momentum_alignment(ta_indicators_for_filter, direction):
+        if ff.get("momentum", True) and not BacktestEngine._check_momentum_alignment(ta_indicators_for_filter, direction):
             return None
 
         return {

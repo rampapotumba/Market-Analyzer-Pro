@@ -13,6 +13,23 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+# EU/NA forex pairs blocked during Asian low-liquidity session (00:00–06:59 UTC).
+# Mirrors BacktestEngine._FOREX_PAIRS_EU_NA and SignalEngine._FOREX_PAIRS_EU_NA.
+_FOREX_PAIRS_EU_NA: frozenset[str] = frozenset({
+    "EURUSD=X", "GBPUSD=X", "USDCHF=X", "EURGBP=X",
+    "EURCAD=X", "GBPCAD=X", "EURCHF=X", "GBPCHF=X",
+})
+_ASIAN_SESSION_UTC_START = 0   # 00:00 UTC inclusive
+_ASIAN_SESSION_UTC_END   = 7   # 07:00 UTC exclusive
+
+
+def _is_asian_session(candle_ts: datetime.datetime) -> bool:
+    """Return True if candle timestamp falls in low-liquidity Asian hours (UTC)."""
+    hour = candle_ts.hour if candle_ts.tzinfo else candle_ts.replace(
+        tzinfo=datetime.timezone.utc
+    ).hour
+    return _ASIAN_SESSION_UTC_START <= hour < _ASIAN_SESSION_UTC_END
+
 
 class SignalFilterPipeline:
     """
@@ -44,6 +61,7 @@ class SignalFilterPipeline:
         apply_momentum_filter: bool = True,
         apply_weekday_filter: bool = True,
         apply_calendar_filter: bool = True,
+        apply_session_filter: bool = True,
         min_composite_score: Optional[float] = None,
     ) -> None:
         self.apply_score_filter = apply_score_filter
@@ -53,6 +71,7 @@ class SignalFilterPipeline:
         self.apply_momentum_filter = apply_momentum_filter
         self.apply_weekday_filter = apply_weekday_filter
         self.apply_calendar_filter = apply_calendar_filter
+        self.apply_session_filter = apply_session_filter
         self.min_composite_score = min_composite_score
 
     def run_all(self, context: dict) -> tuple[bool, str]:
@@ -88,6 +107,12 @@ class SignalFilterPipeline:
         d1_rows = context.get("d1_rows", [])
         economic_events = context.get("economic_events", [])
 
+        # Session filter: must run first (cheapest check)
+        if self.apply_session_filter and candle_ts is not None:
+            passed, reason = self.check_session_liquidity(candle_ts, symbol, market_type)
+            if not passed:
+                return False, reason
+
         # SIM-25: Score threshold
         if self.apply_score_filter:
             passed, reason = self.check_score_threshold(composite, market_type, symbol)
@@ -108,7 +133,7 @@ class SignalFilterPipeline:
 
         # SIM-29: Volume confirmation
         if self.apply_volume_filter and df is not None:
-            passed, reason = self.check_volume(df)
+            passed, reason = self.check_volume(df, market_type)
             if not passed:
                 return False, reason
 
@@ -184,8 +209,16 @@ class SignalFilterPipeline:
             return False, f"d1_bullish_trend:close={current_close:.5f}>ma200={ma200:.5f}"
         return True, "ok"
 
-    def check_volume(self, df: pd.DataFrame) -> tuple[bool, str]:
-        """SIM-29: Volume >= 120% of MA20."""
+    def check_volume(self, df: pd.DataFrame, market_type: str = "forex") -> tuple[bool, str]:
+        """SIM-29: Volume >= 120% of MA20.
+
+        Known limitation: yfinance does not provide volume data for forex pairs
+        (all values are 0). The filter is explicitly skipped for forex to avoid
+        false positives. It remains active for stocks and crypto.
+        """
+        if market_type == "forex":
+            logger.debug("[SIM-29] Volume filter skipped for forex (no volume data from provider)")
+            return True, "ok"
         if df["volume"].sum() == 0:
             return True, "ok"
         if len(df) < 20:
@@ -209,6 +242,10 @@ class SignalFilterPipeline:
             rsi_f, macd_f, sig_f = float(rsi), float(macd_line), float(macd_signal)
         except (TypeError, ValueError):
             return True, "ok"
+        logger.debug(
+            "[SIM-30] Momentum check: rsi=%.1f, macd=%.5f, signal=%.5f, direction=%s",
+            rsi_f, macd_f, sig_f, direction,
+        )
         if direction == "LONG" and not (rsi_f > 50 and macd_f > sig_f):
             return False, f"momentum_misaligned_long:rsi={rsi_f:.1f},macd_diff={macd_f - sig_f:.5f}"
         if direction == "SHORT" and not (rsi_f < 50 and macd_f < sig_f):
@@ -242,4 +279,22 @@ class SignalFilterPipeline:
                 continue
             if abs((candle_ts - event_dt).total_seconds()) <= window.total_seconds():
                 return False, "economic_calendar_block"
+        return True, "ok"
+
+    def check_session_liquidity(
+        self,
+        candle_ts: datetime.datetime,
+        symbol: str,
+        market_type: str,
+    ) -> tuple[bool, str]:
+        """Block EU/NA forex pairs during Asian session (00:00–06:59 UTC).
+
+        Non-forex instruments and non-EU/NA pairs are always allowed.
+        """
+        if market_type != "forex":
+            return True, "ok"
+        if symbol not in _FOREX_PAIRS_EU_NA:
+            return True, "ok"
+        if _is_asian_session(candle_ts):
+            return False, f"asian_session_block:{symbol}"
         return True, "ok"

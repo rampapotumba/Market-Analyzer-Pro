@@ -1726,3 +1726,271 @@ def test_sim44_avg_duration_by_result():
     summary = _compute_summary(trades, Decimal("1000"))
     assert summary["avg_win_duration_minutes"] == 120.0
     assert summary["avg_loss_duration_minutes"] == 60.0
+
+
+# ── Task 1: Regime field in BacktestTradeResult ────────────────────────────────
+
+
+def test_regime_recorded_in_trade_result():
+    """BacktestTradeResult.regime is populated from open_trade, not None or UNKNOWN."""
+    from src.backtesting.backtest_params import BacktestTradeResult
+    from decimal import Decimal
+    import datetime
+
+    # Simulate open_trade dict as constructed in _simulate_symbol
+    open_trade = {
+        "symbol": "EURUSD=X",
+        "timeframe": "H1",
+        "direction": "LONG",
+        "entry_price": Decimal("1.1000"),
+        "entry_at": datetime.datetime(2024, 3, 6, 10, 0, tzinfo=datetime.timezone.utc),
+        "stop_loss": Decimal("1.0950"),
+        "take_profit": Decimal("1.1100"),
+        "composite_score": Decimal("18.0"),
+        "position_pct": 2.0,
+        "mfe": 0.0,
+        "mae": 0.0,
+        "regime": "TREND_BULL",
+    }
+
+    trade = BacktestTradeResult(
+        symbol=open_trade["symbol"],
+        timeframe=open_trade["timeframe"],
+        direction=open_trade["direction"],
+        entry_price=open_trade["entry_price"],
+        exit_price=Decimal("1.1100"),
+        exit_reason="tp_hit",
+        pnl_usd=Decimal("10.0"),
+        result="win",
+        composite_score=open_trade.get("composite_score"),
+        entry_at=open_trade["entry_at"],
+        exit_at=datetime.datetime(2024, 3, 6, 14, 0, tzinfo=datetime.timezone.utc),
+        duration_minutes=240,
+        mfe=Decimal("0.01"),
+        mae=Decimal("0.001"),
+        regime=open_trade.get("regime"),
+    )
+
+    assert trade.regime is not None, "regime must not be None"
+    assert trade.regime != "UNKNOWN", "regime must not be UNKNOWN"
+    assert trade.regime == "TREND_BULL"
+
+
+# ── Task 2: Momentum filter debug logging ─────────────────────────────────────
+
+
+def test_momentum_filter_blocks_misaligned():
+    """LONG with RSI=40 (< 50) and MACD < Signal → filter returns False."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
+
+    pipeline = SignalFilterPipeline()
+    indicators = {"rsi": 40.0, "macd": -0.001, "macd_signal": 0.0005}
+    passed, reason = pipeline.check_momentum(indicators, "LONG")
+    assert passed is False
+    assert "momentum_misaligned" in reason
+
+
+def test_momentum_filter_passes_aligned():
+    """LONG with RSI=60 (> 50) and MACD > Signal → filter returns True."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
+
+    pipeline = SignalFilterPipeline()
+    indicators = {"rsi": 60.0, "macd": 0.002, "macd_signal": 0.0005}
+    passed, reason = pipeline.check_momentum(indicators, "LONG")
+    assert passed is True
+    assert reason == "ok"
+
+
+# ── Task 3: Session filter in SignalFilterPipeline ────────────────────────────
+
+
+def test_session_filter_blocks_eurusd_asian():
+    """EURUSD at 03:00 UTC (Asian session) → blocked."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
+
+    pipeline = SignalFilterPipeline()
+    candle_ts = datetime.datetime(2024, 3, 6, 3, 0, tzinfo=datetime.timezone.utc)
+    passed, reason = pipeline.check_session_liquidity(candle_ts, "EURUSD=X", "forex")
+    assert passed is False
+    assert "asian_session_block" in reason
+    assert "EURUSD=X" in reason
+
+
+def test_session_filter_passes_eurusd_london():
+    """EURUSD at 10:00 UTC (London session) → allowed."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
+
+    pipeline = SignalFilterPipeline()
+    candle_ts = datetime.datetime(2024, 3, 6, 10, 0, tzinfo=datetime.timezone.utc)
+    passed, reason = pipeline.check_session_liquidity(candle_ts, "EURUSD=X", "forex")
+    assert passed is True
+    assert reason == "ok"
+
+
+def test_session_filter_passes_crypto():
+    """BTC/USDT at 03:00 UTC → allowed (not forex)."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
+
+    pipeline = SignalFilterPipeline()
+    candle_ts = datetime.datetime(2024, 3, 6, 3, 0, tzinfo=datetime.timezone.utc)
+    passed, reason = pipeline.check_session_liquidity(candle_ts, "BTC/USDT", "crypto")
+    assert passed is True
+    assert reason == "ok"
+
+
+def test_session_filter_disabled_allows_eurusd_asian():
+    """apply_session_filter=False → EURUSD at 03:00 UTC passes run_all."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
+
+    pipeline = SignalFilterPipeline(
+        apply_session_filter=False,
+        apply_score_filter=False,
+        apply_regime_filter=False,
+        apply_d1_trend_filter=False,
+        apply_volume_filter=False,
+        apply_momentum_filter=False,
+        apply_weekday_filter=False,
+        apply_calendar_filter=False,
+    )
+    ctx = {
+        "composite_score": 20.0,
+        "market_type": "forex",
+        "symbol": "EURUSD=X",
+        "regime": "TREND_BULL",
+        "direction": "LONG",
+        "timeframe": "H1",
+        "df": None,
+        "ta_indicators": {},
+        "candle_ts": datetime.datetime(2024, 3, 6, 3, 0, tzinfo=datetime.timezone.utc),
+        "d1_rows": [],
+        "economic_events": [],
+    }
+    passed, reason = pipeline.run_all(ctx)
+    assert passed is True
+
+
+def test_session_filter_blocks_in_run_all():
+    """Session filter fires in run_all() for EURUSD at 03:00 UTC (before other filters)."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
+
+    pipeline = SignalFilterPipeline(
+        apply_score_filter=False,
+        apply_regime_filter=False,
+        apply_d1_trend_filter=False,
+        apply_volume_filter=False,
+        apply_momentum_filter=False,
+        apply_weekday_filter=False,
+        apply_calendar_filter=False,
+        apply_session_filter=True,
+    )
+    ctx = {
+        "composite_score": 20.0,
+        "market_type": "forex",
+        "symbol": "EURUSD=X",
+        "regime": "TREND_BULL",
+        "direction": "LONG",
+        "timeframe": "H1",
+        "df": None,
+        "ta_indicators": {},
+        "candle_ts": datetime.datetime(2024, 3, 6, 3, 0, tzinfo=datetime.timezone.utc),
+        "d1_rows": [],
+        "economic_events": [],
+    }
+    passed, reason = pipeline.run_all(ctx)
+    assert passed is False
+    assert "asian_session_block" in reason
+
+
+def test_backtest_params_has_session_filter():
+    """BacktestParams.apply_session_filter exists and defaults to True."""
+    from src.backtesting.backtest_params import BacktestParams
+
+    params = BacktestParams(
+        symbols=["EURUSD=X"],
+        start_date="2024-01-01",
+        end_date="2024-06-01",
+    )
+    assert params.apply_session_filter is True
+
+    params_off = BacktestParams(
+        symbols=["EURUSD=X"],
+        start_date="2024-01-01",
+        end_date="2024-06-01",
+        apply_session_filter=False,
+    )
+    assert params_off.apply_session_filter is False
+
+
+# ── Task 5: Volume filter explicit skip for forex ─────────────────────────────
+
+
+def test_volume_filter_skipped_for_forex():
+    """market_type=forex → volume filter always returns True regardless of volume data."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
+
+    pipeline = SignalFilterPipeline()
+    # Create df with low volume that would normally block the signal
+    n = 30
+    volume = np.ones(n) * 100.0
+    volume[-1] = 50.0  # 50% of MA20 — would block for stocks/crypto
+    idx = pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC")
+    df = pd.DataFrame(
+        {"open": 1.1, "high": 1.11, "low": 1.09, "close": 1.10, "volume": volume},
+        index=idx,
+    )
+    passed, reason = pipeline.check_volume(df, market_type="forex")
+    assert passed is True
+    assert reason == "ok"
+
+
+def test_volume_filter_active_for_stocks():
+    """market_type=stocks, low volume → filter blocks signal."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
+
+    pipeline = SignalFilterPipeline()
+    n = 30
+    volume = np.ones(n) * 100.0
+    volume[-1] = 80.0  # 80% of MA20 — below 120% threshold
+    idx = pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC")
+    df = pd.DataFrame(
+        {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": volume},
+        index=idx,
+    )
+    passed, reason = pipeline.check_volume(df, market_type="stocks")
+    assert passed is False
+    assert "volume_low" in reason
+
+
+def test_volume_filter_active_for_crypto():
+    """market_type=crypto, low volume → filter blocks signal."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
+
+    pipeline = SignalFilterPipeline()
+    n = 30
+    volume = np.ones(n) * 100.0
+    volume[-1] = 80.0  # below 120% threshold
+    idx = pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC")
+    df = pd.DataFrame(
+        {"open": 50000.0, "high": 50100.0, "low": 49900.0, "close": 50000.0, "volume": volume},
+        index=idx,
+    )
+    passed, reason = pipeline.check_volume(df, market_type="crypto")
+    assert passed is False
+    assert "volume_low" in reason
+
+
+def test_volume_filter_forex_high_volume_still_passes():
+    """market_type=forex → True even with sufficient volume (skip is unconditional)."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
+
+    pipeline = SignalFilterPipeline()
+    n = 30
+    volume = np.ones(n) * 100.0
+    volume[-1] = 500.0  # 500% of MA20 — would pass anyway
+    idx = pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC")
+    df = pd.DataFrame(
+        {"open": 1.1, "high": 1.11, "low": 1.09, "close": 1.10, "volume": volume},
+        index=idx,
+    )
+    passed, reason = pipeline.check_volume(df, market_type="forex")
+    assert passed is True
