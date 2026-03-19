@@ -1108,13 +1108,20 @@ def test_sim42_live_and_backtest_same_result():
 
 
 def test_sim42_pipeline_disabled_filters_pass():
-    """Disabling score filter allows low-score signal through."""
+    """Disabling score filter allows sub-threshold signal through (but signal_strength always runs).
+
+    Note: SIM-31 signal_strength check is always-on (not flag-controlled).
+    A score of 11 → BUY → passes signal_strength gate even without score threshold.
+    """
     from src.signals.filter_pipeline import SignalFilterPipeline
     import datetime
 
     pipeline = SignalFilterPipeline(apply_score_filter=False)
     ctx = {
-        "composite_score": 1.0,   # would be blocked by score filter
+        # 11.0 is below threshold=15 but would be blocked by score_filter if enabled.
+        # With score_filter=False, it passes the threshold check.
+        # signal_strength(11.0) = "BUY" → in ALLOWED_SIGNAL_STRENGTHS → passes.
+        "composite_score": 11.0,
         "market_type": "forex",
         "symbol": "EURUSD=X",
         "regime": "TREND_BULL",
@@ -1127,7 +1134,7 @@ def test_sim42_pipeline_disabled_filters_pass():
         "economic_events": [],
     }
     passed, reason = pipeline.run_all(ctx)
-    assert passed is True
+    assert passed is True, f"Score=11 with disabled score_filter should pass, got: {reason}"
 
 
 def test_sim42_pipeline_momentum_blocks():
@@ -1829,3 +1836,277 @@ def test_volume_filter_forex_high_volume_still_passes():
     )
     passed, reason = pipeline.check_volume(df, market_type="forex")
     assert passed is True
+
+
+# ── Task 4: Pipeline integration tests ────────────────────────────────────────
+
+
+def test_pipeline_integration_all_filters_off():
+    """All apply_* flags=False: pipeline passes any signal through."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
+
+    pipeline = SignalFilterPipeline(
+        apply_score_filter=False,
+        apply_regime_filter=False,
+        apply_d1_trend_filter=False,
+        apply_volume_filter=False,
+        apply_momentum_filter=False,
+        apply_weekday_filter=False,
+        apply_calendar_filter=False,
+        apply_session_filter=False,
+        apply_dxy_filter=False,
+    )
+    ctx = {
+        "composite_score": 1.0,   # would normally be blocked by score filter
+        "market_type": "forex",
+        "symbol": "EURUSD=X",
+        "regime": "RANGING",      # would normally be blocked by regime filter
+        "direction": "LONG",
+        "timeframe": "H1",
+        "df": None,
+        "ta_indicators": {"rsi_14": 40.0, "macd_line": -0.001, "macd_signal": 0.0005},  # misaligned
+        "candle_ts": datetime.datetime(2024, 1, 1, 3, 0, tzinfo=datetime.timezone.utc),  # Asian session Mon
+        "d1_rows": [],
+        "economic_events": [],
+        "dxy_rsi": 60.0,  # would block LONG
+    }
+    # All filters are off — signal_strength check is always-on (SIM-31)
+    # but score=1 → HOLD → blocked. So we need composite=12 (→BUY) to test "all off"
+    ctx["composite_score"] = 12.0
+    passed, reason = pipeline.run_all(ctx)
+    # With all filters off EXCEPT signal_strength (always-on), BUY strength should pass
+    assert passed is True, f"All-filters-off should pass BUY signal, got: {reason}"
+
+
+def test_pipeline_integration_score_filter_blocks():
+    """composite < 15 → pipeline blocks with score_below_threshold reason."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
+
+    pipeline = SignalFilterPipeline(
+        apply_score_filter=True,
+        apply_regime_filter=False,
+        apply_momentum_filter=False,
+        apply_weekday_filter=False,
+        apply_calendar_filter=False,
+        apply_session_filter=False,
+    )
+    ctx = {
+        "composite_score": 12.0,  # below threshold 15, but BUY strength
+        "market_type": "forex",
+        "symbol": "EURUSD=X",
+        "regime": "TREND_BULL",
+        "direction": "LONG",
+        "timeframe": "H1",
+        "df": None,
+        "ta_indicators": {},
+        "candle_ts": datetime.datetime(2024, 3, 6, 12, 0, tzinfo=datetime.timezone.utc),
+        "d1_rows": [],
+        "economic_events": [],
+    }
+    passed, reason = pipeline.run_all(ctx)
+    assert not passed, "Score 12 < 15 should be blocked"
+    assert "score_below_threshold" in reason
+
+
+def test_pipeline_integration_regime_filter_blocks():
+    """regime=RANGING with apply_regime_filter=True → pipeline blocks."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
+
+    pipeline = SignalFilterPipeline(
+        apply_score_filter=True,
+        apply_regime_filter=True,
+        apply_momentum_filter=False,
+        apply_weekday_filter=False,
+        apply_calendar_filter=False,
+        apply_session_filter=False,
+    )
+    ctx = {
+        "composite_score": 20.0,
+        "market_type": "forex",
+        "symbol": "EURUSD=X",
+        "regime": "RANGING",
+        "direction": "LONG",
+        "timeframe": "H1",
+        "df": None,
+        "ta_indicators": {},
+        "candle_ts": datetime.datetime(2024, 3, 6, 12, 0, tzinfo=datetime.timezone.utc),
+        "d1_rows": [],
+        "economic_events": [],
+    }
+    passed, reason = pipeline.run_all(ctx)
+    assert not passed, "RANGING regime should be blocked"
+    assert "regime_blocked" in reason
+
+
+def test_pipeline_integration_regime_filter_off():
+    """regime=RANGING with apply_regime_filter=False → pipeline passes."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
+
+    pipeline = SignalFilterPipeline(
+        apply_score_filter=True,
+        apply_regime_filter=False,  # filter disabled
+        apply_momentum_filter=False,
+        apply_weekday_filter=False,
+        apply_calendar_filter=False,
+        apply_session_filter=False,
+    )
+    ctx = {
+        "composite_score": 20.0,
+        "market_type": "forex",
+        "symbol": "EURUSD=X",
+        "regime": "RANGING",     # would normally block
+        "direction": "LONG",
+        "timeframe": "H1",
+        "df": None,
+        "ta_indicators": {},
+        "candle_ts": datetime.datetime(2024, 3, 6, 12, 0, tzinfo=datetime.timezone.utc),
+        "d1_rows": [],
+        "economic_events": [],
+    }
+    passed, reason = pipeline.run_all(ctx)
+    assert passed is True, f"Disabled regime filter should allow RANGING signal, got: {reason}"
+
+
+def test_pipeline_used_in_backtest():
+    """SignalFilterPipeline is imported and used in backtest_engine."""
+    import importlib
+    import src.backtesting.backtest_engine as be_module
+
+    # Verify import exists at module level
+    assert hasattr(be_module, "SignalFilterPipeline"), \
+        "SignalFilterPipeline must be imported in backtest_engine"
+
+    # Verify pipeline is used in _simulate_symbol (inspect source)
+    import inspect
+    source = inspect.getsource(be_module.BacktestEngine._simulate_symbol)
+    assert "SignalFilterPipeline" in source, \
+        "SignalFilterPipeline must be instantiated in _simulate_symbol"
+    assert "pipeline.run_all" in source, \
+        "pipeline.run_all() must be called in _simulate_symbol"
+
+
+def test_pipeline_signal_strength_always_blocks_weak():
+    """SIM-31: signal_strength filter blocks WEAK_BUY even when all other flags are off."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
+
+    # Disable all configurable filters — only signal_strength (always-on) runs
+    pipeline = SignalFilterPipeline(
+        apply_score_filter=False,
+        apply_regime_filter=False,
+        apply_d1_trend_filter=False,
+        apply_volume_filter=False,
+        apply_momentum_filter=False,
+        apply_weekday_filter=False,
+        apply_calendar_filter=False,
+        apply_session_filter=False,
+        apply_dxy_filter=False,
+    )
+    ctx = {
+        "composite_score": 8.0,   # 8.0 → WEAK_BUY → not in ALLOWED_SIGNAL_STRENGTHS
+        "market_type": "forex",
+        "symbol": "EURUSD=X",
+        "regime": "TREND_BULL",
+        "direction": "LONG",
+        "timeframe": "H1",
+        "df": None,
+        "ta_indicators": {},
+        "candle_ts": datetime.datetime(2024, 3, 6, 12, 0, tzinfo=datetime.timezone.utc),
+        "d1_rows": [],
+        "economic_events": [],
+    }
+    passed, reason = pipeline.run_all(ctx)
+    assert not passed, "WEAK_BUY should be blocked by always-on signal_strength filter"
+    assert "signal_strength_weak" in reason
+
+
+def test_pipeline_dxy_blocks_long_strong_dollar():
+    """SIM-38: DXY RSI=60 blocks EURUSD LONG via pipeline."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
+
+    pipeline = SignalFilterPipeline(
+        apply_score_filter=False,
+        apply_regime_filter=False,
+        apply_momentum_filter=False,
+        apply_weekday_filter=False,
+        apply_calendar_filter=False,
+        apply_session_filter=False,
+        apply_dxy_filter=True,
+    )
+    ctx = {
+        "composite_score": 20.0,
+        "market_type": "forex",
+        "symbol": "EURUSD=X",
+        "regime": "TREND_BULL",
+        "direction": "LONG",
+        "timeframe": "H1",
+        "df": None,
+        "ta_indicators": {},
+        "candle_ts": datetime.datetime(2024, 3, 6, 12, 0, tzinfo=datetime.timezone.utc),
+        "d1_rows": [],
+        "economic_events": [],
+        "dxy_rsi": 60.0,  # > 55 → blocks LONG for USD long-side pairs
+    }
+    passed, reason = pipeline.run_all(ctx)
+    assert not passed, "DXY RSI=60 should block EURUSD LONG"
+    assert "dxy_strong_blocks_long" in reason
+
+
+def test_pipeline_dxy_no_data_passes():
+    """SIM-38: dxy_rsi=None → DXY filter passes (graceful degradation)."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
+
+    pipeline = SignalFilterPipeline(
+        apply_score_filter=False,
+        apply_regime_filter=False,
+        apply_momentum_filter=False,
+        apply_weekday_filter=False,
+        apply_calendar_filter=False,
+        apply_session_filter=False,
+        apply_dxy_filter=True,
+    )
+    ctx = {
+        "composite_score": 20.0,
+        "market_type": "forex",
+        "symbol": "EURUSD=X",
+        "regime": "TREND_BULL",
+        "direction": "LONG",
+        "timeframe": "H1",
+        "df": None,
+        "ta_indicators": {},
+        "candle_ts": datetime.datetime(2024, 3, 6, 12, 0, tzinfo=datetime.timezone.utc),
+        "d1_rows": [],
+        "economic_events": [],
+        "dxy_rsi": None,  # no data → passthrough
+    }
+    passed, reason = pipeline.run_all(ctx)
+    assert passed is True, f"No DXY data should pass filter, got: {reason}"
+
+
+def test_pipeline_generate_signal_returns_ta_indicators():
+    """_generate_signal() now includes ta_indicators key for pipeline consumption."""
+    from src.backtesting.backtest_engine import BacktestEngine
+    from unittest.mock import MagicMock, patch
+
+    engine = BacktestEngine(db=MagicMock())
+    df = _make_forex_df()
+
+    with patch("src.analysis.ta_engine.TAEngine") as mock_ta_cls:
+        mock_ta = MagicMock()
+        mock_ta.calculate_ta_score.return_value = 40.0
+        mock_ta.get_atr.return_value = Decimal("0.0010")
+        mock_ta.calculate_all_indicators.return_value = {
+            "rsi": 55.0, "macd": 0.001, "macd_signal": 0.0005
+        }
+        mock_ta_cls.return_value = mock_ta
+
+        with patch(
+            "src.backtesting.backtest_engine._detect_regime_from_df",
+            return_value="TREND_BULL",
+        ):
+            result = engine._generate_signal(df, "EURUSD=X", "forex", "H1")
+
+    assert result is not None, "_generate_signal must return a signal"
+    assert "ta_indicators" in result, "_generate_signal must include ta_indicators for pipeline"
+    assert "composite_score" in result
+    assert "regime" in result
+    assert "direction" in result

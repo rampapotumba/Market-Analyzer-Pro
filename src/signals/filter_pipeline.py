@@ -162,12 +162,11 @@ class SignalFilterPipeline:
             if not passed:
                 return False, reason
 
-        # SIM-31: Signal strength quality gate — controlled by apply_score_filter
-        # because strength is a score-based filter (extension of SIM-25 threshold).
-        if self.apply_score_filter:
-            passed, reason = self.check_signal_strength(composite, direction)
-            if not passed:
-                return False, reason
+        # SIM-31: Signal strength — always-on quality gate (not flag-controlled).
+        # Blocks WEAK_BUY, WEAK_SELL, HOLD regardless of other filter flags.
+        passed, reason = self.check_signal_strength(composite, direction)
+        if not passed:
+            return False, reason
 
         # SIM-26: RANGING regime block
         if self.apply_regime_filter:
