@@ -1,18 +1,22 @@
 """REST API v2 — all endpoints per ARCHITECTURE.md section 4.1."""
 
+import asyncio
 import datetime
 import json
 import logging
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
-from sqlalchemy import func, select
+from pydantic import BaseModel, ConfigDict
+from collections import defaultdict
+from sqlalchemy import delete, func, over, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.database.crud import (
+    get_active_signals,
     get_all_instruments,
     get_instrument_by_symbol,
+    get_latest_signal_for_instrument,
     get_open_positions,
     get_price_data,
     get_signal_by_id,
@@ -53,6 +57,7 @@ async def get_session():  # noqa: D401
 class SignalV2(BaseModel):
     id: int
     instrument_id: int
+    symbol: Optional[str] = None
     timeframe: str
     direction: str
     signal_strength: str
@@ -80,8 +85,7 @@ class SignalV2(BaseModel):
     llm_bias: Optional[str] = None
     llm_confidence: Optional[float] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class SignalDetailV2(SignalV2):
@@ -91,7 +95,8 @@ class SignalDetailV2(SignalV2):
 
     @classmethod
     def from_signal(cls, signal: Any) -> "SignalDetailV2":
-        data = {c: getattr(signal, c, None) for c in SignalV2.model_fields}
+        data = {c: getattr(signal, c, None) for c in SignalV2.model_fields if c != "symbol"}
+        data["symbol"] = signal.instrument.symbol if signal.instrument else None
         reasoning = {}
         if signal.reasoning:
             try:
@@ -118,8 +123,7 @@ class InstrumentV2(BaseModel):
     quote_currency: Optional[str]
     central_bank: Optional[str]
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class PortfolioPosition(BaseModel):
@@ -134,8 +138,7 @@ class PortfolioPosition(BaseModel):
     opened_at: datetime.datetime
     closed_at: Optional[datetime.datetime]
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class PortfolioHeat(BaseModel):
@@ -153,8 +156,7 @@ class PriceV2(BaseModel):
     close: float
     volume: float
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class RegimeResponse(BaseModel):
@@ -163,8 +165,7 @@ class RegimeResponse(BaseModel):
     atr_percentile: Optional[float]
     detected_at: datetime.datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class AccuracyV2(BaseModel):
@@ -181,8 +182,7 @@ class AccuracyV2(BaseModel):
     sharpe_ratio: Optional[float]
     max_drawdown_pct: Optional[float]
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class BacktestRunResponse(BaseModel):
@@ -198,8 +198,7 @@ class BacktestRunResponse(BaseModel):
     passed_validation: Optional[bool]
     optimal_weights: Optional[str]
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class BacktestTradeResponse(BaseModel):
@@ -215,8 +214,7 @@ class BacktestTradeResponse(BaseModel):
     exit_reason: Optional[str]
     regime: Optional[str]
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class OrderFlowResponse(BaseModel):
@@ -226,8 +224,7 @@ class OrderFlowResponse(BaseModel):
     open_interest: Optional[float]
     open_interest_prev: Optional[float]
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class MacroRateResponse(BaseModel):
@@ -236,8 +233,7 @@ class MacroRateResponse(BaseModel):
     value: Optional[float]
     collected_at: Optional[datetime.datetime]
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 # ── Signals ───────────────────────────────────────────────────────────────────
@@ -270,8 +266,65 @@ async def list_signals_v2(
             continue
         if date_to and s.created_at > date_to:
             continue
-        result.append(s)
+        d = {f: getattr(s, f, None) for f in SignalV2.model_fields if f != "symbol"}
+        d["symbol"] = s.instrument.symbol if s.instrument else None
+        result.append(SignalV2(**d))
     return result
+
+
+@router_v2.get("/signals/active", response_model=list[SignalV2])
+async def get_active_signals_v2(
+    db: AsyncSession = Depends(get_session),
+):
+    """Get all active (created/tracking) signals."""
+    signals = await get_active_signals(db)
+    result = []
+    for s in signals:
+        d = {f: getattr(s, f, None) for f in SignalV2.model_fields if f != "symbol"}
+        d["symbol"] = s.instrument.symbol if s.instrument else None
+        result.append(SignalV2(**d))
+    return result
+
+
+@router_v2.get("/signals/latest/{symbol:path}")
+async def get_latest_signal(
+    symbol: str,
+    timeframe: str = Query("H1"),
+    db: AsyncSession = Depends(get_session),
+):
+    """Return the most recent signal for a symbol/timeframe (used by dashboard signal panel)."""
+    instrument = await get_instrument_by_symbol(db, symbol)
+    if instrument is None:
+        raise HTTPException(status_code=404, detail=f"Instrument {symbol!r} not found")
+
+    signal = await get_latest_signal_for_instrument(db, instrument.id, timeframe)
+    if signal is None:
+        return None
+
+    return {
+        "status": signal.status,
+        "id": signal.id,
+        "symbol": symbol,
+        "timeframe": signal.timeframe,
+        "direction": signal.direction,
+        "signal_strength": signal.signal_strength,
+        "composite_score": float(signal.composite_score),
+        "ta_score": float(signal.ta_score),
+        "fa_score": float(signal.fa_score),
+        "sentiment_score": float(signal.sentiment_score),
+        "geo_score": float(signal.geo_score),
+        "confidence": float(signal.confidence),
+        "entry_price": float(signal.entry_price) if signal.entry_price else None,
+        "stop_loss": float(signal.stop_loss) if signal.stop_loss else None,
+        "take_profit_1": float(signal.take_profit_1) if signal.take_profit_1 else None,
+        "take_profit_2": float(signal.take_profit_2) if signal.take_profit_2 else None,
+        "risk_reward": float(signal.risk_reward) if signal.risk_reward else None,
+        "position_size_pct": float(signal.position_size_pct) if signal.position_size_pct else None,
+        "horizon": signal.horizon,
+        "reasoning": signal.reasoning,
+        "indicators_snapshot": signal.indicators_snapshot,
+        "created_at": signal.created_at.isoformat(),
+    }
 
 
 @router_v2.get("/signals/{signal_id}", response_model=SignalDetailV2)
@@ -297,9 +350,8 @@ async def signal_feedback(
     # Store feedback in reasoning JSON
     existing = json.loads(signal.reasoning or "{}")
     existing["operator_feedback"] = feedback
-    from sqlalchemy import update as sa_update
     await db.execute(
-        sa_update(Signal)
+        update(Signal)
         .where(Signal.id == signal_id)
         .values(reasoning=json.dumps(existing))
     )
@@ -475,17 +527,29 @@ async def trigger_backtest():
 
 @router_v2.get("/macroeconomics")
 async def get_macro_all(db: AsyncSession = Depends(get_session)):
+    # Get the latest 2 records per (country, indicator_name) using a window function.
+    # This ensures all indicators appear regardless of how many historical records exist.
+    row_num = over(
+        func.row_number(),
+        partition_by=[MacroData.country, MacroData.indicator_name],
+        order_by=MacroData.release_date.desc(),
+    ).label("rn")
+
+    subq = select(MacroData, row_num).subquery()
+
     result = await db.execute(
-        select(MacroData).order_by(MacroData.release_date.desc()).limit(200)
+        select(subq).where(subq.c.rn <= 2).order_by(
+            subq.c.country, subq.c.indicator_name, subq.c.release_date.desc()
+        )
     )
-    rows = result.scalars().all()
+    rows = result.mappings().all()
     return [
         {
-            "country": r.country,
-            "indicator": r.indicator_name,
-            "value": float(r.value) if r.value is not None else None,
-            "previous_value": float(r.previous_value) if r.previous_value is not None else None,
-            "release_date": r.release_date,
+            "country": r["country"],
+            "indicator": r["indicator_name"],
+            "value": float(r["value"]) if r["value"] is not None else None,
+            "previous_value": float(r["previous_value"]) if r["previous_value"] is not None else None,
+            "release_date": r["release_date"],
         }
         for r in rows
     ]
@@ -530,6 +594,85 @@ async def get_macro_calendar(db: AsyncSession = Depends(get_session)):
 
 # ── Prices ────────────────────────────────────────────────────────────────────
 
+# How stale (hours) before we trigger a background refresh per timeframe
+_STALE_HOURS: dict[str, float] = {
+    "M1": 0.1, "M5": 0.25, "M15": 0.5,
+    "H1": 2.0, "H4": 8.0, "D1": 36.0, "W1": 200.0, "MN1": 800.0,
+}
+
+
+_TF_HOURS: dict[str, float] = {
+    "M1": 1/60, "M5": 5/60, "M15": 15/60,
+    "H1": 1.0, "H4": 4.0, "D1": 24.0, "W1": 168.0, "MN1": 720.0,
+}
+
+
+async def _collect_if_stale(
+    instrument: Any,
+    timeframe: str,
+    latest_ts: Optional[datetime.datetime],
+    earliest_ts: Optional[datetime.datetime] = None,
+    row_count: int = 0,
+) -> None:
+    """Background task: collect candles when data is stale or has an internal gap.
+
+    Gap detection: if the time span between first and last returned row implies
+    significantly more candles than we actually have, a historical fill is triggered
+    from earliest_ts to now — this closes gaps caused by downtime.
+    """
+    from src.collectors.price_collector import CcxtCollector, YFinanceCollector
+
+    stale_hours = _STALE_HOURS.get(timeframe, 2.0)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    gap_fill_from: Optional[datetime.datetime] = None
+
+    if latest_ts is None:
+        pass  # no data at all → fall through to collect
+    else:
+        if latest_ts.tzinfo is None:
+            latest_ts = latest_ts.replace(tzinfo=datetime.timezone.utc)
+        age_hours = (now - latest_ts).total_seconds() / 3600
+
+        if age_hours < stale_hours:
+            # Latest candle is fresh — but check for internal gap
+            if earliest_ts is not None and row_count > 1:
+                if earliest_ts.tzinfo is None:
+                    earliest_ts = earliest_ts.replace(tzinfo=datetime.timezone.utc)
+                span_hours = (latest_ts - earliest_ts).total_seconds() / 3600
+                tf_h = _TF_HOURS.get(timeframe, 1.0)
+                # Forex/stocks are closed weekends (~5/7 of time); use 0.6 as conservative factor
+                expected_rows = (span_hours / tf_h) * 0.60
+                if row_count < expected_rows:
+                    # Gap detected — fill from first known candle
+                    gap_fill_from = earliest_ts
+                    logger.info(
+                        "[Prices] Gap detected %s/%s: %d rows vs ~%.0f expected — filling from %s",
+                        instrument.symbol, timeframe, row_count, expected_rows,
+                        earliest_ts.strftime("%Y-%m-%d"),
+                    )
+                else:
+                    return  # data is fresh and complete
+            else:
+                return  # fresh, no gap check possible
+
+    try:
+        if instrument.market == "crypto":
+            collector: Any = CcxtCollector()
+        else:
+            collector = YFinanceCollector()
+
+        if gap_fill_from is not None:
+            await collector.collect_historical(instrument.symbol, timeframe, start=gap_fill_from)
+            logger.info("[Prices] Gap-filled %s/%s from %s", instrument.symbol, timeframe, gap_fill_from)
+        else:
+            await collector.collect_latest(instrument.symbol, timeframe, n_candles=500)
+            logger.info("[Prices] Auto-collected %s/%s (stale or empty)", instrument.symbol, timeframe)
+    except Exception as exc:
+        logger.warning(
+            "[Prices] Auto-collect failed for %s/%s: %s", instrument.symbol, timeframe, exc
+        )
+
+
 @router_v2.get("/prices/{symbol:path}")
 async def get_prices_v2(
     symbol: str,
@@ -551,6 +694,15 @@ async def get_prices_v2(
         to_dt=date_to,
         limit=limit,
     )
+
+    # Auto-collect in background if data is stale or has an internal gap
+    latest_ts = rows[-1].timestamp if rows else None
+    earliest_ts = rows[0].timestamp if rows else None
+    asyncio.create_task(
+        _collect_if_stale(instrument, timeframe, latest_ts, earliest_ts=earliest_ts, row_count=len(rows)),
+        name=f"autocollect-{symbol}-{timeframe}",
+    )
+
     return [
         {
             "timestamp": r.timestamp,
@@ -627,12 +779,12 @@ async def analyze_v2(
         raise HTTPException(status_code=500, detail=str(exc))
 
     if signal is None:
-        import json as _json
         hold_indicators: dict = {}
         hold_ta_score: float = 0.0
         hold_fa_score: float = 0.0
         hold_sentiment_score: float = 0.0
         hold_geo_score: float = 0.0
+        news_records = None
 
         # TA indicators
         try:
@@ -678,9 +830,9 @@ async def analyze_v2(
         try:
             from src.analysis.sentiment_engine_v2 import SentimentEngineV2
             from src.database.crud import get_news_events as _get_news
-            if "news_records" not in dir():
-                news_records = await _get_news(db, limit=30)  # type: ignore[assignment]
-            sent_engine = SentimentEngineV2(news_events=news_records)  # type: ignore[arg-type]
+            if news_records is None:
+                news_records = await _get_news(db, limit=30)
+            sent_engine = SentimentEngineV2(news_events=news_records)
             hold_sentiment_score = await sent_engine.calculate()
         except Exception:
             pass
@@ -717,7 +869,7 @@ async def analyze_v2(
             "sentiment_score": hold_sentiment_score,
             "geo_score": hold_geo_score,
             "confidence": 0.0,
-            "indicators_snapshot": _json.dumps(hold_indicators),
+            "indicators_snapshot": json.dumps(hold_indicators),
             "message": (
                 f"No actionable signal for {symbol}/{timeframe}. "
                 "Market in consolidation or cooldown active."
@@ -743,7 +895,7 @@ async def analyze_v2(
         "take_profit_2": float(signal.take_profit_2) if signal.take_profit_2 else None,
         "risk_reward": float(signal.risk_reward) if signal.risk_reward else None,
         "horizon": signal.horizon,
-        "status_signal": signal.status,
+        "status": signal.status,
         "reasoning": signal.reasoning,
         "indicators_snapshot": signal.indicators_snapshot,
         "created_at": signal.created_at.isoformat(),
@@ -794,6 +946,13 @@ async def simulator_stats(db: AsyncSession = Depends(get_session)):
     )
     total_pnl_pct = float(pnl_pct_q.scalar() or 0)
 
+    # Count how many real trades have pnl_usd stored (for fallback detection)
+    pnl_usd_stored_count_q = await db.execute(
+        select(func.count(SignalResult.id))
+        .where(_real_trades, SignalResult.pnl_usd.isnot(None))
+    )
+    pnl_usd_stored_count = pnl_usd_stored_count_q.scalar() or 0
+
     avg_win_pnl_q = await db.execute(
         select(func.avg(SignalResult.pnl_usd))
         .where(_real_trades, SignalResult.result == "win")
@@ -806,21 +965,24 @@ async def simulator_stats(db: AsyncSession = Depends(get_session)):
     )
     avg_loss_usd = float(avg_loss_pnl_q.scalar() or 0)
 
-    # Fallback for old records without stored pnl_usd
-    if total_pnl_usd_stored == 0 and total_pnl_pct != 0:
-        total_pnl_usd_stored = pnl_usd(total_pnl_pct)
-    if avg_win_usd == 0:
+    # Fallback for old records without stored pnl_usd.
+    # Use pnl_usd_stored_count == 0 to detect missing data (not "== 0" sum, which is ambiguous).
+    # Default size_pct=2.0 matches the simulator default (avoids 100x overestimate from None→100%).
+    _DEFAULT_SIZE = 2.0
+    if pnl_usd_stored_count == 0 and total_pnl_pct != 0:
+        total_pnl_usd_stored = pnl_usd(total_pnl_pct, _DEFAULT_SIZE)
+    if pnl_usd_stored_count == 0 and wins > 0:
         avg_win_pct_q = await db.execute(
             select(func.avg(SignalResult.pnl_percent))
             .where(_real_trades, SignalResult.result == "win")
         )
-        avg_win_usd = pnl_usd(float(avg_win_pct_q.scalar() or 0))
-    if avg_loss_usd == 0:
+        avg_win_usd = pnl_usd(float(avg_win_pct_q.scalar() or 0), _DEFAULT_SIZE)
+    if pnl_usd_stored_count == 0 and losses > 0:
         avg_loss_pct_q = await db.execute(
             select(func.avg(SignalResult.pnl_percent))
             .where(_real_trades, SignalResult.result == "loss")
         )
-        avg_loss_usd = pnl_usd(float(avg_loss_pct_q.scalar() or 0))
+        avg_loss_usd = pnl_usd(float(avg_loss_pct_q.scalar() or 0), _DEFAULT_SIZE)
 
     # Open positions
     open_q = await db.execute(
@@ -1003,7 +1165,6 @@ async def simulator_score_analysis(db: AsyncSession = Depends(get_session)):
             return "strong_buy"
 
     # Group by bucket
-    from collections import defaultdict
     groups: dict[str, list[SignalResult]] = defaultdict(list)
     for r in rows:
         bucket_key = assign_bucket(float(r.composite_score))
@@ -1104,7 +1265,6 @@ async def simulator_breakdown(
             return sr.exit_at.strftime("%Y-%m") if sr.exit_at else None
         return None
 
-    from collections import defaultdict
     groups: dict[str, list[tuple]] = defaultdict(list)
     for sr, sig, instr in trade_rows:
         key = get_key(sr, sig, instr)
@@ -1232,11 +1392,267 @@ async def simulator_open_positions(db: AsyncSession = Depends(get_session)):
             "take_profit_1": float(signal.take_profit_1 or 0),
             "unrealized_pnl_pct": float(pos.unrealized_pnl_pct or 0),
             "unrealized_pnl_usd": round(unrealized_usd_val, 2),
+            "size_pct": float(pos.size_pct),
+            "size_remaining_pct": float(pos.size_remaining_pct),
             "account_balance_at_entry": float(pos.account_balance_at_entry) if pos.account_balance_at_entry else None,
             "opened_at": pos.opened_at.isoformat() if pos.opened_at else None,
         })
 
     return positions
+
+
+# ── Simulator Reset ───────────────────────────────────────────────────────────
+
+@router_v2.post("/simulator/reset")
+async def simulator_reset(db: AsyncSession = Depends(get_session)):
+    """Full simulator reset: delete all positions and signals, restore balance."""
+    from src.config import settings
+
+    # 1. Delete ALL virtual positions (all statuses — clean slate)
+    pos_result = await db.execute(
+        delete(VirtualPortfolio).returning(VirtualPortfolio.id)
+    )
+    deleted_positions = len(pos_result.fetchall())
+
+    # 2. Delete ALL signals
+    sig_result = await db.execute(
+        delete(Signal).returning(Signal.id)
+    )
+    deleted_signals = len(sig_result.fetchall())
+
+    # 3. Reset virtual account to initial balance
+    initial = settings.VIRTUAL_ACCOUNT_SIZE_USD
+    account = (await db.execute(select(VirtualAccount).limit(1))).scalar_one_or_none()
+    if account:
+        account.current_balance = initial  # type: ignore[assignment]
+        account.peak_balance = initial     # type: ignore[assignment]
+        account.total_realized_pnl = 0    # type: ignore[assignment]
+        account.total_trades = 0
+    else:
+        db.add(VirtualAccount(
+            initial_balance=initial,
+            current_balance=initial,
+            peak_balance=initial,
+            total_realized_pnl=0,
+            total_trades=0,
+        ))
+
+    await db.commit()
+    logger.info(
+        f"[SimReset] Deleted {deleted_positions} positions, "
+        f"{deleted_signals} signals; balance restored to ${initial}"
+    )
+    return {
+        "ok": True,
+        "deleted_positions": deleted_positions,
+        "deleted_signals": deleted_signals,
+        "balance_restored_to": initial,
+    }
+
+
+# ── SIM-17: Diagnostic endpoint ───────────────────────────────────────────────
+
+@router_v2.get("/diagnostics/scoring-breakdown")
+async def diagnostics_scoring_breakdown(
+    timeframe: str = Query("H1"),
+    db: AsyncSession = Depends(get_session),
+):
+    """Return per-component score breakdown for all active instruments.
+
+    Used to detect systematic bias in scoring (SIM-17).
+    Response includes bias_flags and a summary with suspected bias sources.
+    """
+    from src.analysis.fa_engine import FAEngine
+    from src.analysis.crypto_fa_engine import CryptoFAEngine
+    from src.analysis.sentiment_engine_v2 import SentimentEngineV2
+    from src.analysis.geo_engine_v2 import GeoEngineV2
+    from src.analysis.ta_engine import TAEngine
+    from src.database.crud import get_macro_data, get_news_events
+    from src.signals.mtf_filter import MTFFilter
+    from src.signals.signal_engine import _price_data_to_df
+
+    instruments = await get_all_instruments(db)
+    macro_records = await get_macro_data(db, limit=200)
+    news_records = await get_news_events(db, limit=30)
+    mtf = MTFFilter()
+    weights = mtf.get_timeframe_weights(timeframe)
+
+    result_instruments = []
+
+    for instr in instruments:
+        if not instr.is_active:
+            continue
+
+        symbol = instr.symbol
+        bias_flags: list[str] = []
+
+        # TA
+        ta_score: Optional[float] = None
+        try:
+            price_records = await get_price_data(db, instr.id, timeframe, limit=300)
+            if len(price_records) >= 30:
+                df = _price_data_to_df(price_records)
+                if df is not None and not df.empty:
+                    ta_eng = TAEngine(df)
+                    ta_score = ta_eng.calculate_ta_score()
+        except Exception as exc:
+            logger.warning("[SIM-17] TA fallback for %s: %s", symbol, exc)
+            bias_flags.append(f"ta_score: error — {exc}")
+
+        # FA
+        fa_score: Optional[float] = None
+        try:
+            if instr.market == "crypto":
+                crypto_fa = CryptoFAEngine(db)
+                res = await crypto_fa.analyze(instr.id, symbol)
+                fa_score = float(res["score"])
+            else:
+                fa_eng = FAEngine(instr, macro_records, news_records)
+                fa_score = fa_eng.calculate_fa_score()
+        except Exception as exc:
+            logger.warning("[SIM-17] FA fallback 0.0 for %s: %s", symbol, exc)
+            fa_score = 0.0
+            bias_flags.append(f"fa_score returned default (no data): {exc}")
+
+        # Sentiment
+        sentiment_score: Optional[float] = None
+        try:
+            sent_eng = SentimentEngineV2(news_events=news_records)
+            sentiment_score = await sent_eng.calculate()
+            if not news_records:
+                bias_flags.append("sentiment_score returned default (no news data)")
+        except Exception as exc:
+            logger.warning("[SIM-17] Sentiment fallback 0.0 for %s: %s", symbol, exc)
+            sentiment_score = 0.0
+            bias_flags.append(f"sentiment_score returned default (error): {exc}")
+
+        # Geo
+        geo_score: Optional[float] = None
+        try:
+            geo_eng = GeoEngineV2()
+            geo_score = await geo_eng.score(symbol)
+            await geo_eng.close()
+        except Exception as exc:
+            logger.warning("[SIM-17] Geo fallback 0.0 for %s: %s", symbol, exc)
+            geo_score = 0.0
+            bias_flags.append(f"geo_score returned default (no data): {exc}")
+
+        # Composite
+        composite: Optional[float] = None
+        if all(v is not None for v in [ta_score, fa_score, sentiment_score, geo_score]):
+            composite = (
+                weights["ta"] * (ta_score or 0.0)
+                + weights["fa"] * (fa_score or 0.0)
+                + weights["sentiment"] * (sentiment_score or 0.0)
+                + weights["geo"] * (geo_score or 0.0)
+            )
+            composite = max(-100.0, min(100.0, composite))
+
+        result_instruments.append({
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "composite_score": round(composite, 4) if composite is not None else None,
+            "components": {
+                "ta_score":        round(ta_score, 4) if ta_score is not None else None,
+                "ta_weight":       weights["ta"],
+                "fa_score":        round(fa_score, 4) if fa_score is not None else None,
+                "fa_weight":       weights["fa"],
+                "sentiment_score": round(sentiment_score, 4) if sentiment_score is not None else None,
+                "sentiment_weight": weights["sentiment"],
+                "geo_score":       round(geo_score, 4) if geo_score is not None else None,
+                "geo_weight":      weights["geo"],
+                "of_score":        None,  # Order flow not yet implemented
+                "of_weight":       0.0,
+            },
+            "bias_flags": bias_flags,
+        })
+
+    composites = [r["composite_score"] for r in result_instruments if r["composite_score"] is not None]
+    avg_composite = sum(composites) / len(composites) if composites else None
+    pct_negative = (
+        sum(1 for c in composites if c < 0) / len(composites) * 100
+        if composites else None
+    )
+
+    # Detect suspected bias sources: component avg < -3.0
+    suspected_bias: list[str] = []
+    for component in ("fa_score", "sentiment_score", "geo_score"):
+        vals = [
+            r["components"][component]
+            for r in result_instruments
+            if r["components"][component] is not None
+        ]
+        if vals and sum(vals) / len(vals) < -3.0:
+            suspected_bias.append(component)
+
+    return {
+        "instruments": result_instruments,
+        "summary": {
+            "avg_composite": round(avg_composite, 4) if avg_composite is not None else None,
+            "pct_negative":  round(pct_negative, 1) if pct_negative is not None else None,
+            "suspected_bias_sources": suspected_bias,
+            "instrument_count": len(result_instruments),
+        },
+    }
+
+
+@router_v2.post("/system/logs/clear")
+async def clear_system_logs(db: AsyncSession = Depends(get_session)):
+    """Delete all system event logs."""
+    from src.database.crud import delete_all_system_events
+    deleted = await delete_all_system_events(db)
+    await db.commit()
+    logger.info(f"[Logs] Cleared {deleted} system events via API")
+    return {"ok": True, "deleted": deleted}
+
+
+# ── News Feed ─────────────────────────────────────────────────────────────────
+
+@router_v2.get("/news")
+async def list_news(
+    category: Optional[str] = Query(None, description="crypto|forex|stock|general"),
+    importance: Optional[str] = Query(None, description="low|medium|high|critical"),
+    search: Optional[str] = Query(None, description="keyword search in headline"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_session),
+):
+    """Return news feed with optional filters."""
+    from src.database.models import NewsEvent as _NewsEvent
+
+    stmt = (
+        select(_NewsEvent)
+        .order_by(_NewsEvent.published_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    if category:
+        stmt = stmt.where(_NewsEvent.category == category)
+    if importance == "medium+":
+        stmt = stmt.where(_NewsEvent.importance.in_(["medium", "high", "critical"]))
+    elif importance == "high+":
+        stmt = stmt.where(_NewsEvent.importance.in_(["high", "critical"]))
+    elif importance:
+        stmt = stmt.where(_NewsEvent.importance == importance)
+    if search:
+        stmt = stmt.where(_NewsEvent.headline.ilike(f"%{search}%"))
+
+    rows = (await db.execute(stmt)).scalars().all()
+
+    return [
+        {
+            "id":               r.id,
+            "headline":         r.headline,
+            "summary":          r.summary,
+            "source":           r.source,
+            "url":              r.url,
+            "published_at":     r.published_at.isoformat() if r.published_at else None,
+            "sentiment_score":  float(r.sentiment_score) if r.sentiment_score is not None else None,
+            "importance":       r.importance,
+            "category":         r.category,
+        }
+        for r in rows
+    ]
 
 
 # ── System Events ─────────────────────────────────────────────────────────────
@@ -1272,8 +1688,55 @@ async def get_system_events_endpoint(
 # ── System / Health ───────────────────────────────────────────────────────────
 
 @router_v2.get("/health")
-async def health_v2():
-    return {"status": "ok", "version": "2.0"}
+async def health_v2(db: AsyncSession = Depends(get_session)):
+    try:
+        await db.execute(select(func.now()))
+        db_status = "ok"
+    except Exception as exc:
+        db_status = f"error: {exc}"
+    return {"status": "ok", "version": "2.0", "database": db_status}
+
+
+@router_v2.get("/health/postgres")
+async def health_postgres(db: AsyncSession = Depends(get_session)):
+    """Check PostgreSQL connectivity and return server version."""
+    try:
+        result = await db.execute(select(func.version()))
+        version_str: str = result.scalar_one()
+        # e.g. "PostgreSQL 15.3 on ..."
+        short = version_str.split(" on ")[0] if " on " in version_str else version_str[:30]
+        return {"status": "ok", "detail": short}
+    except Exception as exc:
+        return {"status": "error", "detail": str(exc)}
+
+
+@router_v2.get("/health/redis")
+async def health_redis():
+    """Check Redis connectivity via PING."""
+    try:
+        import redis.asyncio as aioredis
+        from src.config import settings
+        client = aioredis.from_url(settings.REDIS_URL, socket_connect_timeout=3)
+        await client.ping()
+        info = await client.info("server")
+        version = info.get("redis_version", "")
+        await client.aclose()
+        return {"status": "ok", "detail": f"v{version}" if version else "ok"}
+    except Exception as exc:
+        return {"status": "error", "detail": str(exc)}
+
+
+@router_v2.get("/health/scheduler")
+async def health_scheduler():
+    """Check APScheduler status and return running job count."""
+    try:
+        from src.scheduler.jobs import scheduler
+        if not scheduler.running:
+            return {"status": "error", "detail": "not running"}
+        jobs = scheduler.get_jobs()
+        return {"status": "ok", "detail": f"{len(jobs)} jobs"}
+    except Exception as exc:
+        return {"status": "error", "detail": str(exc)}
 
 
 @router_v2.get("/health/finbert")

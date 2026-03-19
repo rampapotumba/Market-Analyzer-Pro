@@ -46,39 +46,39 @@
 ### 1.1 SIM-17: Диагностика SHORT bias в scoring
 
 **Шаг 1 — Аудит fallback-значений (только чтение кода, не меняй):**
-- [ ] Изучи `src/signals/signal_engine.py` — найди где собирается composite_score (ta/fa/sentiment/geo/of)
-- [ ] Изучи `src/signals/fa_engine.py` — запиши ВСЕ ветки except/fallback и что они возвращают
-- [ ] Изучи `src/signals/sentiment_engine.py` — запиши ВСЕ ветки except/fallback
-- [ ] Изучи `src/signals/geo_engine.py` — запиши ВСЕ ветки except/fallback
-- [ ] Изучи `src/signals/order_flow.py` — запиши ВСЕ ветки except/fallback
-- [ ] Проверь `SIGNAL_WEIGHTS` в конфиге: сумма весов == 1.0? Если нет — зафиксируй отклонение
-- [ ] Зафиксируй все находки в комментарии к коммиту (или временный `docs/SIM17_AUDIT.md`)
+- [x] Изучи `src/signals/signal_engine.py` — найди где собирается composite_score (ta/fa/sentiment/geo/of)
+- [x] Изучи `src/signals/fa_engine.py` — запиши ВСЕ ветки except/fallback и что они возвращают
+- [x] Изучи `src/signals/sentiment_engine.py` — запиши ВСЕ ветки except/fallback
+- [x] Изучи `src/signals/geo_engine.py` — запиши ВСЕ ветки except/fallback
+- [x] Изучи `src/signals/order_flow.py` — **файл не существует**, OF scoring не реализован
+- [x] Проверь `SIGNAL_WEIGHTS` в конфиге: сумма весов == 1.0? ✓ (ta=0.45+fa=0.25+sent=0.20+geo=0.10=1.0)
+- [x] Зафиксируй все находки — все fallbacks уже возвращают 0.0, order_flow.py отсутствует
 
 **Шаг 2 — Фикс fallback-значений:**
-- [ ] В `fa_engine.py`: все except/error fallback → `Decimal("0.0")` (нейтрально)
-- [ ] В `sentiment_engine.py`: все except/error fallback → `Decimal("0.0")`
-- [ ] В `geo_engine.py`: все except/error fallback → `Decimal("0.0")`
-- [ ] В `order_flow.py`: все except/error fallback → `Decimal("0.0")`
-- [ ] Если SIGNAL_WEIGHTS не сходятся к 1.0 — нормализовать
-- [ ] Добавь `logger.warning(f"[SIM-17] {component} returned fallback 0.0: {reason}")` в каждый fallback
+- [x] В `fa_engine.py`: fallbacks уже 0.0, добавлены [SIM-17] logger.warning
+- [x] В `sentiment_engine.py`: fallbacks уже 0.0 (_weighted_average returns 0.0 when all None)
+- [x] В `geo_engine.py`: fallbacks уже 0.0 (line 171)
+- [x] В `order_flow.py`: файл не существует — OF не используется в composite_score
+- [x] SIGNAL_WEIGHTS сходятся к 1.0 — нормализация не нужна
+- [x] Добавь `logger.warning(f"[SIM-17] ...")` в каждый fallback в signal_engine.py и fa_engine.py
 
 **Шаг 3 — Диагностический эндпоинт:**
-- [ ] В `src/api/routes_v2.py`: создай `GET /api/v2/diagnostics/scoring-breakdown`
-- [ ] Для каждого инструмента: вызвать generate() и разобрать компоненты
-- [ ] Структура ответа: см. спеку §SIM-17 (instruments[], summary{})
-- [ ] Добавь `bias_flags`: список компонентов которые вернули дефолт при отсутствии данных
+- [x] В `src/api/routes_v2.py`: создан `GET /api/v2/diagnostics/scoring-breakdown`
+- [x] Для каждого инструмента: вызываются все компоненты (ta/fa/sentiment/geo)
+- [x] Структура ответа: instruments[], summary{avg_composite, pct_negative, suspected_bias_sources}
+- [x] Добавлен `bias_flags`: список компонентов которые вернули дефолт при отсутствии данных
 
 **Шаг 4 — Тесты:**
-- [ ] `test_sim17_neutral_fallback_fa` — FA engine с мокнутой ошибкой API → 0.0
-- [ ] `test_sim17_neutral_fallback_sentiment` — Sentiment engine без новостей → 0.0
-- [ ] `test_sim17_neutral_fallback_geo` — Geo engine при недоступности → 0.0
-- [ ] `test_sim17_neutral_fallback_of` — Order flow без данных → 0.0
-- [ ] `test_sim17_scoring_breakdown_endpoint` — эндпоинт возвращает корректную структуру
-- [ ] `test_sim17_long_signal_possible` — при нейтральных fa/sentiment/geo и бычьем TA → LONG
+- [x] `test_sim17_neutral_fallback_fa` — FA engine без данных → 0.0
+- [x] `test_sim17_neutral_fallback_sentiment` — Sentiment engine без новостей → 0.0
+- [x] `test_sim17_neutral_fallback_geo` — Geo engine для неизвестного символа → 0.0
+- [x] `test_sim17_neutral_fallback_of` — Order flow не реализован → of_score=None, of_weight=0.0
+- [x] `test_sim17_scoring_breakdown_endpoint` — эндпоинт возвращает корректную структуру
+- [x] `test_sim17_long_signal_possible` — при нейтральных fa/sentiment/geo и бычьем TA → composite > 7.0
 
 **Шаг 5 — Верификация:**
 - [ ] Запусти scoring-breakdown → убедись что появились инструменты с положительным composite_score
-- [ ] Коммит: `fix(sim-17): fix SHORT bias — neutral fallback for all scoring components`
+- [x] Коммит: `fix(sim-17): fix SHORT bias — neutral fallback for all scoring components`
 
 ### 1.2 SIM-19: SL на 2×ATR (режим-адаптивный)
 

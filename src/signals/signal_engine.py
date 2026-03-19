@@ -7,6 +7,7 @@ from decimal import Decimal
 from typing import Any, Optional
 
 import pandas as pd
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.analysis.correlation_engine import CorrelationEngine
@@ -28,9 +29,9 @@ from src.database.crud import (
     get_news_events,
     get_price_data,
     get_upcoming_economic_events,
+    has_open_position_for_instrument,
 )
-from src.database.models import Instrument, Signal
-from src.notifications.telegram import telegram
+from src.database.models import Instrument, RegimeState, Signal
 from src.signals.mtf_filter import MTFFilter
 from src.signals.risk_manager import RiskManager
 from src.tracker.trade_simulator import open_position_for_signal
@@ -121,20 +122,6 @@ def _price_redis_key(instrument_id: int, timeframe: str) -> str:
 _cooldown_cache: dict[tuple[int, str], datetime.datetime] = {}
 _last_signal_price_cache: dict[tuple[int, str], float] = {}
 
-# Telegram alert cooldown: don't send more than once per 4 hours per instrument
-TELEGRAM_COOLDOWN_HOURS = 4
-_telegram_sent_cache: dict[int, datetime.datetime] = {}  # instrument_id → last sent
-
-
-def _can_send_telegram(instrument_id: int) -> bool:
-    last = _telegram_sent_cache.get(instrument_id)
-    if last is None:
-        return True
-    return (datetime.datetime.now(datetime.timezone.utc) - last).total_seconds() > TELEGRAM_COOLDOWN_HOURS * 3600
-
-
-def _mark_telegram_sent(instrument_id: int) -> None:
-    _telegram_sent_cache[instrument_id] = datetime.datetime.now(datetime.timezone.utc)
 
 
 def _get_cached_llm(symbol: str, timeframe: str) -> Optional[tuple[float, dict]]:
@@ -347,6 +334,14 @@ class SignalEngine:
                 )
                 return None
 
+        # B. Open-position guard — skip if an active virtual position already exists
+        if await has_open_position_for_instrument(db, instrument.id):
+            logger.info(
+                f"[SignalEngine] {instrument.symbol}/{timeframe}: "
+                "open position exists — skipping new signal"
+            )
+            return None
+
         # FIX-07: Session filter — skip EU/NA forex pairs during Asian low-liquidity hours
         market_type = getattr(instrument, "market", "") or ""
         if _is_low_liquidity_session(instrument.symbol, market_type, now):
@@ -421,33 +416,39 @@ class SignalEngine:
             logger.warning(f"[SignalEngine] Calendar check error: {exc}")
 
         # 4. Run FA Engine (CryptoFAEngine for crypto, FAEngine for forex/stocks)
+        fa_components: Optional[dict] = None
         try:
             if instrument.market == "crypto":
                 crypto_fa = CryptoFAEngine(db)
                 crypto_result = await crypto_fa.analyze(instrument.id, instrument.symbol)
                 fa_score = crypto_result["score"]
+                fa_components = {
+                    "onchain": round(float(crypto_result["components"].get("onchain", 0)), 2),
+                    "cycle":   round(float(crypto_result["components"].get("cycle", 0)), 2),
+                }
                 logger.debug(
                     f"[SignalEngine] CryptoFA for {instrument.symbol}: {fa_score:.1f} "
-                    f"(onchain={crypto_result['components'].get('onchain', 0):.1f}, "
-                    f"cycle={crypto_result['components'].get('cycle', 0):.1f})"
+                    f"(onchain={fa_components['onchain']:.1f}, cycle={fa_components['cycle']:.1f})"
                 )
             else:
                 fa_engine = FAEngine(instrument, macro_records, news_records)
                 fa_score = fa_engine.calculate_fa_score()
         except Exception as exc:
-            logger.error(f"[SignalEngine] FA engine error: {exc}")
+            logger.warning(f"[SIM-17] fa_score returned fallback 0.0: {exc}")
             fa_score = 0.0
 
         # 5. Run Sentiment Engine V2 (FinBERT + multi-source, TextBlob fallback)
+        sentiment_meta: Optional[dict] = None
         try:
             sent_engine = SentimentEngineV2(news_events=news_records)
             sentiment_score = await sent_engine.calculate()
+            sentiment_meta = sent_engine.get_summary()
             logger.debug(
                 f"[SignalEngine] SentimentV2 for {instrument.symbol}: {sentiment_score:.1f} "
-                f"(sources: {sent_engine.get_summary()})"
+                f"(sources: {sentiment_meta})"
             )
         except Exception as exc:
-            logger.error(f"[SignalEngine] Sentiment V2 engine error: {exc}")
+            logger.warning(f"[SIM-17] sentiment_score returned fallback 0.0: {exc}")
             sentiment_score = 0.0
 
         # 6. Run Geo Engine V2 (GDELT real-time geopolitical risk)
@@ -457,7 +458,7 @@ class SignalEngine:
             await geo_engine.close()
             logger.debug(f"[SignalEngine] GeoV2 for {instrument.symbol}: {geo_score:.1f}")
         except Exception as exc:
-            logger.error(f"[SignalEngine] Geo V2 engine error: {exc}")
+            logger.warning(f"[SIM-17] geo_score returned fallback 0.0: {exc}")
             geo_score = 0.0
 
         # Run Correlation Engine (DXY, VIX, TNX)
@@ -533,6 +534,7 @@ class SignalEngine:
             composite_score *= 0.7
 
         # 9. Apply MTF filter
+        pre_mtf_score: float = composite_score
         if higher_tf_signals:
             composite_score = self.mtf_filter.apply(
                 composite_score, timeframe, higher_tf_signals
@@ -609,6 +611,12 @@ class SignalEngine:
             "weights": weights,
             "composite_raw": round(composite_score, 2),
             "calendar_block": calendar_block,
+            # Sub-components for deep analysis
+            "fa_components": fa_components,                          # crypto: onchain/cycle breakdown
+            "sentiment_meta": sentiment_meta,                        # news_count, sources available
+            "mtf_pre_score": round(pre_mtf_score, 2),               # score before MTF adjustment
+            "mtf_applied": bool(higher_tf_signals),                  # whether HTF context was used
+            "atr_at_signal": round(float(atr), 8) if atr else None, # absolute ATR for risk context
             "factors": [],
         }
 
@@ -676,6 +684,21 @@ class SignalEngine:
         horizon = self.mtf_filter.get_horizon(timeframe)
         expires_at = _calculate_expiry(timeframe)  # FIX-02: adaptive TTL per timeframe
 
+        # Fetch current regime for this instrument
+        current_regime: Optional[str] = None
+        try:
+            regime_row = await db.execute(
+                select(RegimeState)
+                .where(RegimeState.instrument_id == instrument.id)
+                .order_by(RegimeState.detected_at.desc())
+                .limit(1)
+            )
+            regime_obj = regime_row.scalar_one_or_none()
+            if regime_obj:
+                current_regime = regime_obj.regime
+        except Exception:
+            pass
+
         signal_data = {
             "instrument_id": instrument.id,
             "timeframe": timeframe,
@@ -703,6 +726,8 @@ class SignalEngine:
                 for k, v in ta_indicators.items()
                 if v is not None
             }),
+            "regime": current_regime,
+            "market_price_at_signal": current_price,
             "status": initial_status,
             "expires_at": expires_at,
         }
@@ -713,12 +738,14 @@ class SignalEngine:
         # Commit so the signal is persisted before Telegram alert fires
         await db.commit()
 
-        # Open virtual position immediately (market order simulation)
-        try:
-            await open_position_for_signal(signal, db)
-            await db.commit()
-        except Exception as exc:
-            logger.warning(f"[SignalEngine] Failed to open simulator position: {exc}")
+        # Open virtual position only for market-order signals (tracking).
+        # Limit-order signals (created) wait for price to reach entry in signal_tracker.
+        if initial_status == "tracking":
+            try:
+                await open_position_for_signal(signal, db)
+                await db.commit()
+            except Exception as exc:
+                logger.warning(f"[SignalEngine] Failed to open simulator position: {exc}")
 
         # Update Redis + in-memory caches so subsequent checks work immediately
         _cooldown_cache[cooldown_key] = now
@@ -756,21 +783,6 @@ class SignalEngine:
                 "geo_score": round(geo_score, 2),
             },
         )
-
-        # Send Telegram alert: only STRONG_BUY/STRONG_SELL, max once per 4h per instrument
-        is_strong = signal_strength in ("STRONG_BUY", "STRONG_SELL")
-        if is_strong and _can_send_telegram(instrument.id):
-            try:
-                await telegram.send_signal_alert(signal, instrument.symbol, instrument.name)
-                _mark_telegram_sent(instrument.id)
-            except Exception as exc:
-                logger.warning(f"[SignalEngine] Telegram alert failed: {exc}")
-        else:
-            logger.debug(
-                f"[SignalEngine] Telegram skipped for {instrument.symbol}/{timeframe} "
-                f"(strength={signal_strength}, strong={is_strong}, "
-                f"cooldown={'active' if not _can_send_telegram(instrument.id) else 'ok'})"
-            )
 
         return signal
 

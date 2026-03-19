@@ -134,7 +134,7 @@ class FAEngine:
 
     def _analyze_crypto_fundamentals(self) -> float:
         """Crypto has minimal fundamental analysis in Phase 1."""
-        # In Phase 2, integrate on-chain metrics, dominance, etc.
+        logger.warning("[SIM-17] fa_score returned fallback 0.0: crypto FA not yet implemented")
         return 0.0
 
     def _news_sentiment_adjustment(self) -> float:
@@ -172,6 +172,7 @@ class FAEngine:
         elif market == "crypto":
             base_score = self._analyze_crypto_fundamentals()
         else:
+            logger.warning("[SIM-17] fa_score returned fallback 0.0: unknown market type %r", market)
             base_score = 0.0
 
         # Apply news adjustment (small weight)
