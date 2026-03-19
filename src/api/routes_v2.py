@@ -13,8 +13,11 @@ from sqlalchemy import delete, func, over, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.database.crud import (
+    create_backtest_run,
     get_active_signals,
     get_all_instruments,
+    get_backtest_results,
+    get_backtest_run,
     get_instrument_by_symbol,
     get_latest_signal_for_instrument,
     get_open_positions,
@@ -23,6 +26,7 @@ from src.database.crud import (
     get_signals,
     get_upcoming_economic_events,
     get_virtual_account,
+    list_backtest_runs,
 )
 from src.database.engine import async_session_factory
 from src.database.models import (
@@ -186,33 +190,36 @@ class AccuracyV2(BaseModel):
 
 
 class BacktestRunResponse(BaseModel):
-    id: int
-    started_at: datetime.datetime
-    completed_at: Optional[datetime.datetime]
-    oos_sharpe: Optional[float]
-    oos_profit_factor: Optional[float]
-    oos_win_rate: Optional[float]
-    oos_max_drawdown: Optional[float]
-    oos_total_trades: Optional[int]
-    monte_carlo_ci_drawdown: Optional[float]
-    passed_validation: Optional[bool]
-    optimal_weights: Optional[str]
+    """SIM-22 v4 schema."""
+    id: str
+    status: str
+    started_at: Optional[datetime.datetime] = None
+    completed_at: Optional[datetime.datetime] = None
+    params: Optional[str] = None
+    summary: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
 
 class BacktestTradeResponse(BaseModel):
+    """SIM-22 v4 schema."""
     id: int
-    direction: Optional[str]
-    entry_price: Optional[float]
-    exit_price: Optional[float]
-    sl: Optional[float]
-    tp: Optional[float]
-    pnl_pct: Optional[float]
-    entry_time: Optional[datetime.datetime]
-    exit_time: Optional[datetime.datetime]
-    exit_reason: Optional[str]
-    regime: Optional[str]
+    run_id: str
+    symbol: Optional[str] = None
+    timeframe: Optional[str] = None
+    direction: Optional[str] = None
+    entry_price: Optional[float] = None
+    exit_price: Optional[float] = None
+    exit_reason: Optional[str] = None
+    pnl_pips: Optional[float] = None
+    pnl_usd: Optional[float] = None
+    result: Optional[str] = None
+    composite_score: Optional[float] = None
+    entry_at: Optional[datetime.datetime] = None
+    exit_at: Optional[datetime.datetime] = None
+    duration_minutes: Optional[int] = None
+    mfe: Optional[float] = None
+    mae: Optional[float] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -478,49 +485,111 @@ async def get_accuracy_by_market_tf(
 
 # ── Backtesting ───────────────────────────────────────────────────────────────
 
-@router_v2.get("/backtests", response_model=list[BacktestRunResponse])
-async def list_backtests(
+@router_v2.get("/backtest/list", response_model=list[BacktestRunResponse])
+async def list_backtests_v4(
     limit: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_session),
 ):
-    result = await db.execute(
-        select(BacktestRun)
-        .order_by(BacktestRun.started_at.desc())
-        .limit(limit)
-    )
-    return list(result.scalars().all())
+    """SIM-22: List all backtest runs, newest first."""
+    runs = await list_backtest_runs(db, limit=limit)
+    return runs
 
 
-@router_v2.get("/backtests/{run_id}", response_model=BacktestRunResponse)
-async def get_backtest(run_id: int, db: AsyncSession = Depends(get_session)):
-    result = await db.execute(select(BacktestRun).where(BacktestRun.id == run_id))
-    run = result.scalar_one_or_none()
+@router_v2.get("/backtest/{run_id}/status")
+async def get_backtest_status(run_id: str, db: AsyncSession = Depends(get_session)):
+    """SIM-22: Current status of a backtest run."""
+    run = await get_backtest_run(db, run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Backtest run not found")
-    return run
+    return {
+        "run_id": run.id,
+        "status": run.status,
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+    }
 
 
-@router_v2.get("/backtests/{run_id}/trades", response_model=list[BacktestTradeResponse])
-async def get_backtest_trades(
-    run_id: int,
+@router_v2.get("/backtest/{run_id}/results")
+async def get_backtest_results_endpoint(
+    run_id: str,
     db: AsyncSession = Depends(get_session),
 ):
-    result = await db.execute(
-        select(BacktestTrade).where(BacktestTrade.run_id == run_id)
-    )
-    return list(result.scalars().all())
+    """SIM-22: Full backtest results: summary + trade list."""
+    results = await get_backtest_results(db, run_id)
+    if not results:
+        raise HTTPException(status_code=404, detail="Backtest run not found")
+    return results
 
 
-@router_v2.post("/backtest/run")
-async def trigger_backtest():
-    """Trigger async backtest via Celery."""
+@router_v2.post("/backtest/run", status_code=202)
+async def run_backtest_v4(
+    body: dict,
+    db: AsyncSession = Depends(get_session),
+):
+    """SIM-22: Start a new backtest run (async, non-blocking).
+
+    Body: {symbols, timeframe, start_date, end_date, account_size,
+           apply_slippage, apply_swap}
+
+    Returns run_id immediately; poll /backtest/{run_id}/status for progress.
+    """
+    from src.backtesting.backtest_engine import BacktestEngine
+    from src.backtesting.backtest_params import BacktestParams
+    import asyncio
+
     try:
-        from src.scheduler.tasks import run_weekly_backtest
-        task = run_weekly_backtest.delay()
-        return {"status": "queued", "task_id": task.id}
+        params = BacktestParams(**body)
     except Exception as exc:
-        logger.error("Failed to queue backtest: %s", exc)
-        raise HTTPException(status_code=503, detail="Celery unavailable")
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    # Create the run record immediately so caller gets run_id
+    run_id = await create_backtest_run(db, params.model_dump(mode="json"))
+    await db.commit()
+
+    # Launch simulation in background (fire-and-forget)
+    async def _run_bg() -> None:
+        from src.database.engine import async_session_factory
+        from src.backtesting.backtest_engine import BacktestEngine
+        async with async_session_factory() as bg_session:
+            engine = BacktestEngine(bg_session)
+            # Use the existing run_id but skip create_backtest_run (already done)
+            from src.database.crud import update_backtest_run, create_backtest_trades_bulk
+            from src.backtesting.backtest_engine import _compute_summary
+            await update_backtest_run(bg_session, run_id, "running")
+            await bg_session.commit()
+            try:
+                trades = await engine._simulate(params)
+                summary = _compute_summary(trades, params.account_size)
+                trade_dicts = [
+                    {
+                        "symbol": t.symbol, "timeframe": t.timeframe,
+                        "direction": t.direction,
+                        "entry_price": str(t.entry_price),
+                        "exit_price": str(t.exit_price) if t.exit_price else None,
+                        "exit_reason": t.exit_reason,
+                        "pnl_pips": str(t.pnl_pips) if t.pnl_pips else None,
+                        "pnl_usd": str(t.pnl_usd) if t.pnl_usd else None,
+                        "result": t.result,
+                        "composite_score": str(t.composite_score) if t.composite_score else None,
+                        "entry_at": t.entry_at, "exit_at": t.exit_at,
+                        "duration_minutes": t.duration_minutes,
+                        "mfe": str(t.mfe) if t.mfe else None,
+                        "mae": str(t.mae) if t.mae else None,
+                    }
+                    for t in trades
+                ]
+                await create_backtest_trades_bulk(bg_session, run_id, trade_dicts)
+                await update_backtest_run(bg_session, run_id, "completed", summary)
+                await bg_session.commit()
+                logger.info("[SIM-22] Background backtest %s completed: %d trades", run_id, len(trades))
+            except Exception as exc:
+                logger.error("[SIM-22] Background backtest %s failed: %s", run_id, exc)
+                await update_backtest_run(bg_session, run_id, "failed", {"error": str(exc)})
+                await bg_session.commit()
+
+    asyncio.create_task(_run_bg())
+
+    return {"run_id": run_id, "status": "running"}
 
 
 # ── Macroeconomics ────────────────────────────────────────────────────────────

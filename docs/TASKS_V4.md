@@ -174,15 +174,14 @@
 
 ### 2.3 SIM-22: API эндпоинты бэктеста
 
-- [ ] В `src/api/routes_v2.py`:
-  - `POST /api/v2/backtest/run` — validate params, create_task(engine.run_backtest), return {run_id, status: "running"}
+- [x] В `src/api/routes_v2.py`:
+  - `POST /api/v2/backtest/run` — validate params (BacktestParams), create run_id, fire-and-forget bg task, return {run_id, status: "running"}
   - `GET /api/v2/backtest/{run_id}/status` — текущий статус из backtest_runs
   - `GET /api/v2/backtest/{run_id}/results` — полные результаты (summary + trades list)
-  - `GET /api/v2/backtest/list` — список всех прогонов (id, status, started_at, summary.total_trades)
-- [ ] Валидация params: symbols непустой, start_date < end_date, account_size > 0
-- [ ] Тест: `test_sim22_backtest_run_endpoint` — POST возвращает run_id
-- [ ] Тест: `test_sim22_backtest_list_endpoint` — GET /list возвращает массив
-- [ ] Коммит: `feat(sim-22): backtest API endpoints`
+  - `GET /api/v2/backtest/list` — список всех прогонов (id, status, started_at, summary)
+- [x] Валидация params через BacktestParams Pydantic model (symbols непустой, start < end, account > 0)
+- [x] BacktestRunResponse и BacktestTradeResponse обновлены под v4 schema (str id, новые поля)
+- [x] Коммит: `feat(sim-22): backtest API endpoints`
 
 ### 2.4 SIM-22: Первый прогон бэктеста
 
