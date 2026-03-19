@@ -851,6 +851,31 @@ class BacktestEngine:
                 return False
         return True
 
+    # SIM-38: DXY filter — USD long-side pairs affected by DXY RSI
+    _USD_LONG_SIDE_PAIRS: frozenset[str] = frozenset({
+        "EURUSD=X", "GBPUSD=X", "AUDUSD=X", "NZDUSD=X"
+    })
+
+    @staticmethod
+    def _check_dxy_alignment(direction: str, symbol: str, dxy_rsi: Optional[float]) -> bool:
+        """SIM-38: DXY RSI filter for forex USD pairs. No data → passthrough.
+
+        DXY RSI > 55 → USD strong → block LONG for USD long-side pairs
+        DXY RSI < 45 → USD weak → block SHORT for USD long-side pairs
+        45-55 → neutral, no filter
+        """
+        if dxy_rsi is None:
+            return True  # no DXY data → no filter
+        if symbol not in BacktestEngine._USD_LONG_SIDE_PAIRS:
+            return True  # only applies to USD long-side pairs
+        if dxy_rsi > 55 and direction == "LONG":
+            logger.debug("[SIM-38] DXY RSI=%.1f > 55: blocking LONG for %s", dxy_rsi, symbol)
+            return False
+        if dxy_rsi < 45 and direction == "SHORT":
+            logger.debug("[SIM-38] DXY RSI=%.1f < 45: blocking SHORT for %s", dxy_rsi, symbol)
+            return False
+        return True
+
     def _generate_signal(
         self,
         df: pd.DataFrame,

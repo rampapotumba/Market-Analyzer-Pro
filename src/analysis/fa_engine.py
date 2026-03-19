@@ -179,4 +179,29 @@ class FAEngine:
         news_adj = self._news_sentiment_adjustment()
         final_score = base_score * 0.8 + news_adj * 0.2
 
+        # SIM-41: COT data adjustment (forex only — COT non-commercials net positions)
+        try:
+            from src.collectors.cot_collector import get_cot_fa_adjustment
+            symbol = self.instrument.symbol if hasattr(self.instrument, "symbol") else ""
+            cot_indicator = f"COT_NET_{symbol}"
+            cot_values = [
+                item for item in self.macro_data
+                if (
+                    item.indicator_name if hasattr(item, "indicator_name")
+                    else item.get("indicator_name", "")
+                ) == cot_indicator
+            ]
+            if len(cot_values) >= 2:
+                latest_val = cot_values[0].value if hasattr(cot_values[0], "value") else cot_values[0].get("value", 0)
+                prev_val = cot_values[1].value if hasattr(cot_values[1], "value") else cot_values[1].get("value", 0)
+                latest = float(latest_val)
+                previous = float(prev_val)
+                change = latest - previous
+                cot_adj = get_cot_fa_adjustment(latest, change)
+                if cot_adj != 0:
+                    final_score += cot_adj
+                    logger.debug("[SIM-41] COT adjustment: %+.0f for %s", cot_adj, symbol)
+        except Exception as exc:
+            logger.debug("[SIM-41] COT error: %s", exc)
+
         return max(-100.0, min(100.0, final_score))

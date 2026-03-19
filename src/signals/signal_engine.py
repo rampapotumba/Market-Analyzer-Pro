@@ -69,6 +69,51 @@ _TF_EXPIRY_CANDLES: dict[str, int] = {
 # SIM-31: Allowed signal strengths (weak signals filtered out)
 ALLOWED_SIGNAL_STRENGTHS = {"BUY", "STRONG_BUY", "SELL", "STRONG_SELL"}
 
+# SIM-38: DXY filter pairs — USD is the quote currency (USD long-side)
+_USD_LONG_SIDE_PAIRS: frozenset[str] = frozenset({
+    "EURUSD=X", "GBPUSD=X", "AUDUSD=X", "NZDUSD=X"
+})
+
+# In-memory cache for DXY RSI (updated by realtime_collector)
+_dxy_rsi_cache: Optional[float] = None
+
+
+def update_dxy_rsi(rsi_value: float) -> None:
+    """Called by realtime_collector to update the DXY RSI cache."""
+    global _dxy_rsi_cache
+    _dxy_rsi_cache = rsi_value
+
+
+def _check_dxy_alignment(direction: str, symbol: str, dxy_rsi: Optional[float] = None) -> bool:
+    """SIM-38: DXY RSI filter. No data → passthrough."""
+    rsi = dxy_rsi if dxy_rsi is not None else _dxy_rsi_cache
+    if rsi is None:
+        return True
+    if symbol not in _USD_LONG_SIDE_PAIRS:
+        return True
+    if rsi > 55 and direction == "LONG":
+        logger.debug("[SIM-38] DXY RSI=%.1f > 55: blocking LONG for %s", rsi, symbol)
+        return False
+    if rsi < 45 and direction == "SHORT":
+        logger.debug("[SIM-38] DXY RSI=%.1f < 45: blocking SHORT for %s", rsi, symbol)
+        return False
+    return True
+
+
+def _get_funding_rate_adjustment(funding_rate: Optional[float], direction: str, market: str) -> float:
+    """SIM-40: Penalize composite if funding rate is extreme (crypto only).
+
+    FR > +0.1%: LONG penalty -10
+    FR < -0.1%: SHORT penalty -10
+    """
+    if market != "crypto" or funding_rate is None:
+        return 0.0
+    if funding_rate > 0.001 and direction == "LONG":   # > 0.1%
+        return -10.0
+    if funding_rate < -0.001 and direction == "SHORT":  # < -0.1%
+        return -10.0
+    return 0.0
+
 
 def _calculate_expiry(timeframe: str) -> datetime.datetime:
     """Return signal expiry timestamp based on timeframe (FIX-02).
@@ -565,6 +610,41 @@ class SignalEngine:
         if signal_strength not in ALLOWED_SIGNAL_STRENGTHS:
             logger.debug(f"[SIM-31] Filtered weak signal: {signal_strength} for {instrument.symbol}")
             return None
+
+        # SIM-38: DXY alignment filter (forex only)
+        if market_type == "forex" and direction != "HOLD":
+            if not _check_dxy_alignment(direction, instrument.symbol):
+                logger.info("[SIM-38] DXY filter blocked %s %s", direction, instrument.symbol)
+                return None
+
+        # SIM-39: Fear & Greed composite adjustment for crypto
+        if market_type == "crypto" and direction != "HOLD":
+            try:
+                from src.collectors.fear_greed_collector import get_cached_fear_greed, get_fear_greed_adjustment
+                fg_value = get_cached_fear_greed()
+                fg_adj = get_fear_greed_adjustment(fg_value, direction, instrument.symbol)
+                if fg_adj != 0:
+                    composite_score += fg_adj
+                    composite_score = max(-100.0, min(100.0, composite_score))
+                    logger.debug("[SIM-39] Fear & Greed adjustment: %+d for %s", fg_adj, instrument.symbol)
+            except Exception as exc:
+                logger.debug("[SIM-39] Fear & Greed error: %s", exc)
+
+        # SIM-40: Funding rate extreme filter (crypto only)
+        if market_type == "crypto" and direction != "HOLD":
+            try:
+                from src.database.crud import get_latest_funding_rate
+                latest_fr = await get_latest_funding_rate(db, instrument.id)
+                if latest_fr is not None:
+                    fr_raw = latest_fr.funding_rate if hasattr(latest_fr, "funding_rate") else latest_fr
+                    fr_value = float(fr_raw)
+                    fr_adj = _get_funding_rate_adjustment(fr_value, direction, market_type)
+                    if fr_adj != 0:
+                        composite_score += fr_adj
+                        composite_score = max(-100.0, min(100.0, composite_score))
+                        logger.debug("[SIM-40] Funding rate adjustment: %+.0f for %s", fr_adj, instrument.symbol)
+            except Exception as exc:
+                logger.debug("[SIM-40] Funding rate error: %s", exc)
 
         # 11a. SIM-21: Correlation group guard (direction-aware)
         if direction != "HOLD":

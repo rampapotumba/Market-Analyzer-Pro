@@ -189,3 +189,23 @@ class COTCollector(BaseCollector):
                 return r.status_code in (200, 302, 301)
         except Exception:
             return False
+
+
+def get_cot_fa_adjustment(
+    net_positions: Optional[float],
+    change_week: Optional[float],
+) -> float:
+    """SIM-41: Calculate FA score adjustment from COT data.
+
+    Non-commercials net long + increasing → +5
+    Non-commercials net short + increasing (more negative) → -5
+    No data → 0
+    """
+    if net_positions is None or change_week is None:
+        return 0.0
+
+    if net_positions > 0 and change_week > 0:
+        return 5.0   # net long and growing → bullish
+    if net_positions < 0 and change_week < 0:
+        return -5.0  # net short and growing → bearish
+    return 0.0

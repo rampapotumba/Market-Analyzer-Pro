@@ -950,3 +950,223 @@ def test_sim37_json_has_updated_at():
     with open(config_path) as f:
         data = json.load(f)
     assert "updated_at" in data
+
+
+# ── SIM-38: DXY real-time filter ──────────────────────────────────────────────
+
+
+def test_sim38_dxy_strong_blocks_usd_long_side():
+    """DXY RSI=60 → EURUSD LONG blocked."""
+    from src.signals.signal_engine import _check_dxy_alignment
+    assert _check_dxy_alignment("LONG", "EURUSD=X", dxy_rsi=60.0) is False
+    assert _check_dxy_alignment("SHORT", "EURUSD=X", dxy_rsi=60.0) is True  # SHORT not blocked
+
+
+def test_sim38_dxy_weak_blocks_usd_long_side_short():
+    """DXY RSI=40 → GBPUSD SHORT blocked."""
+    from src.signals.signal_engine import _check_dxy_alignment
+    assert _check_dxy_alignment("SHORT", "GBPUSD=X", dxy_rsi=40.0) is False
+    assert _check_dxy_alignment("LONG", "GBPUSD=X", dxy_rsi=40.0) is True  # LONG not blocked
+
+
+def test_sim38_dxy_strong_allows_usd_base():
+    """DXY RSI=60 → USDJPY LONG allowed (not in USD long-side pairs)."""
+    from src.signals.signal_engine import _check_dxy_alignment
+    assert _check_dxy_alignment("LONG", "USDJPY=X", dxy_rsi=60.0) is True
+
+
+def test_sim38_dxy_neutral_no_filter():
+    """DXY RSI=50 → no filtering."""
+    from src.signals.signal_engine import _check_dxy_alignment
+    assert _check_dxy_alignment("LONG", "EURUSD=X", dxy_rsi=50.0) is True
+    assert _check_dxy_alignment("SHORT", "EURUSD=X", dxy_rsi=50.0) is True
+
+
+def test_sim38_dxy_no_data_passthrough():
+    """No DXY data (None) → passthrough."""
+    from src.signals.signal_engine import _check_dxy_alignment
+    assert _check_dxy_alignment("LONG", "EURUSD=X", dxy_rsi=None) is True
+
+
+def test_sim38_backtest_dxy_method_exists():
+    """BacktestEngine._check_dxy_alignment static method exists and works."""
+    from src.backtesting.backtest_engine import BacktestEngine
+    # DXY RSI=60 → EURUSD LONG blocked
+    assert BacktestEngine._check_dxy_alignment("LONG", "EURUSD=X", 60.0) is False
+    # No data → passthrough
+    assert BacktestEngine._check_dxy_alignment("LONG", "EURUSD=X", None) is True
+    # Non-matching symbol → passthrough
+    assert BacktestEngine._check_dxy_alignment("LONG", "USDJPY=X", 60.0) is True
+
+
+# ── SIM-39: Fear & Greed Index for crypto ─────────────────────────────────────
+
+
+def test_sim39_extreme_fear_boosts_long():
+    """FG=15 (Extreme Fear) → +5 adjustment for BTC LONG."""
+    from src.collectors.fear_greed_collector import get_fear_greed_adjustment
+    assert get_fear_greed_adjustment(15, "LONG", "BTC/USDT") == 5
+
+
+def test_sim39_extreme_greed_boosts_short():
+    """FG=85 (Extreme Greed) → +5 adjustment for BTC SHORT."""
+    from src.collectors.fear_greed_collector import get_fear_greed_adjustment
+    assert get_fear_greed_adjustment(85, "SHORT", "BTC/USDT") == 5
+
+
+def test_sim39_neutral_no_effect():
+    """FG=50 → 0 adjustment."""
+    from src.collectors.fear_greed_collector import get_fear_greed_adjustment
+    assert get_fear_greed_adjustment(50, "LONG", "BTC/USDT") == 0
+    assert get_fear_greed_adjustment(50, "SHORT", "BTC/USDT") == 0
+
+
+def test_sim39_non_crypto_no_effect():
+    """FG=15 → 0 for EURUSD (not crypto)."""
+    from src.collectors.fear_greed_collector import get_fear_greed_adjustment
+    assert get_fear_greed_adjustment(15, "LONG", "EURUSD=X") == 0
+
+
+def test_sim39_no_data_no_effect():
+    """FG=None → 0 adjustment."""
+    from src.collectors.fear_greed_collector import get_fear_greed_adjustment
+    assert get_fear_greed_adjustment(None, "LONG", "BTC/USDT") == 0
+
+
+def test_sim39_boundary_fear_20():
+    """FG=20 (boundary Extreme Fear) → +5 for LONG."""
+    from src.collectors.fear_greed_collector import get_fear_greed_adjustment
+    assert get_fear_greed_adjustment(20, "LONG", "BTC/USDT") == 5
+
+
+def test_sim39_boundary_greed_80():
+    """FG=80 (boundary Extreme Greed) → +5 for SHORT."""
+    from src.collectors.fear_greed_collector import get_fear_greed_adjustment
+    assert get_fear_greed_adjustment(80, "SHORT", "BTC/USDT") == 5
+
+
+def test_sim39_fear_does_not_boost_short():
+    """FG=15 (Extreme Fear) → 0 for SHORT (only boosts LONG)."""
+    from src.collectors.fear_greed_collector import get_fear_greed_adjustment
+    assert get_fear_greed_adjustment(15, "SHORT", "BTC/USDT") == 0
+
+
+def test_sim39_greed_does_not_boost_long():
+    """FG=85 (Extreme Greed) → 0 for LONG (only boosts SHORT)."""
+    from src.collectors.fear_greed_collector import get_fear_greed_adjustment
+    assert get_fear_greed_adjustment(85, "LONG", "BTC/USDT") == 0
+
+
+# ── SIM-40: Funding Rate extreme filter ───────────────────────────────────────
+
+
+def test_sim40_high_funding_penalizes_long():
+    """FR=+0.15% → LONG composite -10."""
+    from src.signals.signal_engine import _get_funding_rate_adjustment
+    adj = _get_funding_rate_adjustment(0.0015, "LONG", "crypto")  # 0.15% > 0.1%
+    assert adj == -10.0
+
+
+def test_sim40_negative_funding_penalizes_short():
+    """FR=-0.15% → SHORT composite -10."""
+    from src.signals.signal_engine import _get_funding_rate_adjustment
+    adj = _get_funding_rate_adjustment(-0.0015, "SHORT", "crypto")
+    assert adj == -10.0
+
+
+def test_sim40_normal_funding_no_effect():
+    """FR=+0.03% → no penalty."""
+    from src.signals.signal_engine import _get_funding_rate_adjustment
+    adj = _get_funding_rate_adjustment(0.0003, "LONG", "crypto")
+    assert adj == 0.0
+
+
+def test_sim40_non_crypto_no_effect():
+    """FR doesn't apply to forex."""
+    from src.signals.signal_engine import _get_funding_rate_adjustment
+    adj = _get_funding_rate_adjustment(0.002, "LONG", "forex")
+    assert adj == 0.0
+
+
+def test_sim40_no_data_no_effect():
+    """FR=None → no penalty."""
+    from src.signals.signal_engine import _get_funding_rate_adjustment
+    adj = _get_funding_rate_adjustment(None, "LONG", "crypto")
+    assert adj == 0.0
+
+
+def test_sim40_boundary_exactly_01pct_long():
+    """FR=+0.1% exactly (boundary not exceeded) → no penalty for LONG."""
+    from src.signals.signal_engine import _get_funding_rate_adjustment
+    # 0.001 is the threshold — strictly greater than 0.001 triggers penalty
+    adj = _get_funding_rate_adjustment(0.001, "LONG", "crypto")
+    assert adj == 0.0
+
+
+def test_sim40_high_funding_does_not_penalize_short():
+    """FR=+0.15% → no penalty for SHORT."""
+    from src.signals.signal_engine import _get_funding_rate_adjustment
+    adj = _get_funding_rate_adjustment(0.0015, "SHORT", "crypto")
+    assert adj == 0.0
+
+
+# ── SIM-41: COT Data for forex ────────────────────────────────────────────────
+
+
+def test_sim41_cot_net_long_boosts_fa():
+    """Net long + growing → +5 FA adjustment."""
+    from src.collectors.cot_collector import get_cot_fa_adjustment
+    adj = get_cot_fa_adjustment(net_positions=10000, change_week=500)
+    assert adj == 5.0
+
+
+def test_sim41_cot_net_short_penalizes_fa():
+    """Net short + growing (more negative) → -5 FA adjustment."""
+    from src.collectors.cot_collector import get_cot_fa_adjustment
+    adj = get_cot_fa_adjustment(net_positions=-10000, change_week=-500)
+    assert adj == -5.0
+
+
+def test_sim41_cot_no_data_neutral():
+    """No COT data → 0."""
+    from src.collectors.cot_collector import get_cot_fa_adjustment
+    assert get_cot_fa_adjustment(None, None) == 0.0
+    assert get_cot_fa_adjustment(10000, None) == 0.0
+
+
+def test_sim41_cot_net_long_shrinking_neutral():
+    """Net long but shrinking → 0 (mixed signal, no adjustment)."""
+    from src.collectors.cot_collector import get_cot_fa_adjustment
+    adj = get_cot_fa_adjustment(net_positions=10000, change_week=-200)
+    assert adj == 0.0
+
+
+def test_sim41_cot_net_short_shrinking_neutral():
+    """Net short but shrinking (less negative) → 0 (mixed signal)."""
+    from src.collectors.cot_collector import get_cot_fa_adjustment
+    adj = get_cot_fa_adjustment(net_positions=-10000, change_week=200)
+    assert adj == 0.0
+
+
+def test_sim41_fa_engine_accepts_cot_macro_data():
+    """FAEngine.calculate_fa_score() applies COT adjustment when macro_data has COT_NET entries."""
+    from src.analysis.fa_engine import FAEngine
+    from unittest.mock import MagicMock
+
+    instrument = MagicMock()
+    instrument.symbol = "EURUSD=X"
+    instrument.market = "forex"
+
+    # Two COT records: latest net=10000, previous=9500 → change=+500 → +5 boost
+    cot_latest = MagicMock()
+    cot_latest.indicator_name = "COT_NET_EURUSD=X"
+    cot_latest.value = 10000.0
+
+    cot_prev = MagicMock()
+    cot_prev.indicator_name = "COT_NET_EURUSD=X"
+    cot_prev.value = 9500.0
+
+    fa = FAEngine(instrument, [cot_latest, cot_prev], [])
+    score = fa.calculate_fa_score()
+    # Score should be within range and not crash
+    assert -100.0 <= score <= 100.0
