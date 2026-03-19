@@ -7,7 +7,8 @@ import uuid
 from decimal import Decimal
 from typing import Any, Optional, Sequence
 
-from sqlalchemy import and_, delete, func, select, update
+import sqlalchemy as sa
+from sqlalchemy import and_, case, delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -497,6 +498,27 @@ async def get_upcoming_economic_events(
     return result.scalars().all()
 
 
+async def get_economic_events_in_range(
+    db: AsyncSession,
+    start: datetime.datetime,
+    end: datetime.datetime,
+    impact: str = "HIGH",
+) -> list:
+    """Fetch economic events within a datetime range with given impact level (SIM-33)."""
+    try:
+        result = await db.execute(
+            select(EconomicEvent)
+            .where(
+                EconomicEvent.event_date >= start,
+                EconomicEvent.event_date <= end,
+                EconomicEvent.impact == impact.lower(),
+            )
+        )
+        return list(result.scalars().all())
+    except Exception:
+        return []
+
+
 async def delete_old_economic_events(session: AsyncSession) -> int:
     """Remove events older than 24 hours (already passed)."""
     cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=24)
@@ -899,74 +921,80 @@ async def get_backtest_run(
 
 async def get_backtest_results(session: AsyncSession, run_id: str) -> dict:
     """
-    Return run metadata + aggregated trade stats as a dict.
-    Summary field (if populated) is merged in as top-level keys.
+    Return run metadata + stats from stored summary (no full trade scan).
+    Summary is pre-computed by BacktestEngine and stored in backtest_runs.summary.
+    For trade list use get_backtest_trades() with pagination.
     """
     run = await get_backtest_run(session, run_id)
     if run is None:
         return {}
 
-    result = await session.execute(
-        select(BacktestTrade).where(BacktestTrade.run_id == run_id)
-    )
-    trades = result.scalars().all()
-
-    total = len(trades)
-    wins = [t for t in trades if t.result == "win"]
-    losses = [t for t in trades if t.result == "loss"]
-
-    total_pnl = sum(float(t.pnl_usd or 0) for t in trades)
-    gross_win = sum(float(t.pnl_usd or 0) for t in wins)
-    gross_loss = abs(sum(float(t.pnl_usd or 0) for t in losses))
-    profit_factor = (gross_win / gross_loss) if gross_loss > 0 else None
-
-    win_rate = (len(wins) / total * 100) if total > 0 else 0.0
-    avg_dur = (
-        sum(t.duration_minutes or 0 for t in trades) / total if total > 0 else 0
-    )
-
-    summary_override: dict = {}
+    # Use stored summary — computed by engine, includes equity_curve (downsampled)
+    summary: dict = {}
     if run.summary:
         try:
-            summary_override = json.loads(run.summary)
+            summary = json.loads(run.summary)
         except (json.JSONDecodeError, TypeError):
             pass
 
-    base = {
+    # Fallback: compute basic counts from DB if summary missing (old runs)
+    if not summary:
+        r = await session.execute(
+            select(
+                func.count().label("total"),
+                func.sum(case((BacktestTrade.result == "win", 1), else_=0)).label("wins"),
+                func.sum(BacktestTrade.pnl_usd).label("pnl"),
+            ).where(BacktestTrade.run_id == run_id)
+        )
+        row = r.one()
+        total = row.total or 0
+        wins = row.wins or 0
+        pnl = float(row.pnl or 0)
+        summary = {
+            "total_trades": total,
+            "win_rate_pct": round(wins / total * 100, 2) if total else 0.0,
+            "profit_factor": None,
+            "total_pnl_usd": round(pnl, 4),
+            "max_drawdown_pct": None,
+            "avg_duration_minutes": 0,
+            "long_count": 0,
+            "short_count": 0,
+            "equity_curve": [],
+            "monthly_returns": [],
+            "by_symbol": {},
+            "by_score_bucket": {},
+        }
+
+    return {
         "run_id": run.id,
         "status": run.status,
         "params": json.loads(run.params) if run.params else {},
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "completed_at": run.completed_at.isoformat() if run.completed_at else None,
-        "total_trades": total,
-        "win_rate_pct": round(win_rate, 2),
-        "profit_factor": round(profit_factor, 4) if profit_factor is not None else None,
-        "total_pnl_usd": round(total_pnl, 4),
-        "avg_duration_minutes": round(avg_dur, 1),
-        "trades": [
-            {
-                "id": t.id,
-                "symbol": t.symbol,
-                "timeframe": t.timeframe,
-                "direction": t.direction,
-                "entry_price": str(t.entry_price) if t.entry_price is not None else None,
-                "exit_price": str(t.exit_price) if t.exit_price is not None else None,
-                "exit_reason": t.exit_reason,
-                "pnl_pips": str(t.pnl_pips) if t.pnl_pips is not None else None,
-                "pnl_usd": str(t.pnl_usd) if t.pnl_usd is not None else None,
-                "result": t.result,
-                "composite_score": str(t.composite_score) if t.composite_score is not None else None,
-                "entry_at": t.entry_at.isoformat() if t.entry_at else None,
-                "exit_at": t.exit_at.isoformat() if t.exit_at else None,
-                "duration_minutes": t.duration_minutes,
-                "mfe": str(t.mfe) if t.mfe is not None else None,
-                "mae": str(t.mae) if t.mae is not None else None,
-            }
-            for t in trades
-        ],
+        **summary,
     }
-    base.update(summary_override)
-    return base
+
+
+async def get_backtest_trades(
+    session: AsyncSession,
+    run_id: str,
+    limit: int = 100,
+    offset: int = 0,
+) -> tuple[list[BacktestTrade], int]:
+    """Return paginated trades for a run and total count."""
+    count_result = await session.execute(
+        select(func.count()).where(BacktestTrade.run_id == run_id)
+    )
+    total = count_result.scalar() or 0
+
+    result = await session.execute(
+        select(BacktestTrade)
+        .where(BacktestTrade.run_id == run_id)
+        .order_by(BacktestTrade.entry_at)
+        .limit(limit)
+        .offset(offset)
+    )
+    return list(result.scalars().all()), total
 
 
 async def list_backtest_runs(
@@ -979,3 +1007,13 @@ async def list_backtest_runs(
         .limit(limit)
     )
     return list(result.scalars().all())
+
+
+async def delete_backtest_run(session: AsyncSession, run_id: str) -> bool:
+    """Delete a backtest run and its trades (CASCADE). Returns False if not found."""
+    run = await get_backtest_run(session, run_id)
+    if run is None:
+        return False
+    await session.delete(run)
+    await session.flush()
+    return True

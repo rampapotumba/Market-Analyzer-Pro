@@ -155,7 +155,9 @@ def test_sim25_score_above_threshold_accepted():
     df = _make_forex_df()
     engine = BacktestEngine(db=MagicMock())
 
-    with patch("src.analysis.ta_engine.TAEngine") as mock_ta_cls:
+    with patch("src.analysis.ta_engine.TAEngine") as mock_ta_cls, \
+         patch.object(BacktestEngine, "_check_volume_confirmation", return_value=True), \
+         patch.object(BacktestEngine, "_check_momentum_alignment", return_value=True):
         mock_ta = MagicMock()
         # composite = 0.45 * 36 = 16.2 > 15
         mock_ta.calculate_ta_score.return_value = 36.0
@@ -205,7 +207,9 @@ def test_sim25_crypto_score_accepted():
     engine = BacktestEngine(db=MagicMock())
 
     # 0.45 * 103 ≈ 46.4 > 20
-    with patch("src.analysis.ta_engine.TAEngine") as mock_ta_cls:
+    with patch("src.analysis.ta_engine.TAEngine") as mock_ta_cls, \
+         patch.object(BacktestEngine, "_check_volume_confirmation", return_value=True), \
+         patch.object(BacktestEngine, "_check_momentum_alignment", return_value=True):
         mock_ta = MagicMock()
         mock_ta.calculate_ta_score.return_value = 103.0
         mock_ta.get_atr.return_value = Decimal("100.0")
@@ -261,7 +265,9 @@ def test_sim26_trend_bull_allowed():
     df = _make_forex_df()
     engine = BacktestEngine(db=MagicMock())
 
-    with patch("src.analysis.ta_engine.TAEngine") as mock_ta_cls:
+    with patch("src.analysis.ta_engine.TAEngine") as mock_ta_cls, \
+         patch.object(BacktestEngine, "_check_volume_confirmation", return_value=True), \
+         patch.object(BacktestEngine, "_check_momentum_alignment", return_value=True):
         mock_ta = MagicMock()
         # composite = 0.45 * 40 = 18 > 15
         mock_ta.calculate_ta_score.return_value = 40.0
@@ -287,7 +293,9 @@ def test_sim26_volatile_allowed():
     df = _make_forex_df()
     engine = BacktestEngine(db=MagicMock())
 
-    with patch("src.analysis.ta_engine.TAEngine") as mock_ta_cls:
+    with patch("src.analysis.ta_engine.TAEngine") as mock_ta_cls, \
+         patch.object(BacktestEngine, "_check_volume_confirmation", return_value=True), \
+         patch.object(BacktestEngine, "_check_momentum_alignment", return_value=True):
         mock_ta = MagicMock()
         # composite = 0.45 * 40 = 18 > 15
         mock_ta.calculate_ta_score.return_value = 40.0
@@ -385,7 +393,9 @@ def test_sim28_btc_strong_trend_allowed():
     engine = BacktestEngine(db=MagicMock())
 
     # 0.45 * 103 ≈ 46 > 20, STRONG_TREND_BULL is in allowed_regimes
-    with patch("src.analysis.ta_engine.TAEngine") as mock_ta_cls:
+    with patch("src.analysis.ta_engine.TAEngine") as mock_ta_cls, \
+         patch.object(BacktestEngine, "_check_volume_confirmation", return_value=True), \
+         patch.object(BacktestEngine, "_check_momentum_alignment", return_value=True):
         mock_ta = MagicMock()
         mock_ta.calculate_ta_score.return_value = 103.0
         mock_ta.get_atr.return_value = Decimal("100.0")
@@ -431,7 +441,9 @@ def test_sim28_gbpusd_score_above_override_accepted():
     engine = BacktestEngine(db=MagicMock())
 
     # 0.45 * 47 = 21.15 > override threshold 20 for GBPUSD=X
-    with patch("src.analysis.ta_engine.TAEngine") as mock_ta_cls:
+    with patch("src.analysis.ta_engine.TAEngine") as mock_ta_cls, \
+         patch.object(BacktestEngine, "_check_volume_confirmation", return_value=True), \
+         patch.object(BacktestEngine, "_check_momentum_alignment", return_value=True):
         mock_ta = MagicMock()
         mock_ta.calculate_ta_score.return_value = 47.0
         mock_ta.get_atr.return_value = Decimal("0.0010")
@@ -552,3 +564,195 @@ def test_sim27_h4_applies_filter():
 
     result = BacktestEngine._check_d1_trend_alignment("EURUSD=X", "LONG", "H4", d1_rows)
     assert result is False, "H4 timeframe should apply D1 MA200 filter"
+
+
+# ── SIM-29: Volume confirmation ───────────────────────────────────────────────
+
+
+def test_sim29_volume_above_threshold_passes():
+    """Volume 150% of MA20 → filter passes."""
+    from src.backtesting.backtest_engine import BacktestEngine
+
+    n = 30
+    # MA20 of last 20 = 100, current = 150 → 150% > 120%
+    volume = np.ones(n) * 100.0
+    volume[-1] = 150.0
+    idx = pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC")
+    df = pd.DataFrame({"open": 1.1, "high": 1.11, "low": 1.09, "close": 1.10, "volume": volume}, index=idx)
+    assert BacktestEngine._check_volume_confirmation(df) is True
+
+
+def test_sim29_volume_below_threshold_blocked():
+    """Volume 80% of MA20 → filter blocked."""
+    from src.backtesting.backtest_engine import BacktestEngine
+
+    n = 30
+    volume = np.ones(n) * 100.0
+    volume[-1] = 80.0  # 80% < 120%
+    idx = pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC")
+    df = pd.DataFrame({"open": 1.1, "high": 1.11, "low": 1.09, "close": 1.10, "volume": volume}, index=idx)
+    assert BacktestEngine._check_volume_confirmation(df) is False
+
+
+def test_sim29_zero_volume_passthrough():
+    """All volume == 0 → filter passes (broker doesn't send volume)."""
+    from src.backtesting.backtest_engine import BacktestEngine
+
+    n = 30
+    idx = pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC")
+    df = pd.DataFrame({"open": 1.1, "high": 1.11, "low": 1.09, "close": 1.10, "volume": np.zeros(n)}, index=idx)
+    assert BacktestEngine._check_volume_confirmation(df) is True
+
+
+def test_sim29_insufficient_data_passthrough():
+    """Less than 20 bars → filter passes."""
+    from src.backtesting.backtest_engine import BacktestEngine
+
+    n = 15  # < 20
+    idx = pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC")
+    df = pd.DataFrame({"open": 1.1, "high": 1.11, "low": 1.09, "close": 1.10, "volume": np.ones(n) * 100}, index=idx)
+    assert BacktestEngine._check_volume_confirmation(df) is True
+
+
+# ── SIM-30: Momentum alignment (RSI/MACD) ────────────────────────────────────
+
+
+def test_sim30_long_momentum_confirmed():
+    """LONG: RSI=55 > 50, MACD > Signal → True."""
+    from src.backtesting.backtest_engine import BacktestEngine
+
+    indicators = {"rsi_14": 55.0, "macd_line": 0.001, "macd_signal": 0.0005}
+    assert BacktestEngine._check_momentum_alignment(indicators, "LONG") is True
+
+
+def test_sim30_long_momentum_rejected_rsi():
+    """LONG: RSI=45 < 50 → False."""
+    from src.backtesting.backtest_engine import BacktestEngine
+
+    indicators = {"rsi_14": 45.0, "macd_line": 0.001, "macd_signal": 0.0005}
+    assert BacktestEngine._check_momentum_alignment(indicators, "LONG") is False
+
+
+def test_sim30_long_momentum_rejected_macd():
+    """LONG: RSI=55, MACD < Signal → False."""
+    from src.backtesting.backtest_engine import BacktestEngine
+
+    indicators = {"rsi_14": 55.0, "macd_line": -0.001, "macd_signal": 0.0005}
+    assert BacktestEngine._check_momentum_alignment(indicators, "LONG") is False
+
+
+def test_sim30_missing_data_passthrough():
+    """Missing RSI/MACD → filter passes (graceful degradation)."""
+    from src.backtesting.backtest_engine import BacktestEngine
+
+    assert BacktestEngine._check_momentum_alignment({}, "LONG") is True
+    assert BacktestEngine._check_momentum_alignment({"rsi_14": 55.0}, "LONG") is True
+
+
+# ── SIM-31: Min signal strength = BUY ────────────────────────────────────────
+
+
+def test_sim31_strong_buy_allowed():
+    """STRONG_BUY → in ALLOWED_SIGNAL_STRENGTHS."""
+    from src.backtesting.backtest_engine import ALLOWED_SIGNAL_STRENGTHS
+
+    assert "STRONG_BUY" in ALLOWED_SIGNAL_STRENGTHS
+
+
+def test_sim31_buy_allowed():
+    """BUY → in ALLOWED_SIGNAL_STRENGTHS."""
+    from src.backtesting.backtest_engine import ALLOWED_SIGNAL_STRENGTHS
+
+    assert "BUY" in ALLOWED_SIGNAL_STRENGTHS
+
+
+def test_sim31_weak_buy_rejected():
+    """WEAK_BUY → not in ALLOWED_SIGNAL_STRENGTHS, signal filtered."""
+    from src.backtesting.backtest_engine import ALLOWED_SIGNAL_STRENGTHS, _get_signal_strength
+
+    # composite = 8.0 → WEAK_BUY
+    strength = _get_signal_strength(8.0)
+    assert strength == "WEAK_BUY"
+    assert strength not in ALLOWED_SIGNAL_STRENGTHS
+
+
+def test_sim31_hold_rejected():
+    """HOLD → not in ALLOWED_SIGNAL_STRENGTHS."""
+    from src.backtesting.backtest_engine import ALLOWED_SIGNAL_STRENGTHS, _get_signal_strength
+
+    strength = _get_signal_strength(3.0)
+    assert strength == "HOLD"
+    assert strength not in ALLOWED_SIGNAL_STRENGTHS
+
+
+# ── SIM-32: Weekday filter ────────────────────────────────────────────────────
+
+
+def test_sim32_monday_morning_blocked():
+    """Mon 06:00 UTC, forex → blocked."""
+    from src.backtesting.backtest_engine import BacktestEngine
+
+    ts = datetime.datetime(2024, 1, 1, 6, 0, tzinfo=datetime.timezone.utc)  # Monday
+    assert ts.weekday() == 0  # Monday
+    assert BacktestEngine._check_weekday_filter(ts, "forex") is False
+
+
+def test_sim32_monday_afternoon_allowed():
+    """Mon 14:00 UTC, forex → allowed."""
+    from src.backtesting.backtest_engine import BacktestEngine
+
+    ts = datetime.datetime(2024, 1, 1, 14, 0, tzinfo=datetime.timezone.utc)
+    assert BacktestEngine._check_weekday_filter(ts, "forex") is True
+
+
+def test_sim32_friday_evening_blocked():
+    """Fri 20:00 UTC → blocked."""
+    from src.backtesting.backtest_engine import BacktestEngine
+
+    ts = datetime.datetime(2024, 1, 5, 20, 0, tzinfo=datetime.timezone.utc)  # Friday
+    assert ts.weekday() == 4  # Friday
+    assert BacktestEngine._check_weekday_filter(ts, "forex") is False
+
+
+def test_sim32_monday_crypto_allowed():
+    """Mon 06:00 UTC, crypto → allowed (exempt from Monday filter)."""
+    from src.backtesting.backtest_engine import BacktestEngine
+
+    ts = datetime.datetime(2024, 1, 1, 6, 0, tzinfo=datetime.timezone.utc)
+    assert BacktestEngine._check_weekday_filter(ts, "crypto") is True
+
+
+# ── SIM-33: Economic calendar filter ─────────────────────────────────────────
+
+
+def test_sim33_high_impact_event_blocks_signal():
+    """HIGH-impact event within ±2h → signal blocked."""
+    from src.backtesting.backtest_engine import BacktestEngine
+
+    candle_ts = datetime.datetime(2024, 3, 8, 13, 30, tzinfo=datetime.timezone.utc)  # NFP time
+    event = MagicMock()
+    event.event_date = datetime.datetime(2024, 3, 8, 13, 30, tzinfo=datetime.timezone.utc)
+
+    result = BacktestEngine._check_economic_calendar(candle_ts, [event])
+    assert result is False
+
+
+def test_sim33_no_event_allows_signal():
+    """No events near candle → signal allowed."""
+    from src.backtesting.backtest_engine import BacktestEngine
+
+    candle_ts = datetime.datetime(2024, 3, 8, 13, 30, tzinfo=datetime.timezone.utc)
+    event = MagicMock()
+    event.event_date = datetime.datetime(2024, 3, 8, 20, 0, tzinfo=datetime.timezone.utc)  # 6.5h away
+
+    result = BacktestEngine._check_economic_calendar(candle_ts, [event])
+    assert result is True
+
+
+def test_sim33_no_historical_events_passthrough():
+    """Empty event list → passthrough."""
+    from src.backtesting.backtest_engine import BacktestEngine
+
+    candle_ts = datetime.datetime(2024, 3, 8, 13, 30, tzinfo=datetime.timezone.utc)
+    result = BacktestEngine._check_economic_calendar(candle_ts, [])
+    assert result is True

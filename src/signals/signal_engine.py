@@ -66,6 +66,10 @@ _TF_EXPIRY_CANDLES: dict[str, int] = {
 }
 
 
+# SIM-31: Allowed signal strengths (weak signals filtered out)
+ALLOWED_SIGNAL_STRENGTHS = {"BUY", "STRONG_BUY", "SELL", "STRONG_SELL"}
+
+
 def _calculate_expiry(timeframe: str) -> datetime.datetime:
     """Return signal expiry timestamp based on timeframe (FIX-02).
 
@@ -556,6 +560,11 @@ class SignalEngine:
         # 11. Determine direction and strength
         direction = _determine_direction(composite_score)
         signal_strength = _determine_signal_strength(composite_score)
+
+        # 11-SIM-31: Minimum signal strength filter
+        if signal_strength not in ALLOWED_SIGNAL_STRENGTHS:
+            logger.debug(f"[SIM-31] Filtered weak signal: {signal_strength} for {instrument.symbol}")
+            return None
 
         # 11a. SIM-21: Correlation group guard (direction-aware)
         if direction != "HOLD":

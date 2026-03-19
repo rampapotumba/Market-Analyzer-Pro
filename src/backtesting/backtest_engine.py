@@ -45,6 +45,17 @@ logger = logging.getLogger(__name__)
 _backtest_progress: dict[str, float] = {}
 
 
+# SIM-31: Allowed signal strengths (weak signals filtered out)
+ALLOWED_SIGNAL_STRENGTHS = {"BUY", "STRONG_BUY", "SELL", "STRONG_SELL"}
+
+# SIM-32: Weekday filter config
+WEEKDAY_FILTER = {
+    "monday_block_until_utc": 10,   # Mon 00:00–10:00 UTC blocked
+    "friday_block_from_utc": 18,    # Fri 18:00–23:59 UTC blocked
+    "crypto_exempt_monday": True,   # crypto exempt from Monday gap filter
+}
+
+
 def get_backtest_progress(run_id: str) -> float | None:
     """Return progress percentage (0–100) for a running backtest, or None if not tracked."""
     return _backtest_progress.get(run_id)
@@ -97,6 +108,24 @@ def _is_asian_session(candle_ts: datetime.datetime) -> bool:
         tzinfo=datetime.timezone.utc
     ).hour
     return _ASIAN_SESSION_UTC_START <= hour < _ASIAN_SESSION_UTC_END
+
+
+def _get_signal_strength(composite: float) -> str:
+    """Map composite score to signal strength bucket (mirrors SIM-14 score buckets)."""
+    if composite >= 20.0:
+        return "STRONG_BUY"
+    elif composite >= 10.0:
+        return "BUY"
+    elif composite <= -20.0:
+        return "STRONG_SELL"
+    elif composite <= -10.0:
+        return "SELL"
+    elif composite >= 7.0:
+        return "WEAK_BUY"
+    elif composite <= -7.0:
+        return "WEAK_SELL"
+    else:
+        return "HOLD"
 
 
 def _detect_regime_from_df(df: pd.DataFrame) -> str:
@@ -390,6 +419,15 @@ class BacktestEngine:
             hour=23, minute=59, second=59, tzinfo=datetime.timezone.utc
         )
 
+        # SIM-33: Pre-load economic events for calendar filter
+        economic_events: list = []
+        try:
+            from src.database.crud import get_economic_events_in_range
+            economic_events = await get_economic_events_in_range(self.db, start_dt, end_dt)
+            logger.info("[SIM-33] Loaded %d HIGH-impact economic events", len(economic_events))
+        except Exception as exc:
+            logger.warning("[SIM-33] Could not load economic events: %s", exc)
+
         total_symbols = len(params.symbols)
         if run_id:
             _backtest_progress[run_id] = 0.0
@@ -439,6 +477,7 @@ class BacktestEngine:
                 account_size=params.account_size,
                 apply_slippage=params.apply_slippage,
                 progress_cb=_progress_cb,
+                economic_events=economic_events,
             )
             trades.extend(symbol_trades)
 
@@ -457,6 +496,7 @@ class BacktestEngine:
         account_size: Decimal,
         apply_slippage: bool,
         progress_cb: Any = None,
+        economic_events: list | None = None,
     ) -> list[BacktestTradeResult]:
         """Simulate one symbol over all its candles. Returns closed trades.
 
@@ -520,6 +560,14 @@ class BacktestEngine:
             if market_type == "forex" and symbol in _FOREX_PAIRS_EU_NA:
                 if _is_asian_session(candle_ts):
                     continue
+
+            # SIM-32: Weekday filter
+            if not BacktestEngine._check_weekday_filter(candle_ts, market_type):
+                continue
+
+            # SIM-33: Economic calendar filter
+            if not BacktestEngine._check_economic_calendar(candle_ts, economic_events or []):
+                continue
 
             # Cooldown filter: mirror SignalEngine cooldown per timeframe
             if last_signal_ts is not None:
@@ -716,6 +764,91 @@ class BacktestEngine:
             return False
         return True
 
+    @staticmethod
+    def _check_volume_confirmation(df: pd.DataFrame) -> bool:
+        """SIM-29: Volume >= 120% of MA20 required. Graceful degradation if no volume data."""
+        if df["volume"].sum() == 0:
+            return True  # broker doesn't provide volume
+        if len(df) < 20:
+            return True  # insufficient data
+        vol_ma20 = df["volume"].rolling(20).mean().iloc[-1]
+        if pd.isna(vol_ma20) or vol_ma20 == 0:
+            return True
+        current_vol = df["volume"].iloc[-1]
+        if current_vol < vol_ma20 * 1.2:
+            logger.debug("[SIM-29] Volume %.0f < 120%% of MA20 %.0f", current_vol, vol_ma20)
+            return False
+        return True
+
+    @staticmethod
+    def _check_momentum_alignment(ta_indicators: dict, direction: str) -> bool:
+        """SIM-30: LONG: RSI>50 AND MACD>Signal; SHORT: RSI<50 AND MACD<Signal."""
+        rsi = ta_indicators.get("rsi_14") or ta_indicators.get("rsi")
+        macd_line = ta_indicators.get("macd_line") or ta_indicators.get("macd")
+        macd_signal = ta_indicators.get("macd_signal") or ta_indicators.get("macd_signal_line")
+
+        if rsi is None or macd_line is None or macd_signal is None:
+            logger.warning("[SIM-30] Missing RSI/MACD data, skipping momentum filter")
+            return True  # graceful degradation
+
+        try:
+            rsi_f = float(rsi)
+            macd_f = float(macd_line)
+            signal_f = float(macd_signal)
+        except (TypeError, ValueError):
+            return True
+
+        if direction == "LONG":
+            if not (rsi_f > 50 and macd_f > signal_f):
+                logger.debug(
+                    "[SIM-30] Momentum not aligned for LONG: RSI=%.1f, MACD=%.4f, Signal=%.4f",
+                    rsi_f, macd_f, signal_f,
+                )
+                return False
+        elif direction == "SHORT":
+            if not (rsi_f < 50 and macd_f < signal_f):
+                logger.debug(
+                    "[SIM-30] Momentum not aligned for SHORT: RSI=%.1f, MACD=%.4f, Signal=%.4f",
+                    rsi_f, macd_f, signal_f,
+                )
+                return False
+        return True
+
+    @staticmethod
+    def _check_weekday_filter(ts: datetime.datetime, market_type: str) -> bool:
+        """SIM-32: Block Mon 00:00–10:00 UTC (forex/stocks) and Fri 18:00+ UTC."""
+        hour = ts.hour if ts.tzinfo else ts.replace(tzinfo=datetime.timezone.utc).hour
+        weekday = ts.weekday()  # 0=Mon, 4=Fri
+
+        # Monday gap filter (forex/stocks only)
+        if weekday == 0 and hour < WEEKDAY_FILTER["monday_block_until_utc"]:
+            if market_type == "crypto" and WEEKDAY_FILTER["crypto_exempt_monday"]:
+                return True  # crypto exempt
+            logger.debug("[SIM-32] Monday morning blocked: hour=%d, market=%s", hour, market_type)
+            return False
+
+        # Friday close filter (all markets — institutions close positions)
+        if weekday == 4 and hour >= WEEKDAY_FILTER["friday_block_from_utc"]:
+            logger.debug("[SIM-32] Friday evening blocked: hour=%d", hour)
+            return False
+
+        return True
+
+    @staticmethod
+    def _check_economic_calendar(candle_ts: datetime.datetime, economic_events: list) -> bool:
+        """SIM-33: Block signals ±2 hours around HIGH-impact economic events."""
+        if not economic_events:
+            return True  # no data → passthrough
+
+        window = datetime.timedelta(hours=2)
+        for event in economic_events:
+            event_dt = getattr(event, "event_date", None) or getattr(event, "scheduled_at", None)
+            if event_dt is None:
+                continue
+            if abs((candle_ts - event_dt).total_seconds()) <= window.total_seconds():
+                return False
+        return True
+
     def _generate_signal(
         self,
         df: pd.DataFrame,
@@ -735,6 +868,10 @@ class BacktestEngine:
         LLM and DB guards are deliberately skipped (no historical context).
         """
         from src.analysis.ta_engine import TAEngine
+
+        # SIM-29: Volume confirmation filter (fast check before expensive TA)
+        if not BacktestEngine._check_volume_confirmation(df):
+            return None
 
         try:
             ta_engine = TAEngine(df, timeframe=timeframe)
@@ -761,6 +898,12 @@ class BacktestEngine:
 
         direction = "LONG" if composite > 0 else "SHORT"
 
+        # SIM-31: Minimum signal strength filter
+        signal_strength = _get_signal_strength(composite)
+        if signal_strength not in ALLOWED_SIGNAL_STRENGTHS:
+            logger.debug("[SIM-31] Filtered weak signal: %s for %s (score=%.2f)", signal_strength, symbol, composite)
+            return None
+
         regime = "DEFAULT"
         try:
             regime = _detect_regime_from_df(df)
@@ -780,6 +923,15 @@ class BacktestEngine:
         # SIM-27: D1 MA200 trend alignment filter (passed as kwarg when available)
         # d1_rows is not available in this signature; callers that need it should use
         # _check_d1_trend_alignment directly. Here we skip (no D1 data in _generate_signal).
+
+        # SIM-30: Momentum alignment filter
+        ta_indicators_for_filter: dict = {}
+        try:
+            ta_indicators_for_filter = ta_engine.calculate_all_indicators()
+        except Exception:
+            pass
+        if not BacktestEngine._check_momentum_alignment(ta_indicators_for_filter, direction):
+            return None
 
         return {
             "direction": direction,
