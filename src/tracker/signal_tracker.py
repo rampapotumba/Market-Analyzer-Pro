@@ -70,11 +70,12 @@ SL_SLIPPAGE_PIPS: dict[str, Decimal] = {
 }
 SL_SLIPPAGE_CRYPTO_PCT: Decimal = Decimal("0.001")  # 0.1% — taker при пробое
 
-# ── Overnight swap constants (SIM-13) ─────────────────────────────────────────
+# ── Overnight swap constants (SIM-13, SIM-37) ─────────────────────────────────
 
+# SIM-37: Hardcoded fallback rates (used when config/swap_rates.json is missing)
 # Типовые дневные swap-ставки (в пипах за 1 лот, ориентировочно)
 # Положительный = начисляется держателю позиции
-SWAP_DAILY_PIPS: dict[str, dict[str, Decimal]] = {
+SWAP_DAILY_PIPS_HARDCODE: dict[str, dict[str, Decimal]] = {
     "EURUSD=X": {"long": Decimal("-0.5"),  "short": Decimal("0.3")},
     "USDJPY=X": {"long": Decimal("1.2"),   "short": Decimal("-1.5")},
     "GBPUSD=X": {"long": Decimal("-0.8"),  "short": Decimal("0.5")},
@@ -87,6 +88,63 @@ SWAP_DAILY_PIPS: dict[str, dict[str, Decimal]] = {
 TRIPLE_SWAP_WEEKDAY: int = 2    # Wednesday (0=Mon)
 ROLLOVER_HOUR_UTC: int = 22     # 22:00 UTC
 
+
+def _load_swap_rates() -> dict[str, dict[str, Decimal]]:
+    """SIM-37: Load swap rates from config/swap_rates.json. Falls back to hardcode."""
+    import json
+    import os
+
+    config_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+        "config", "swap_rates.json"
+    )
+    try:
+        with open(config_path, "r") as f:
+            data = json.load(f)
+
+        # Check staleness (> 90 days)
+        updated_at_str = data.get("updated_at", "")
+        if updated_at_str:
+            import datetime as _dt
+            try:
+                updated_at = _dt.datetime.fromisoformat(updated_at_str).date()
+                days_old = (_dt.date.today() - updated_at).days
+                if days_old > 90:
+                    logger.warning("[SIM-37] Swap rates are stale (%d days old)", days_old)
+            except ValueError:
+                pass
+
+        rates: dict[str, dict[str, Decimal]] = {}
+        for symbol, vals in data.get("rates", {}).items():
+            rates[symbol] = {
+                "long": Decimal(str(vals["long"])),
+                "short": Decimal(str(vals["short"])),
+            }
+        logger.info("[SIM-37] Loaded swap rates for %d symbols from JSON", len(rates))
+        return rates
+    except FileNotFoundError:
+        logger.warning("[SIM-37] config/swap_rates.json not found, using hardcoded rates")
+        return SWAP_DAILY_PIPS_HARDCODE
+    except Exception as exc:
+        logger.warning("[SIM-37] Failed to load swap rates: %s, using hardcoded", exc)
+        return SWAP_DAILY_PIPS_HARDCODE
+
+
+# SIM-37: Load from JSON (falls back to hardcode if file missing or unreadable)
+SWAP_DAILY_PIPS = _load_swap_rates()
+
+
+# ── SIM-34: Breakeven buffer — SL moves to 50% of distance to TP1 ─────────────
+
+BREAKEVEN_BUFFER_RATIO = Decimal("0.5")
+
+# ── SIM-35: Time-based exit for stale positions ───────────────────────────────
+
+TIME_EXIT_CANDLES: dict[str, int] = {
+    "H1": 48,   # 48 hours
+    "H4": 20,   # ~3.3 days
+    "D1": 10,   # 2 weeks
+}
 
 # ── MAE Early Exit config (SIM-20) ────────────────────────────────────────────
 
@@ -625,6 +683,29 @@ class SignalTracker:
                 )
                 return
 
+            # SIM-35: Time-based exit for stale positions (only if not profitable)
+            tf = signal.timeframe
+            max_candles = TIME_EXIT_CANDLES.get(tf)
+            if max_candles is not None and position.entry_filled_at:
+                entry_time = _utc(position.entry_filled_at)
+                if entry_time:
+                    tf_seconds = _TF_SECONDS.get(tf, 3600)
+                    candles_elapsed = int((now - entry_time).total_seconds() / tf_seconds)
+                    if candles_elapsed >= max_candles:
+                        unrealized = position.unrealized_pnl_usd or Decimal("0")
+                        if unrealized <= Decimal("0"):
+                            logger.info(
+                                "[SIM-35] Time exit: %s/%s after %d candles (max=%d), "
+                                "unrealized=%.2f",
+                                signal.instrument_id, tf, candles_elapsed, max_candles,
+                                float(unrealized),
+                            )
+                            await self._close_signal(
+                                db, signal, current_price, now, "time_exit",
+                                position, pip_size, market=market,
+                            )
+                            return
+
             # SIM-05: use TradeLifecycleManager when SL and TP1 are defined
             if signal.stop_loss and signal.take_profit_1:
                 atr = await self._get_atr(db, signal, instrument)
@@ -967,10 +1048,21 @@ class SignalTracker:
         exit_at: datetime.datetime,
         pip_size: Decimal,
     ) -> None:
-        """SIM-07: Close 50% at TP1 zone, move SL to entry."""
+        """SIM-07: Close 50% at TP1 zone, move SL to breakeven buffer (SIM-34)."""
         entry = position.entry_price or signal.entry_price or exit_price
         _, pnl_pct = self._calculate_pnl(signal.direction, entry, exit_price, pip_size)
         remaining = (position.size_remaining_pct or Decimal("1.0")) * Decimal("0.5")
+
+        # SIM-34: Move SL to entry + 50% of distance to TP1 (not just entry)
+        tp1 = signal.take_profit_1
+        if tp1 is not None:
+            if signal.direction == "LONG":
+                new_sl = entry + BREAKEVEN_BUFFER_RATIO * (tp1 - entry)
+            else:
+                new_sl = entry - BREAKEVEN_BUFFER_RATIO * (entry - tp1)
+            new_sl = new_sl.quantize(Decimal("0.00000001"))
+        else:
+            new_sl = entry  # fallback to entry if no TP1
 
         await update_virtual_position(db, signal.id, {
             "size_remaining_pct":  remaining,
@@ -978,9 +1070,9 @@ class SignalTracker:
             "partial_close_price": exit_price,
             "partial_close_at":    exit_at,
             "partial_pnl_pct":     pnl_pct.quantize(Decimal("0.0001")),
-            "current_stop_loss":   entry,    # SL → entry after partial close
+            "current_stop_loss":   new_sl,   # SIM-34: SL → entry + 50% buffer
             "breakeven_moved":     True,
-            "breakeven_price":     entry,    # record exact BE level for analysis
+            "breakeven_price":     new_sl,   # record exact BE level for analysis
         })
 
         # SIM-16: update account balance for the 50% partial close P&L
@@ -991,7 +1083,7 @@ class SignalTracker:
 
         logger.info(
             f"[Tracker] Signal {signal.id} partial close @ {exit_price}: "
-            f"50% at {pnl_pct:.4f}%, SL moved to entry {entry}, "
+            f"50% at {pnl_pct:.4f}%, SL moved to {new_sl} (SIM-34 buffer), "
             f"partial_pnl_usd={partial_pnl_usd:.2f}"
         )
 

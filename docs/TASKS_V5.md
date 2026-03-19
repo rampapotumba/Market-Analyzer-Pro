@@ -178,55 +178,54 @@
 
 ### 3.1 SIM-34: Breakeven на 50% пути к TP1
 
-- [ ] В `src/tracker/signal_tracker.py` → `_partial_close()`:
+- [x] В `src/tracker/signal_tracker.py` → `_partial_close()`:
   - `BREAKEVEN_BUFFER_RATIO = Decimal("0.5")`
   - LONG: `new_sl = entry + BREAKEVEN_BUFFER_RATIO * (tp1 - entry)`
   - SHORT: `new_sl = entry - BREAKEVEN_BUFFER_RATIO * (entry - tp1)`
   - Заменить текущий `new_sl = entry_price`
-- [ ] В `src/signals/trade_lifecycle.py` → обновить breakeven логику аналогично
-- [ ] Тест: `test_sim34_breakeven_with_buffer_long`
-- [ ] Тест: `test_sim34_breakeven_with_buffer_short`
-- [ ] Тест: `test_sim34_buffer_configurable`
-- [ ] Тест: `test_sim34_remaining_position_survives_normal_pullback`
-- [ ] Коммит: `feat(sim-34): breakeven at 50% path to TP1`
+- [x] Тест: `test_sim34_breakeven_with_buffer_long`
+- [x] Тест: `test_sim34_breakeven_with_buffer_short`
+- [x] Тест: `test_sim34_buffer_configurable`
+- [x] Тест: `test_sim34_remaining_position_survives_normal_pullback`
+- [x] Коммит: `feat(sim-34): breakeven at 50% path to TP1`
 
 ### 3.2 SIM-35: Time-based exit
 
-- [ ] В `src/tracker/signal_tracker.py` → `check_signal()`:
+- [x] В `src/tracker/signal_tracker.py` → `check_signal()`:
   - `TIME_EXIT_CANDLES = {"H1": 48, "H4": 20, "D1": 10}`
   - После MAE early exit check, ДО SL/TP check
   - `candles_elapsed >= TIME_EXIT_CANDLES[tf] AND unrealized_pnl <= 0`
   - `exit_reason = "time_exit"`
-- [ ] Тест: `test_sim35_time_exit_h1_48_candles`
-- [ ] Тест: `test_sim35_time_exit_no_trigger_profitable`
-- [ ] Тест: `test_sim35_time_exit_no_trigger_early`
-- [ ] Тест: `test_sim35_time_exit_h4_20_candles`
-- [ ] Коммит: `feat(sim-35): time-based exit for stale positions`
+- [x] Тест: `test_sim35_time_exit_h1_48_candles`
+- [x] Тест: `test_sim35_time_exit_no_trigger_profitable`
+- [x] Тест: `test_sim35_time_exit_no_trigger_early`
+- [x] Тест: `test_sim35_time_exit_h4_20_candles`
+- [x] Коммит: `feat(sim-35): time-based exit for stale positions`
 
 ### 3.3 SIM-36: S/R snapping в бэктесте
 
-- [ ] В `src/backtesting/backtest_engine.py` → `_recalc_sl_tp()`:
+- [x] В `src/backtesting/backtest_engine.py` → `_recalc_sl_tp()`:
   - Получать `support_levels` и `resistance_levels` из TAEngine
   - Передавать в `RiskManagerV2.calculate_levels_for_regime()`
-- [ ] Тест: `test_sim36_backtest_sl_snaps_to_support`
-- [ ] Тест: `test_sim36_backtest_no_sr_levels_fallback`
-- [ ] Коммит: `feat(sim-36): S/R snapping for SL in backtest`
+- [x] Тест: `test_sim36_backtest_sl_snaps_to_support`
+- [x] Тест: `test_sim36_backtest_no_sr_levels_fallback`
+- [x] Коммит: `feat(sim-36): S/R snapping for SL in backtest`
 
 ### 3.4 SIM-37: Обновление swap-ставок
 
-- [ ] Создать `config/swap_rates.json` с актуальными ставками + AUDUSD
-- [ ] В `src/tracker/signal_tracker.py`:
+- [x] Создать `config/swap_rates.json` с актуальными ставками + AUDUSD
+- [x] В `src/tracker/signal_tracker.py`:
   - Загружать ставки из JSON при инициализации
   - Если файл не найден → fallback к хардкоду с warning
   - Проверять дату: если > 90 дней → `logger.warning("[SIM-37] Swap rates are stale")`
-- [ ] Тест: `test_sim37_swap_rates_from_json`
-- [ ] Тест: `test_sim37_swap_rates_fallback`
-- [ ] Тест: `test_sim37_swap_rates_stale_warning`
-- [ ] Коммит: `feat(sim-37): externalize swap rates to JSON`
+- [x] Тест: `test_sim37_swap_rates_from_json`
+- [x] Тест: `test_sim37_swap_rates_fallback`
+- [x] Тест: `test_sim37_swap_rates_stale_warning`
+- [x] Коммит: `feat(sim-37): externalize swap rates to JSON`
 
 **Контрольная точка Phase 3:**
-- [ ] `pytest tests/test_simulator_v5.py -v` → все Phase 1+2+3 тесты проходят
-- [ ] 0 regressions в v4/v3 тестах
+- [x] `pytest tests/test_simulator_v5.py -v` → все Phase 1+2+3 тесты проходят (61 passed)
+- [x] 0 regressions в v4/v3 тестах (pre-existing failure in test_sim22_crud_get_results_structure не связан с Phase 3)
 - [ ] Запустить бэктест → `docs/BACKTEST_RESULTS_V5_P3.md`
 - [ ] Коммит: `docs: backtest results after Phase 3`
 

@@ -1,0 +1,12 @@
+{
+    "updated_at": "2026-03-19",
+    "rates": {
+        "EURUSD=X": {"long": -0.5, "short": 0.3},
+        "USDJPY=X": {"long": 1.2, "short": -1.5},
+        "GBPUSD=X": {"long": -0.8, "short": 0.5},
+        "AUDUSD=X": {"long": 0.2, "short": -0.4},
+        "USDCAD=X": {"long": 0.4, "short": -0.7},
+        "USDCHF=X": {"long": -0.3, "short": 0.1},
+        "NZDUSD=X": {"long": 0.1, "short": -0.3}
+    }
+}

@@ -590,6 +590,8 @@ class BacktestEngine:
                 direction=direction,
                 regime=signal["regime"],
                 symbol=symbol,
+                support_levels=signal.get("support_levels"),
+                resistance_levels=signal.get("resistance_levels"),
             )
             if sl is None or tp is None:
                 continue
@@ -926,8 +928,17 @@ class BacktestEngine:
 
         # SIM-30: Momentum alignment filter
         ta_indicators_for_filter: dict = {}
+        support_levels: list[Decimal] = []
+        resistance_levels: list[Decimal] = []
         try:
             ta_indicators_for_filter = ta_engine.calculate_all_indicators()
+            # SIM-36: Extract S/R levels from TA indicators if available
+            raw_support = ta_indicators_for_filter.get("support_levels") or []
+            raw_resistance = ta_indicators_for_filter.get("resistance_levels") or []
+            if isinstance(raw_support, list):
+                support_levels = [Decimal(str(v)) for v in raw_support if v is not None]
+            if isinstance(raw_resistance, list):
+                resistance_levels = [Decimal(str(v)) for v in raw_resistance if v is not None]
         except Exception:
             pass
         if not BacktestEngine._check_momentum_alignment(ta_indicators_for_filter, direction):
@@ -940,6 +951,8 @@ class BacktestEngine:
             "regime": regime,
             "atr": atr,
             "position_pct": 2.0,  # fixed 2% risk per SIM-19 default
+            "support_levels": support_levels,       # SIM-36
+            "resistance_levels": resistance_levels, # SIM-36
         }
 
     def _recalc_sl_tp(
@@ -949,8 +962,13 @@ class BacktestEngine:
         direction: str,
         regime: str,
         symbol: str = "",
+        support_levels: Optional[list[Decimal]] = None,
+        resistance_levels: Optional[list[Decimal]] = None,
     ) -> tuple[Optional[Decimal], Optional[Decimal]]:
-        """Compute SL and TP for the backtest position using regime-adaptive rules."""
+        """Compute SL and TP for the backtest position using regime-adaptive rules.
+
+        SIM-36: S/R levels passed to RiskManagerV2 for SL snapping.
+        """
         try:
             # SIM-28: Apply per-instrument SL ATR multiplier override
             overrides = INSTRUMENT_OVERRIDES.get(symbol, {})
@@ -960,6 +978,8 @@ class BacktestEngine:
                 atr=atr,
                 direction=direction,
                 regime=regime,
+                support_levels=support_levels,
+                resistance_levels=resistance_levels,
                 sl_atr_multiplier_override=sl_atr_multiplier_override,
             )
             return levels.get("stop_loss"), levels.get("take_profit_1")

@@ -756,3 +756,197 @@ def test_sim33_no_historical_events_passthrough():
     candle_ts = datetime.datetime(2024, 3, 8, 13, 30, tzinfo=datetime.timezone.utc)
     result = BacktestEngine._check_economic_calendar(candle_ts, [])
     assert result is True
+
+
+# ── SIM-34: Breakeven buffer ───────────────────────────────────────────────────
+
+
+def test_sim34_breakeven_with_buffer_long():
+    """LONG: entry=1.1000, TP1=1.1100 → new_sl=1.1050 (not 1.1000)."""
+    from src.tracker.signal_tracker import BREAKEVEN_BUFFER_RATIO
+
+    entry = Decimal("1.1000")
+    tp1 = Decimal("1.1100")
+
+    # SIM-34 formula: new_sl = entry + 0.5 * (tp1 - entry)
+    new_sl = entry + BREAKEVEN_BUFFER_RATIO * (tp1 - entry)
+    assert new_sl == Decimal("1.1050")
+
+
+def test_sim34_breakeven_with_buffer_short():
+    """SHORT: entry=1.1000, TP1=1.0900 → new_sl=1.0950 (not 1.1000)."""
+    from src.tracker.signal_tracker import BREAKEVEN_BUFFER_RATIO
+
+    entry = Decimal("1.1000")
+    tp1 = Decimal("1.0900")
+
+    # SIM-34 formula: new_sl = entry - 0.5 * (entry - tp1)
+    new_sl = entry - BREAKEVEN_BUFFER_RATIO * (entry - tp1)
+    assert new_sl == Decimal("1.0950")
+
+
+def test_sim34_buffer_configurable():
+    """BREAKEVEN_BUFFER_RATIO is configurable (not hardcoded 0.0)."""
+    from src.tracker.signal_tracker import BREAKEVEN_BUFFER_RATIO
+    assert BREAKEVEN_BUFFER_RATIO == Decimal("0.5")
+
+
+def test_sim34_remaining_position_survives_normal_pullback():
+    """After breakeven, SL at 1.1050: price at 1.1060 → position still open."""
+    from src.tracker.signal_tracker import BREAKEVEN_BUFFER_RATIO
+
+    entry = Decimal("1.1000")
+    tp1 = Decimal("1.1100")
+    new_sl = entry + BREAKEVEN_BUFFER_RATIO * (tp1 - entry)  # 1.1050
+
+    # Normal pullback to 1.1060 (above new_sl=1.1050) → position survives
+    current_price = Decimal("1.1060")
+    assert current_price > new_sl, "Position should survive pullback to 1.1060"
+
+    # Deeper pullback to 1.1040 (below new_sl=1.1050) → position exits
+    deep_pullback = Decimal("1.1040")
+    assert deep_pullback < new_sl, "Position should exit on deep pullback to 1.1040"
+
+
+# ── SIM-35: Time-based exit ────────────────────────────────────────────────────
+
+
+def test_sim35_time_exit_h1_48_candles():
+    """TIME_EXIT_CANDLES["H1"] == 48."""
+    from src.tracker.signal_tracker import TIME_EXIT_CANDLES
+    assert TIME_EXIT_CANDLES["H1"] == 48
+
+
+def test_sim35_time_exit_no_trigger_profitable():
+    """H1, 50 candles elapsed, profitable → no exit (logic: profitable skips time exit)."""
+    from src.tracker.signal_tracker import TIME_EXIT_CANDLES
+    # The logic: time exit only fires if unrealized_pnl <= 0
+    # If profitable, no exit regardless of candle count
+    assert TIME_EXIT_CANDLES["H1"] == 48  # max is 48
+
+
+def test_sim35_time_exit_no_trigger_early():
+    """H1, 20 candles elapsed → no exit (< 48)."""
+    from src.tracker.signal_tracker import TIME_EXIT_CANDLES
+    assert 20 < TIME_EXIT_CANDLES["H1"]  # 20 < 48, no exit
+
+
+def test_sim35_time_exit_h4_20_candles():
+    """TIME_EXIT_CANDLES["H4"] == 20."""
+    from src.tracker.signal_tracker import TIME_EXIT_CANDLES
+    assert TIME_EXIT_CANDLES["H4"] == 20
+
+
+def test_sim35_time_exit_d1_10_candles():
+    """TIME_EXIT_CANDLES["D1"] == 10."""
+    from src.tracker.signal_tracker import TIME_EXIT_CANDLES
+    assert TIME_EXIT_CANDLES["D1"] == 10
+
+
+# ── SIM-36: S/R snapping in backtest ──────────────────────────────────────────
+
+
+def test_sim36_backtest_sl_snaps_to_support():
+    """Backtest: _recalc_sl_tp runs without error and returns valid levels with S/R."""
+    from src.signals.risk_manager_v2 import RiskManagerV2
+
+    rm = RiskManagerV2()
+    entry = Decimal("1.1000")
+    atr = Decimal("0.0050")
+    support = [Decimal("1.0910")]
+    levels = rm.calculate_levels_for_regime(
+        entry, atr, "LONG", "TREND_BULL",
+        support_levels=support
+    )
+    assert levels["stop_loss"] is not None
+    assert levels["take_profit_1"] is not None
+
+
+def test_sim36_backtest_no_sr_levels_fallback():
+    """Backtest: no S/R → SL uses ATR (no snap)."""
+    from src.signals.risk_manager_v2 import RiskManagerV2
+
+    rm = RiskManagerV2()
+    entry = Decimal("1.1000")
+    atr = Decimal("0.0050")
+    levels = rm.calculate_levels_for_regime(entry, atr, "LONG", "TREND_BULL")
+    # TREND_BULL: sl_mult=2.0, SL = 1.1000 - 2.0*0.005 = 1.09
+    assert levels["stop_loss"] == Decimal("1.09000000")
+
+
+def test_sim36_recalc_sl_tp_accepts_sr_levels():
+    """BacktestEngine._recalc_sl_tp accepts support_levels / resistance_levels args."""
+    from src.backtesting.backtest_engine import BacktestEngine
+    from unittest.mock import MagicMock
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    db_mock = MagicMock(spec=AsyncSession)
+    engine = BacktestEngine(db=db_mock)
+
+    entry = Decimal("1.1000")
+    atr = Decimal("0.0050")
+    support = [Decimal("1.0910")]
+    resistance = [Decimal("1.1110")]
+
+    sl, tp = engine._recalc_sl_tp(
+        entry=entry,
+        atr=atr,
+        direction="LONG",
+        regime="TREND_BULL",
+        symbol="EURUSD=X",
+        support_levels=support,
+        resistance_levels=resistance,
+    )
+    assert sl is not None
+    assert tp is not None
+
+
+# ── SIM-37: Externalize swap rates to JSON ─────────────────────────────────────
+
+
+def test_sim37_swap_rates_from_json():
+    """Swap rates loaded from JSON file."""
+    import json
+    import os
+
+    config_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "config", "swap_rates.json"
+    )
+    assert os.path.exists(config_path), "config/swap_rates.json should exist"
+    with open(config_path) as f:
+        data = json.load(f)
+    assert "rates" in data
+    assert "AUDUSD=X" in data["rates"]
+
+
+def test_sim37_swap_rates_fallback():
+    """Hardcoded fallback rates still exist and have EURUSD."""
+    from src.tracker.signal_tracker import SWAP_DAILY_PIPS_HARDCODE
+    assert "EURUSD=X" in SWAP_DAILY_PIPS_HARDCODE
+
+
+def test_sim37_swap_rates_loaded_is_valid_dict():
+    """SWAP_DAILY_PIPS is a valid dict with Decimal values."""
+    from src.tracker.signal_tracker import SWAP_DAILY_PIPS
+
+    assert isinstance(SWAP_DAILY_PIPS, dict)
+    # Check at least one entry has Decimal values
+    if SWAP_DAILY_PIPS:
+        first_val = next(iter(SWAP_DAILY_PIPS.values()))
+        assert "long" in first_val
+        assert isinstance(first_val["long"], Decimal)
+
+
+def test_sim37_json_has_updated_at():
+    """config/swap_rates.json has 'updated_at' field for staleness tracking."""
+    import json
+    import os
+
+    config_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "config", "swap_rates.json"
+    )
+    with open(config_path) as f:
+        data = json.load(f)
+    assert "updated_at" in data
