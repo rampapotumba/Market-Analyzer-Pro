@@ -16,6 +16,7 @@ Architecture (per SPEC_SIMULATOR_V4.md §SIM-22):
 Isolation guarantee: this module NEVER writes to signal_results or virtual_portfolio.
 """
 
+import asyncio
 import datetime
 import logging
 from decimal import Decimal
@@ -26,6 +27,7 @@ import pandas as pd
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.backtesting.backtest_params import BacktestParams, BacktestTradeResult
+from src.config import BLOCKED_REGIMES, INSTRUMENT_OVERRIDES, MIN_COMPOSITE_SCORE, MIN_COMPOSITE_SCORE_CRYPTO
 from src.database.crud import (
     create_backtest_run,
     create_backtest_trades_bulk,
@@ -36,6 +38,17 @@ from src.database.crud import (
 from src.signals.risk_manager_v2 import REGIME_RR_MAP, ATR_SL_MULTIPLIER_MAP, RiskManagerV2
 
 logger = logging.getLogger(__name__)
+
+# ── In-memory progress tracker: run_id → pct (0–100) ─────────────────────────
+# Updated from worker thread — safe due to GIL for simple dict writes.
+# Cleared when run completes or fails.
+_backtest_progress: dict[str, float] = {}
+
+
+def get_backtest_progress(run_id: str) -> float | None:
+    """Return progress percentage (0–100) for a running backtest, or None if not tracked."""
+    return _backtest_progress.get(run_id)
+
 
 # ── Thresholds (mirror SignalEngineV2) ────────────────────────────────────────
 _BUY_THRESHOLD = 10.0     # composite score to emit a signal
@@ -61,6 +74,29 @@ _SL_SLIPPAGE: dict[str, Decimal] = {
     "stocks": Decimal("0.01"),    # 1 pip (dollar)
     "crypto": Decimal("0.001"),   # 0.1%
 }
+
+# Cooldown per timeframe in minutes — mirrors SignalEngine.SIGNAL_COOLDOWN_MINUTES
+_COOLDOWN_MINUTES: dict[str, int] = {
+    "M1": 1, "M5": 5, "M15": 15,
+    "H1": 60, "H4": 240, "D1": 1440,
+}
+
+# EU/NA forex pairs blocked during Asian low-liquidity session (00:00–06:59 UTC)
+# mirrors SignalEngine._FOREX_PAIRS_EU_NA + _is_low_liquidity_session
+_FOREX_PAIRS_EU_NA: frozenset[str] = frozenset({
+    "EURUSD=X", "GBPUSD=X", "USDCHF=X", "EURGBP=X",
+    "EURCAD=X", "GBPCAD=X", "EURCHF=X", "GBPCHF=X",
+})
+_ASIAN_SESSION_UTC_START = 0   # 00:00 UTC
+_ASIAN_SESSION_UTC_END   = 7   # 07:00 UTC (exclusive)
+
+
+def _is_asian_session(candle_ts: datetime.datetime) -> bool:
+    """Return True if candle timestamp falls in low-liquidity Asian hours (UTC)."""
+    hour = candle_ts.hour if candle_ts.tzinfo else candle_ts.replace(
+        tzinfo=datetime.timezone.utc
+    ).hour
+    return _ASIAN_SESSION_UTC_START <= hour < _ASIAN_SESSION_UTC_END
 
 
 def _detect_regime_from_df(df: pd.DataFrame) -> str:
@@ -176,15 +212,24 @@ def _compute_summary(
     long_count = sum(1 for t in trades if t.direction == "LONG")
     short_count = sum(1 for t in trades if t.direction == "SHORT")
 
-    # Equity curve: running balance
+    # Equity curve: running balance, downsampled to max 200 points
     balance = float(account_size)
-    equity_curve: list[dict] = []
+    raw_curve: list[dict] = []
     for t in sorted(trades, key=lambda x: x.exit_at or datetime.datetime.min):
         balance += float(t.pnl_usd or 0)
-        equity_curve.append({
+        raw_curve.append({
             "date": (t.exit_at.isoformat() if t.exit_at else ""),
             "balance": round(balance, 4),
         })
+    # Downsample: keep first, last, and evenly spaced points in between
+    _max_points = 200
+    if len(raw_curve) > _max_points:
+        step = len(raw_curve) / (_max_points - 1)
+        indices = set(int(i * step) for i in range(_max_points - 1))
+        indices.add(len(raw_curve) - 1)
+        equity_curve = [raw_curve[i] for i in sorted(indices)]
+    else:
+        equity_curve = raw_curve
 
     # Max drawdown
     peak = float(account_size)
@@ -326,8 +371,16 @@ class BacktestEngine:
 
         return run_id
 
-    async def _simulate(self, params: BacktestParams) -> list[BacktestTradeResult]:
-        """Core simulation loop. Returns list of completed trades."""
+    async def _simulate(
+        self,
+        params: BacktestParams,
+        run_id: str | None = None,
+    ) -> list[BacktestTradeResult]:
+        """Core simulation loop. Returns list of completed trades.
+
+        If run_id is provided, updates _backtest_progress[run_id] (0–100)
+        after each symbol completes so callers can poll progress.
+        """
         trades: list[BacktestTradeResult] = []
 
         start_dt = datetime.datetime.fromisoformat(params.start_date).replace(
@@ -337,10 +390,16 @@ class BacktestEngine:
             hour=23, minute=59, second=59, tzinfo=datetime.timezone.utc
         )
 
-        for symbol in params.symbols:
+        total_symbols = len(params.symbols)
+        if run_id:
+            _backtest_progress[run_id] = 0.0
+
+        for sym_idx, symbol in enumerate(params.symbols):
             instrument = await get_instrument_by_symbol(self.db, symbol)
             if instrument is None:
                 logger.warning("[SIM-22] Instrument %s not found — skipping", symbol)
+                if run_id:
+                    _backtest_progress[run_id] = round((sym_idx + 1) / total_symbols * 100, 1)
                 continue
 
             market_type: str = instrument.market or "forex"
@@ -359,21 +418,37 @@ class BacktestEngine:
                     "[SIM-22] %s: only %d candles — need at least %d, skipping",
                     symbol, len(price_rows), _MIN_BARS_HISTORY + 2,
                 )
+                if run_id:
+                    _backtest_progress[run_id] = round((sym_idx + 1) / total_symbols * 100, 1)
                 continue
 
-            symbol_trades = await self._simulate_symbol(
+            # progress_cb: called from the worker thread after every N candles
+            sym_base_pct = sym_idx / total_symbols * 100
+            sym_share = 100.0 / total_symbols
+
+            def _progress_cb(candle_pct: float) -> None:
+                if run_id:
+                    _backtest_progress[run_id] = round(sym_base_pct + candle_pct * sym_share / 100, 1)
+
+            symbol_trades = await asyncio.to_thread(
+                self._simulate_symbol,
                 symbol=symbol,
                 market_type=market_type,
                 timeframe=params.timeframe,
                 price_rows=price_rows,
                 account_size=params.account_size,
                 apply_slippage=params.apply_slippage,
+                progress_cb=_progress_cb,
             )
             trades.extend(symbol_trades)
 
+            if run_id:
+                _backtest_progress[run_id] = round((sym_idx + 1) / total_symbols * 100, 1)
+                logger.info("[SIM-22] %s done — progress %.1f%%", symbol, _backtest_progress[run_id])
+
         return trades
 
-    async def _simulate_symbol(
+    def _simulate_symbol(
         self,
         symbol: str,
         market_type: str,
@@ -381,14 +456,26 @@ class BacktestEngine:
         price_rows: list,
         account_size: Decimal,
         apply_slippage: bool,
+        progress_cb: Any = None,
     ) -> list[BacktestTradeResult]:
-        """Simulate one symbol over all its candles. Returns closed trades."""
+        """Simulate one symbol over all its candles. Returns closed trades.
+
+        NOTE: sync (no awaits) — called via asyncio.to_thread() to avoid blocking event loop.
+        progress_cb(pct: float) is called every 100 candles if provided.
+        """
         trades: list[BacktestTradeResult] = []
         open_trade: Optional[dict[str, Any]] = None  # one position at a time per symbol
+        last_signal_ts: Optional[datetime.datetime] = None  # cooldown tracking
+        cooldown_minutes = _COOLDOWN_MINUTES.get(timeframe, 60)
 
         n = len(price_rows)
+        _progress_interval = 100  # call progress_cb every N candles
 
         for i in range(_MIN_BARS_HISTORY, n - 1):
+            # ── Progress callback every N candles ─────────────────────────────
+            if progress_cb is not None and (i - _MIN_BARS_HISTORY) % _progress_interval == 0:
+                progress_cb((i - _MIN_BARS_HISTORY) / max(n - _MIN_BARS_HISTORY - 1, 1) * 100)
+
             # ── NO LOOKAHEAD: only rows [0..i-1] visible to signal generation
             history = price_rows[:i]
             df = _to_ohlcv_df(history)
@@ -427,6 +514,19 @@ class BacktestEngine:
             if open_trade is not None:
                 continue  # one position per symbol at a time
 
+            candle_ts: datetime.datetime = current_candle.timestamp
+
+            # Session filter: skip EU/NA forex pairs during Asian hours
+            if market_type == "forex" and symbol in _FOREX_PAIRS_EU_NA:
+                if _is_asian_session(candle_ts):
+                    continue
+
+            # Cooldown filter: mirror SignalEngine cooldown per timeframe
+            if last_signal_ts is not None:
+                elapsed = (candle_ts - last_signal_ts).total_seconds() / 60
+                if elapsed < cooldown_minutes:
+                    continue
+
             signal = self._generate_signal(df, symbol, market_type, timeframe)
             if signal is None:
                 continue
@@ -441,10 +541,12 @@ class BacktestEngine:
                 atr=signal["atr"],
                 direction=direction,
                 regime=signal["regime"],
+                symbol=symbol,
             )
             if sl is None or tp is None:
                 continue
 
+            last_signal_ts = candle_ts
             open_trade = {
                 "symbol": symbol,
                 "timeframe": timeframe,
@@ -571,6 +673,49 @@ class BacktestEngine:
             mae=Decimal(str(round(open_trade["mae"], 8))),
         )
 
+    @staticmethod
+    def _check_d1_trend_alignment(
+        symbol: str,
+        direction: str,
+        timeframe: str,
+        d1_rows: list,
+    ) -> bool:
+        """SIM-27: D1 MA200 trend alignment filter.
+
+        Returns True (allow) or False (block).
+        Graceful degradation: if data insufficient → returns True.
+        M1/M5/M15: filter not applied (returns True).
+        """
+        # M1/M5/M15: filter not applied
+        if timeframe in ("M1", "M5", "M15"):
+            return True
+
+        if not d1_rows or len(d1_rows) < 200:
+            logger.warning(
+                "[SIM-27] Insufficient D1 data (%d/200) for %s, skipping filter",
+                len(d1_rows) if d1_rows else 0,
+                symbol,
+            )
+            return True  # graceful degradation
+
+        closes = [float(r.close) for r in d1_rows[-200:]]
+        ma200 = sum(closes) / len(closes)
+        current_close = closes[-1]
+
+        if direction == "LONG" and current_close < ma200:
+            logger.info(
+                "[SIM-27] Blocked LONG: D1 close %.5f < MA200 %.5f for %s",
+                current_close, ma200, symbol,
+            )
+            return False
+        if direction == "SHORT" and current_close > ma200:
+            logger.info(
+                "[SIM-27] Blocked SHORT: D1 close %.5f > MA200 %.5f for %s",
+                current_close, ma200, symbol,
+            )
+            return False
+        return True
+
     def _generate_signal(
         self,
         df: pd.DataFrame,
@@ -604,7 +749,14 @@ class BacktestEngine:
 
         composite = _TA_WEIGHT * ta_score
 
-        if abs(composite) < abs(_BUY_THRESHOLD):
+        # SIM-25: Composite score threshold
+        threshold = MIN_COMPOSITE_SCORE_CRYPTO if market_type == "crypto" else MIN_COMPOSITE_SCORE
+        # SIM-28: Per-instrument override for min_composite_score
+        overrides = INSTRUMENT_OVERRIDES.get(symbol, {})
+        if "min_composite_score" in overrides:
+            threshold = overrides["min_composite_score"]
+        if abs(composite) < threshold:
+            logger.debug("[SIM-25/28] Score %.2f below threshold %.0f for %s", composite, threshold, symbol)
             return None
 
         direction = "LONG" if composite > 0 else "SHORT"
@@ -614,6 +766,20 @@ class BacktestEngine:
             regime = _detect_regime_from_df(df)
         except Exception as exc:
             logger.debug("[SIM-22] Regime detection error for %s: %s", symbol, exc)
+
+        # SIM-26: Block RANGING regime
+        if regime in BLOCKED_REGIMES:
+            logger.debug("[SIM-26] Skipping: %s regime for %s", regime, symbol)
+            return None
+
+        # SIM-28: Allowed regimes check (per-instrument override)
+        if "allowed_regimes" in overrides and regime not in overrides["allowed_regimes"]:
+            logger.debug("[SIM-28] Regime %s not in allowed_regimes for %s", regime, symbol)
+            return None
+
+        # SIM-27: D1 MA200 trend alignment filter (passed as kwarg when available)
+        # d1_rows is not available in this signature; callers that need it should use
+        # _check_d1_trend_alignment directly. Here we skip (no D1 data in _generate_signal).
 
         return {
             "direction": direction,
@@ -630,14 +796,19 @@ class BacktestEngine:
         atr: Decimal,
         direction: str,
         regime: str,
+        symbol: str = "",
     ) -> tuple[Optional[Decimal], Optional[Decimal]]:
         """Compute SL and TP for the backtest position using regime-adaptive rules."""
         try:
+            # SIM-28: Apply per-instrument SL ATR multiplier override
+            overrides = INSTRUMENT_OVERRIDES.get(symbol, {})
+            sl_atr_multiplier_override = overrides.get("sl_atr_multiplier")
             levels = self._rm.calculate_levels_for_regime(
                 entry=entry,
                 atr=atr,
                 direction=direction,
                 regime=regime,
+                sl_atr_multiplier_override=sl_atr_multiplier_override,
             )
             return levels.get("stop_loss"), levels.get("take_profit_1")
         except Exception as exc:

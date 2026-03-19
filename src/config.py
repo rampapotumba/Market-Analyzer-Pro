@@ -141,3 +141,27 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+# ── v5: Signal filtering constants ───────────────────────────────────────────
+MIN_COMPOSITE_SCORE: int = 15          # global threshold (raised from 10)
+MIN_COMPOSITE_SCORE_CRYPTO: int = 20   # for market == "crypto"
+
+BLOCKED_REGIMES: list = ["RANGING"]
+
+INSTRUMENT_OVERRIDES: dict = {
+    "BTC/USDT": {
+        "sl_atr_multiplier": 3.5,
+        "min_composite_score": 20,
+        "allowed_regimes": ["STRONG_TREND_BULL", "STRONG_TREND_BEAR"],
+    },
+    "ETH/USDT": {
+        "sl_atr_multiplier": 3.5,
+        "min_composite_score": 20,
+    },
+    "GBPUSD=X": {
+        "min_composite_score": 20,
+    },
+    "USDCHF=X": {
+        "min_composite_score": 18,
+    },
+}

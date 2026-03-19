@@ -230,6 +230,7 @@ class RiskManagerV2:
         regime: str = "RANGING",
         support_levels: Optional[list[Decimal]] = None,
         resistance_levels: Optional[list[Decimal]] = None,
+        sl_atr_multiplier_override: Optional[float] = None,
     ) -> dict[str, Optional[Decimal]]:
         """v3: Regime-adaptive SL/TP using R:R-based TP calculation.
 
@@ -240,6 +241,8 @@ class RiskManagerV2:
         SL = entry ± ATR × REGIME_SL_MULTIPLIERS[regime]
         TP1 = entry ± SL_distance × REGIME_TP1_RR[regime]
         TP2 = entry ± SL_distance × REGIME_TP2_RR[regime]
+
+        sl_atr_multiplier_override: SIM-28 — if provided, use instead of ATR_SL_MULTIPLIER_MAP lookup.
         """
         if direction not in ("LONG", "SHORT"):
             return {
@@ -251,7 +254,11 @@ class RiskManagerV2:
             }
 
         # SIM-19: use ATR_SL_MULTIPLIER_MAP with DEFAULT fallback (any unknown regime → 2.0)
-        sl_mult = Decimal(str(ATR_SL_MULTIPLIER_MAP.get(regime, ATR_SL_MULTIPLIER_MAP["DEFAULT"])))
+        # SIM-28: if override provided, use it instead of map lookup
+        if sl_atr_multiplier_override is not None:
+            sl_mult = Decimal(str(sl_atr_multiplier_override))
+        else:
+            sl_mult = Decimal(str(ATR_SL_MULTIPLIER_MAP.get(regime, ATR_SL_MULTIPLIER_MAP["DEFAULT"])))
         # SIM-18: use REGIME_RR_MAP for target_rr (TP1) and min_rr (snap validation)
         rr_cfg = REGIME_RR_MAP.get(regime, REGIME_RR_MAP["DEFAULT"])
         target_rr = Decimal(str(rr_cfg["target_rr"]))

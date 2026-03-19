@@ -18,7 +18,7 @@ from src.analysis.llm_engine import LLMEngine
 from src.analysis.sentiment_engine_v2 import SentimentEngineV2
 from src.analysis.ta_engine import TAEngine
 from src.cache import cache
-from src.config import settings
+from src.config import BLOCKED_REGIMES, INSTRUMENT_OVERRIDES, MIN_COMPOSITE_SCORE, MIN_COMPOSITE_SCORE_CRYPTO, settings
 from src.database.crud import (
     cancel_open_signals,
     create_signal,
@@ -678,6 +678,19 @@ class SignalEngine:
 
         # 14c. H1 signals only for crypto and forex
         market_type = getattr(instrument, "market", "") or ""
+
+        # SIM-25: Global composite score threshold (raised from 10 to 15/20)
+        _threshold_25 = MIN_COMPOSITE_SCORE_CRYPTO if market_type == "crypto" else MIN_COMPOSITE_SCORE
+        # SIM-28: Per-instrument override takes priority
+        _instrument_overrides = INSTRUMENT_OVERRIDES.get(instrument.symbol, {})
+        if "min_composite_score" in _instrument_overrides:
+            _threshold_25 = _instrument_overrides["min_composite_score"]
+        if abs(composite_score) < _threshold_25:
+            logger.debug(
+                f"[SIM-25] Score {composite_score:.2f} below threshold {_threshold_25} for {instrument.symbol}"
+            )
+            return None
+
         if timeframe == "H1" and market_type not in settings.H1_ALLOWED_MARKETS:
             logger.debug(
                 f"[SignalEngine] H1 signal skipped for {instrument.symbol} "
@@ -711,6 +724,11 @@ class SignalEngine:
                 current_regime = regime_obj.regime
         except Exception:
             pass
+
+        # SIM-26: Block RANGING regime
+        if current_regime and current_regime in BLOCKED_REGIMES:
+            logger.info(f"[SIM-26] Skipping: {current_regime} regime for {instrument.symbol}")
+            return None
 
         signal_data = {
             "instrument_id": instrument.id,
