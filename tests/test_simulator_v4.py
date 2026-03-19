@@ -1017,3 +1017,127 @@ async def test_sim22_backtest_isolated_from_live(mock_db_session):
     # The mock_db_session was never asked to write directly to live tables
     # (signal_results / virtual_portfolio are never mentioned in backtest_engine.py)
     assert mock_sim.called
+
+
+# ── SIM-20: MAE Early Exit ────────────────────────────────────────────────────
+
+
+def _make_signal_for_mae(direction: str = "LONG") -> MagicMock:
+    """Create a minimal signal mock for MAE early exit tests."""
+    sig = MagicMock()
+    sig.id = 99
+    sig.direction = direction
+    sig.timeframe = "H1"
+    sig.stop_loss = Decimal("1.09000") if direction == "LONG" else Decimal("1.11000")
+    sig.entry_price = Decimal("1.10000")
+    return sig
+
+
+def _make_position_for_mae(
+    mfe: Decimal = Decimal("0"),
+    mae: Decimal = Decimal("0"),
+    entry_filled_at: Optional[datetime.datetime] = None,
+    current_stop_loss: Optional[Decimal] = None,
+    entry_actual_price: Optional[Decimal] = None,
+) -> MagicMock:
+    pos = MagicMock()
+    pos.mfe = mfe
+    pos.mae = mae
+    pos.entry_filled_at = entry_filled_at or datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+    pos.current_stop_loss = current_stop_loss or Decimal("1.09000")
+    pos.entry_actual_price = entry_actual_price or Decimal("1.10000")
+    pos.trailing_stop = None
+    return pos
+
+
+def test_sim20_mae_early_exit_triggers():
+    """MAE 65% of SL distance, 4 candles elapsed, MFE=0 → early exit."""
+    from src.tracker.signal_tracker import SignalTracker
+
+    tracker = SignalTracker()
+    sig = _make_signal_for_mae("LONG")
+
+    # SL distance = |1.10000 - 1.09000| = 0.01000
+    # MAE = 0.0065 → mae_ratio = 0.0065/0.01 = 0.65 ≥ threshold (0.60)
+    pos = _make_position_for_mae(
+        mfe=Decimal("0"),
+        mae=Decimal("0.00650"),
+        entry_filled_at=datetime.datetime(2024, 1, 1, 0, 0, tzinfo=datetime.timezone.utc),
+    )
+
+    # now = 4 hours after entry → candles_elapsed = 4 (H1)
+    now = datetime.datetime(2024, 1, 1, 4, 0, tzinfo=datetime.timezone.utc)
+    current_price = Decimal("1.09650")  # current price not used in decision
+
+    result = tracker._check_mae_early_exit(pos, sig, current_price, now)
+    assert result is True, (
+        "Expected early exit with MAE=65%SL, 4 candles, MFE=0"
+    )
+
+
+def test_sim20_mae_early_exit_no_trigger_early_candles():
+    """MAE 65% of SL, but only 2 candles elapsed → NO early exit."""
+    from src.tracker.signal_tracker import SignalTracker
+
+    tracker = SignalTracker()
+    sig = _make_signal_for_mae("LONG")
+    pos = _make_position_for_mae(
+        mfe=Decimal("0"),
+        mae=Decimal("0.00650"),
+        entry_filled_at=datetime.datetime(2024, 1, 1, 0, 0, tzinfo=datetime.timezone.utc),
+    )
+
+    # now = only 2 hours after entry → candles_elapsed = 2 < min_candles (3)
+    now = datetime.datetime(2024, 1, 1, 2, 0, tzinfo=datetime.timezone.utc)
+    result = tracker._check_mae_early_exit(pos, sig, Decimal("1.09650"), now)
+    assert result is False, "Should not early exit before min_candles"
+
+
+def test_sim20_mae_early_exit_no_trigger_with_mfe():
+    """MAE 65%, 4 candles, but MFE = 40% of MAE → NO early exit.
+
+    mfe_max_ratio = 0.20 → exit only if mfe/mae < 0.20 → mfe < 20% of mae.
+    Here mfe = 40% of mae → mfe_ratio (0.40) >= mfe_max_ratio (0.20) → skip.
+    """
+    from src.tracker.signal_tracker import SignalTracker
+
+    tracker = SignalTracker()
+    sig = _make_signal_for_mae("LONG")
+    # MAE = 0.0065, MFE = 0.40 × 0.0065 = 0.0026
+    pos = _make_position_for_mae(
+        mfe=Decimal("0.00260"),
+        mae=Decimal("0.00650"),
+        entry_filled_at=datetime.datetime(2024, 1, 1, 0, 0, tzinfo=datetime.timezone.utc),
+    )
+    now = datetime.datetime(2024, 1, 1, 4, 0, tzinfo=datetime.timezone.utc)
+    result = tracker._check_mae_early_exit(pos, sig, Decimal("1.09650"), now)
+    assert result is False, (
+        "Should not early exit: MFE=40%MAE is above mfe_max_ratio threshold (20%)"
+    )
+
+
+def test_sim20_mae_early_exit_division_by_zero():
+    """sl_distance=0 or mae=0 → graceful (returns False, no crash)."""
+    from src.tracker.signal_tracker import SignalTracker
+
+    tracker = SignalTracker()
+    sig = _make_signal_for_mae("LONG")
+
+    # sl_distance = 0 (entry == SL — degenerate case)
+    pos_zero_sl = _make_position_for_mae(
+        mfe=Decimal("0"), mae=Decimal("0"),
+        current_stop_loss=Decimal("1.10000"),  # same as entry → dist=0
+        entry_actual_price=Decimal("1.10000"),
+        entry_filled_at=datetime.datetime(2024, 1, 1, 0, 0, tzinfo=datetime.timezone.utc),
+    )
+    now = datetime.datetime(2024, 1, 1, 5, 0, tzinfo=datetime.timezone.utc)
+    result = tracker._check_mae_early_exit(pos_zero_sl, sig, Decimal("1.10000"), now)
+    assert result is False, "sl_distance=0 should return False gracefully"
+
+    # mae=0 → ratio < threshold → no exit
+    pos_zero_mae = _make_position_for_mae(
+        mfe=Decimal("0"), mae=Decimal("0"),
+        entry_filled_at=datetime.datetime(2024, 1, 1, 0, 0, tzinfo=datetime.timezone.utc),
+    )
+    result2 = tracker._check_mae_early_exit(pos_zero_mae, sig, Decimal("1.10000"), now)
+    assert result2 is False, "mae=0 should return False (no adverse move)"

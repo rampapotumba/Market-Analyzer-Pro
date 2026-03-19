@@ -204,22 +204,15 @@
 
 ### 3.1 SIM-20: MAE Early Exit
 
-- [ ] В `src/tracker/signal_tracker.py`: добавь `MAE_EARLY_EXIT_CONFIG` (значения из спеки §SIM-20)
-- [ ] Добавь `"mae_early_exit"` в exit_reason константы (если есть enum/set — расширить)
-- [ ] В тике симулятора: ПОСЛЕ обновления MAE (но ДО проверки SL/TP):
-  ```
-  sl_distance = abs(entry_price - current_sl)
-  mae_ratio = abs(mae) / sl_distance
-  if mae_ratio >= threshold AND candles >= min_candles AND (mfe == 0 or abs(mae)/abs(mfe) >= 1/mfe_max_ratio):
-      → close at current_price, exit_reason="mae_early_exit"
-  ```
-- [ ] При закрытии: записать exit_reason = "mae_early_exit", result = "loss" (это всегда убыточный выход)
-- [ ] Тест: `test_sim20_mae_early_exit_triggers` — MAE 65% SL, 4 свечи, MFE=0 → exit
-- [ ] Тест: `test_sim20_mae_early_exit_no_trigger_early_candles` — MAE 65%, 2 свечи → НЕ exit
-- [ ] Тест: `test_sim20_mae_early_exit_no_trigger_with_mfe` — MAE 65%, MFE=40% MAE → НЕ exit
-- [ ] Тест: `test_sim20_mae_exit_reason_stored` — exit_reason="mae_early_exit" в БД
-- [ ] Тест: `test_sim20_mae_early_exit_division_by_zero` — mfe=0, mae=0, sl_distance=0 → graceful (нет exit, нет crash)
-- [ ] Коммит: `feat(sim-20): MAE early exit mechanism`
+- [x] В `src/tracker/signal_tracker.py`: добавлен `MAE_EARLY_EXIT_CONFIG` (threshold=0.60, min_candles=3, mfe_max_ratio=0.20)
+- [x] Добавлен `_TF_SECONDS` dict для оценки candles_elapsed из timestamp diff
+- [x] В тике симулятора: ПОСЛЕ `_update_mfe_mae`, ДО SL/TP check — вызов `_check_mae_early_exit()`
+- [x] При срабатывании: `_close_signal(..., exit_reason="mae_early_exit")` ("mae_early_exit" = 14 chars ≤ String(16))
+- [x] Тест: `test_sim20_mae_early_exit_triggers` — MAE 65% SL, 4 свечи, MFE=0 → exit
+- [x] Тест: `test_sim20_mae_early_exit_no_trigger_early_candles` — MAE 65%, 2 свечи → НЕ exit
+- [x] Тест: `test_sim20_mae_early_exit_no_trigger_with_mfe` — MAE 65%, MFE=40% MAE → НЕ exit
+- [x] Тест: `test_sim20_mae_early_exit_division_by_zero` — sl_distance=0 или mae=0 → graceful
+- [x] Коммит: `feat(sim-20): MAE early exit mechanism`
 
 ### 3.2 SIM-20: Бэктест с MAE early exit
 

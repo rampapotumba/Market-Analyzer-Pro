@@ -88,6 +88,23 @@ TRIPLE_SWAP_WEEKDAY: int = 2    # Wednesday (0=Mon)
 ROLLOVER_HOUR_UTC: int = 22     # 22:00 UTC
 
 
+# ── MAE Early Exit config (SIM-20) ────────────────────────────────────────────
+
+MAE_EARLY_EXIT_CONFIG: dict = {
+    "enabled": True,
+    "threshold_pct_of_sl": Decimal("0.60"),   # MAE >= 60% of SL distance
+    "min_candles": 3,                          # minimum 3 candles elapsed
+    "mfe_max_ratio": Decimal("0.20"),          # MFE < 20% of MAE
+}
+
+# Timeframe → approximate seconds per candle (for candles_elapsed estimate)
+_TF_SECONDS: dict[str, int] = {
+    "M1": 60, "M5": 300, "M15": 900, "M30": 1800,
+    "H1": 3600, "H4": 14400, "H12": 43200,
+    "D1": 86400, "W1": 604800,
+}
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _utc(dt: Optional[datetime.datetime]) -> Optional[datetime.datetime]:
@@ -317,6 +334,73 @@ class SignalTracker:
         except Exception as exc:
             logger.debug(f"[Tracker] MFE/MAE update failed for signal {signal.id}: {exc}")
 
+    # ── MAE Early Exit (SIM-20) ───────────────────────────────────────────────
+
+    def _check_mae_early_exit(
+        self,
+        position: Any,
+        signal: "Signal",
+        current_price: Decimal,
+        now: datetime.datetime,
+    ) -> bool:
+        """Return True if the position should be closed early due to MAE threshold.
+
+        Conditions (all must be true):
+          1. MAE_EARLY_EXIT_CONFIG["enabled"] is True
+          2. mae_ratio = abs(mae) / sl_distance >= threshold_pct_of_sl
+          3. candles_elapsed >= min_candles (estimated from entry_filled_at + timeframe)
+          4. mfe == 0 OR abs(mae) / abs(mfe) >= 1 / mfe_max_ratio
+
+        Graceful on zero-division (sl_distance=0, mfe=0): returns False.
+        """
+        cfg = MAE_EARLY_EXIT_CONFIG
+        if not cfg.get("enabled"):
+            return False
+
+        mae: Decimal = position.mae if position.mae is not None else Decimal("0")
+        current_sl: Optional[Decimal] = position.current_stop_loss or signal.stop_loss
+        entry_price: Optional[Decimal] = position.entry_actual_price or signal.entry_price
+
+        # Guard: need SL distance to compute ratio
+        if current_sl is None or entry_price is None:
+            return False
+
+        sl_distance = abs(entry_price - current_sl)
+        if sl_distance == 0:
+            return False
+
+        mae_ratio = abs(mae) / sl_distance
+        if mae_ratio < cfg["threshold_pct_of_sl"]:
+            return False
+
+        # Candles elapsed estimate from entry time and timeframe
+        entry_time = position.entry_filled_at
+        if entry_time is None:
+            return False
+
+        timeframe = signal.timeframe or "H1"
+        tf_seconds = _TF_SECONDS.get(timeframe, 3600)
+        elapsed_seconds = (now - _utc(entry_time)).total_seconds()
+        candles_elapsed = int(elapsed_seconds / tf_seconds)
+
+        if candles_elapsed < cfg["min_candles"]:
+            return False
+
+        # MFE ratio check
+        mfe: Decimal = position.mfe if position.mfe is not None else Decimal("0")
+        if mfe > 0:
+            mfe_ratio = mfe / abs(mae) if abs(mae) > 0 else Decimal("999")
+            # mfe < 20% of mae ↔ mae/mfe >= 1/0.20 = 5.0 ↔ mfe_ratio < mfe_max_ratio
+            if mfe_ratio >= cfg["mfe_max_ratio"]:
+                # MFE is large enough relative to MAE — don't early exit
+                return False
+
+        logger.info(
+            "[SIM-20] MAE early exit: signal=%d mae_ratio=%.2f candles=%d mfe=%.6f mae=%.6f",
+            signal.id, float(mae_ratio), candles_elapsed, float(mfe), float(mae),
+        )
+        return True
+
     # ── ATR helper (SIM-11: live Wilder's ATR with fallback chain) ───────────
 
     async def _get_live_atr(
@@ -529,6 +613,17 @@ class SignalTracker:
             await self._update_virtual_unrealized(db, signal, current_price, actual_entry, position)
             # Update MFE/MAE in DB (SIM-01)
             await self._update_mfe_mae(db, signal, current_price, actual_entry)
+            # Reload position after MAE update so latest values are visible
+            position = await get_virtual_position(db, signal.id) or position
+
+            # SIM-20: MAE Early Exit — check after MAE update, before SL/TP
+            if self._check_mae_early_exit(position, signal, current_price, now):
+                await self._close_signal(
+                    db, signal, current_price, now, "mae_early_exit", position, pip_size,
+                    candle_high_at_exit=candle_high, candle_low_at_exit=candle_low,
+                    market=market,
+                )
+                return
 
             # SIM-05: use TradeLifecycleManager when SL and TP1 are defined
             if signal.stop_loss and signal.take_profit_1:
@@ -593,6 +688,7 @@ class SignalTracker:
                         await update_virtual_position(db, signal.id, {
                             "current_stop_loss": action["new_stop_loss"],
                             "breakeven_moved":   True,
+                            "breakeven_price":   action["new_stop_loss"],
                         })
                         logger.debug(
                             f"[Tracker] Signal {signal.id} breakeven: SL → {action['new_stop_loss']}"
@@ -782,8 +878,12 @@ class SignalTracker:
             size_pct = position.size_pct or Decimal("2.0")
             _raw_bal2 = position.account_balance_at_entry
             balance = _raw_bal2 if isinstance(_raw_bal2, Decimal) else ACCOUNT_SIZE
-            # swap_usd = swap_pips × pip_size × (balance × size_pct / 100) / pip_size (simplified)
-            swap_usd = swap_pips * pip_size * (balance * size_pct / Decimal("100")) / pip_size
+            # swap_usd = swap_pips × pip_size × position_value / entry_price
+            # = fractional price move × notional position value
+            # (dividing by entry_price converts from quote units to base-currency position)
+            entry_price = position.entry_price or Decimal("1")
+            position_value = balance * size_pct / Decimal("100")
+            swap_usd = swap_pips * pip_size * position_value / entry_price
             swap_usd = swap_usd.quantize(Decimal("0.0001"))
 
             new_accrued_pips = (position.accrued_swap_pips or Decimal("0")) + swap_pips
@@ -863,6 +963,7 @@ class SignalTracker:
             "partial_pnl_pct":     pnl_pct.quantize(Decimal("0.0001")),
             "current_stop_loss":   entry,    # SL → entry after partial close
             "breakeven_moved":     True,
+            "breakeven_price":     entry,    # record exact BE level for analysis
         })
 
         # SIM-16: update account balance for the 50% partial close P&L
@@ -919,7 +1020,7 @@ class SignalTracker:
         pnl_pips, pnl_pct = self._calculate_pnl(
             signal.direction, actual_entry, exit_price, pip_size
         )
-        result = "win" if pnl_pips > 0 else ("loss" if pnl_pips < 0 else "breakeven")
+        # result is determined below after all P&L adjustments (partial + swap)
 
         # SIM-04: duration from entry_filled_at
         entry_time = (
@@ -963,7 +1064,7 @@ class SignalTracker:
             "pnl_pips":               pnl_pips.quantize(Decimal("0.01")),
             "pnl_percent":             pnl_pct.quantize(Decimal("0.0001")),
             "pnl_usd":                 pnl_usd_val.quantize(Decimal("0.01")),
-            "result":                  result,
+            "result":                  "breakeven",  # overridden below after all P&L adjustments
             "max_favorable_excursion": mfe,
             "max_adverse_excursion":   mae,
             "duration_minutes":        duration_minutes,
@@ -987,6 +1088,12 @@ class SignalTracker:
         if partial_close_pnl_usd is not None:
             result_data["partial_close_pnl_usd"] = partial_close_pnl_usd.quantize(Decimal("0.01"))
             result_data["full_close_pnl_usd"]    = full_close_pnl_usd.quantize(Decimal("0.01"))
+
+        # Determine result from final pnl_usd — includes blended partial close + swap.
+        # Using pnl_pips alone would mislabel a partial-close win as "loss" when the
+        # final SL leg is slightly negative but overall trade is profitable.
+        _final_pnl = result_data["pnl_usd"]
+        result_data["result"] = "win" if _final_pnl > 0 else ("loss" if _final_pnl < 0 else "breakeven")
 
         async with db.begin_nested():
             await create_signal_result(db, result_data)
@@ -1021,9 +1128,15 @@ class SignalTracker:
 
         try:
             instr = await get_instrument_by_id(db, signal.instrument_id)
-            instrument_name = instr.name if instr else str(signal.instrument_id)
-            await telegram.send_signal_result(
-                instrument_name, signal.direction, exit_reason, float(pnl_pips)
+            await telegram.send_position_closed(
+                instrument_name=instr.name if instr else str(signal.instrument_id),
+                instrument_symbol=instr.symbol if instr else "—",
+                direction=signal.direction,
+                exit_reason=exit_reason,
+                entry_price=float(actual_entry),
+                exit_price=float(exit_price),
+                pnl_pips=float(pnl_pips),
+                pnl_usd=float(pnl_usd_val),
             )
         except Exception as exc:
             logger.warning(f"[Tracker] Telegram notification failed: {exc}")
