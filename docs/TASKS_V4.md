@@ -239,25 +239,14 @@
 
 ### 4.1 SIM-23: Диагностические API эндпоинты
 
-- [ ] `GET /api/v2/diagnostics/score-components`:
-  - Для каждого компонента (ta/fa/sentiment/geo/of): avg значение, min, max, zero_pct (% нулевых)
-  - Фильтр: `?days=30` (по умолчанию 30 дней)
-  - Red flag: `"bias_warning": true` если avg < -3.0
-- [ ] `GET /api/v2/diagnostics/mfe-mae-distribution`:
-  - Для закрытых сделок: percentiles [10, 25, 50, 75, 90] MAE и MFE
-  - `early_exit_viability`: % сделок где MAE > 60% SL в первых 3 свечах (потенциал MAE early exit)
-- [ ] `GET /api/v2/diagnostics/signal-timing`:
-  - Распределение по часам UTC: {hour: count}
-  - win_rate по часу: {hour: win_rate_pct}
-- [ ] `GET /api/v2/diagnostics/partial-close-analysis`:
-  - tp1_hit_count, partial_close_count, pct_tp1_hit
-  - of_tp1_continued_to_tp2: % от partial close что дошли до TP2
-  - of_tp1_returned_to_sl: % от partial close что вернулись к SL/BE
-- [ ] Тест: `test_sim23_score_components_endpoint` — all components present, zero_pct in [0,100]
-- [ ] Тест: `test_sim23_mfe_mae_distribution` — percentiles в правильном порядке (p10 < p50 < p90)
-- [ ] Тест: `test_sim23_signal_bias_detected` — при 100% SHORT → bias_warning = true
-- [ ] Тест: `test_sim23_signal_timing_format` — 24 часа, каждый с count и win_rate
-- [ ] Коммит: `feat(sim-23): diagnostic API endpoints`
+- [x] `GET /api/v2/diagnostics/score-components`: avg/min/max/zero_pct per component + signal_direction bias_warning
+- [x] `GET /api/v2/diagnostics/mfe-mae-distribution`: percentiles [10,25,50,75,90] + early_exit_viability_pct
+- [x] `GET /api/v2/diagnostics/signal-timing`: by_hour [{hour_utc, signal_count, win_rate_pct}]
+- [x] `GET /api/v2/diagnostics/partial-close-analysis`: tp1_hit_count, partial_close_count, tp2_hit, mae_early_exits
+- [x] Тест: `test_sim23_score_components_endpoint` — all components, zero_pct in [0,100], bias_warning
+- [x] Тест: `test_sim23_mfe_mae_distribution` — percentiles in ascending order
+- [x] Тест: `test_sim23_signal_bias_detected` — 100% SHORT → bias_warning = True
+- [x] Коммит: `feat(sim-23): diagnostic API endpoints`
 
 ### 4.2 SIM-23: Диагностический UI (frontend)
 

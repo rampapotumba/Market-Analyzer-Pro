@@ -1274,3 +1274,131 @@ def test_sim24_candle_tp1_hit_triggers_partial_close():
     assert action["action"] == "partial_close", (
         f"Candle TP1 hit + not partial_closed → partial_close, got {action['action']}"
     )
+
+
+# ── SIM-23: Diagnostic endpoints ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_sim23_score_components_endpoint(mock_db_session):
+    """GET /diagnostics/score-components returns all components with zero_pct in [0,100]."""
+    from unittest.mock import MagicMock, AsyncMock
+    from src.database.models import Signal as SignalModel
+
+    # Mock 2 signals: one with all-zero FA/geo/sentiment, one with real values
+    sig1 = MagicMock()
+    sig1.direction = "SHORT"
+    sig1.created_at = datetime.datetime(2024, 1, 15, tzinfo=datetime.timezone.utc)
+    sig1.ta_score = -12.0
+    sig1.fa_score = 0.0
+    sig1.sentiment_score = 0.0
+    sig1.geo_score = 0.0
+    sig1.of_score = None
+    sig1.id = 1
+
+    sig2 = MagicMock()
+    sig2.direction = "SHORT"
+    sig2.created_at = datetime.datetime(2024, 1, 16, tzinfo=datetime.timezone.utc)
+    sig2.ta_score = -8.0
+    sig2.fa_score = -2.0
+    sig2.sentiment_score = 1.0
+    sig2.geo_score = 0.0
+    sig2.of_score = None
+    sig2.id = 2
+
+    mock_result = MagicMock()
+    mock_result.scalars.return_value.all.return_value = [sig1, sig2]
+    mock_db_session.execute = AsyncMock(return_value=mock_result)
+
+    from src.api.routes_v2 import diagnostics_score_components
+    result = await diagnostics_score_components(days=30, db=mock_db_session)
+
+    assert "components" in result
+    comps = result["components"]
+    for comp in ["ta_score", "fa_score", "sentiment_score", "geo_score"]:
+        assert comp in comps, f"Missing component: {comp}"
+        stats = comps[comp]
+        if stats["count"] > 0:
+            assert 0 <= stats["zero_pct"] <= 100, f"zero_pct out of range for {comp}"
+
+    # Signal direction summary
+    assert "signal_direction" in result
+    sd = result["signal_direction"]
+    assert "long_count" in sd and "short_count" in sd
+    assert "bias_warning" in sd
+
+    # 100% SHORT → bias_warning should be True
+    assert sd["bias_warning"] is True
+
+
+@pytest.mark.asyncio
+async def test_sim23_mfe_mae_distribution(mock_db_session):
+    """percentiles in correct ascending order (p10 < p50 < p90)."""
+    from unittest.mock import MagicMock, AsyncMock
+    from src.api.routes_v2 import diagnostics_mfe_mae_distribution
+
+    # 10 closed trades with varying MFE/MAE
+    trades = []
+    for i in range(1, 11):
+        t = MagicMock()
+        t.max_favorable_excursion = Decimal(str(i * 0.001))
+        t.max_adverse_excursion = Decimal(str(i * 0.0005))
+        t.pnl_pips = Decimal(str(-i * 10))  # all losses
+        t.exit_reason = "sl_hit"
+        trades.append(t)
+
+    mock_result = MagicMock()
+    mock_result.scalars.return_value.all.return_value = trades
+    mock_db_session.execute = AsyncMock(return_value=mock_result)
+
+    result = await diagnostics_mfe_mae_distribution(db=mock_db_session)
+
+    assert result["total_closed"] == 10
+
+    mfe_dist = result["mfe_distribution"]
+    assert mfe_dist["p10"] is not None
+    assert mfe_dist["p50"] is not None
+    assert mfe_dist["p90"] is not None
+    # Ascending order
+    assert mfe_dist["p10"] <= mfe_dist["p50"] <= mfe_dist["p90"], (
+        f"MFE percentiles not in order: {mfe_dist}"
+    )
+
+    mae_dist = result["mae_distribution"]
+    assert mae_dist["p10"] <= mae_dist["p50"] <= mae_dist["p90"]
+
+    assert "early_exit_viability_pct" in result
+    assert 0 <= result["early_exit_viability_pct"] <= 100
+
+
+@pytest.mark.asyncio
+async def test_sim23_signal_bias_detected(mock_db_session):
+    """When 100% of signals are SHORT, bias_warning = True in score-components."""
+    from unittest.mock import MagicMock, AsyncMock
+    from src.api.routes_v2 import diagnostics_score_components
+
+    # 5 SHORT signals
+    signals = []
+    for i in range(5):
+        s = MagicMock()
+        s.direction = "SHORT"
+        s.created_at = datetime.datetime(2024, 1, i + 1, tzinfo=datetime.timezone.utc)
+        s.ta_score = -10.0
+        s.fa_score = 0.0
+        s.sentiment_score = 0.0
+        s.geo_score = 0.0
+        s.of_score = None
+        s.id = i
+        signals.append(s)
+
+    mock_result = MagicMock()
+    mock_result.scalars.return_value.all.return_value = signals
+    mock_db_session.execute = AsyncMock(return_value=mock_result)
+
+    result = await diagnostics_score_components(days=30, db=mock_db_session)
+
+    sd = result["signal_direction"]
+    assert sd["long_count"] == 0
+    assert sd["short_count"] == 5
+    assert sd["pct_short"] == 100.0
+    assert sd["bias_warning"] is True, "100% SHORT signals should set bias_warning"

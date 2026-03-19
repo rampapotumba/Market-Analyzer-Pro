@@ -1856,3 +1856,215 @@ async def health_collectors():
 
     overall = all(results.values())
     return {"healthy": overall, "collectors": results}
+
+
+# ── SIM-23: Diagnostic endpoints ──────────────────────────────────────────────
+
+
+@router_v2.get("/diagnostics/score-components")
+async def diagnostics_score_components(
+    days: int = Query(30, ge=1, le=365),
+    db: AsyncSession = Depends(get_session),
+):
+    """SIM-23: Average score components from signals generated in the last N days.
+
+    Returns per-component avg, min, max, zero_pct plus bias_warning flag.
+    """
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
+
+    stmt = select(Signal).where(Signal.created_at >= cutoff)
+    result = await db.execute(stmt)
+    signals = result.scalars().all()
+
+    components = ["ta_score", "fa_score", "sentiment_score", "geo_score", "of_score"]
+    stats: dict[str, Any] = {}
+    for comp in components:
+        values = [float(getattr(s, comp)) for s in signals if getattr(s, comp, None) is not None]
+        if values:
+            avg_v = sum(values) / len(values)
+            stats[comp] = {
+                "avg": round(avg_v, 4),
+                "min": round(min(values), 4),
+                "max": round(max(values), 4),
+                "zero_pct": round(sum(1 for v in values if v == 0.0) / len(values) * 100, 2),
+                "count": len(values),
+                "bias_warning": avg_v < -3.0,
+            }
+        else:
+            stats[comp] = {
+                "avg": None, "min": None, "max": None,
+                "zero_pct": None, "count": 0, "bias_warning": False,
+            }
+
+    # LONG/SHORT signal ratio
+    directions = [s.direction for s in signals if s.direction in ("LONG", "SHORT")]
+    long_count = sum(1 for d in directions if d == "LONG")
+    short_count = sum(1 for d in directions if d == "SHORT")
+    total_dir = long_count + short_count
+    pct_short = (short_count / total_dir * 100) if total_dir > 0 else 0
+    pct_long = (long_count / total_dir * 100) if total_dir > 0 else 0
+
+    return {
+        "period_days": days,
+        "total_signals": len(signals),
+        "components": stats,
+        "signal_direction": {
+            "long_count": long_count,
+            "short_count": short_count,
+            "pct_long": round(pct_long, 1),
+            "pct_short": round(pct_short, 1),
+            "bias_warning": pct_short > 80 or pct_long > 80,
+        },
+    }
+
+
+@router_v2.get("/diagnostics/mfe-mae-distribution")
+async def diagnostics_mfe_mae_distribution(db: AsyncSession = Depends(get_session)):
+    """SIM-23: MFE and MAE percentile distributions across all closed trades."""
+    import statistics
+
+    stmt = select(SignalResult).where(
+        SignalResult.exit_reason.notin_(["cancelled"]),
+        SignalResult.max_favorable_excursion.isnot(None),
+        SignalResult.max_adverse_excursion.isnot(None),
+    )
+    result = await db.execute(stmt)
+    closed = result.scalars().all()
+
+    def _percentiles(values: list[float], pcts: list[int]) -> dict[str, float]:
+        if not values:
+            return {f"p{p}": None for p in pcts}
+        s = sorted(values)
+        n = len(s)
+        out = {}
+        for p in pcts:
+            idx = int(p / 100 * (n - 1))
+            out[f"p{p}"] = round(s[idx], 6)
+        return out
+
+    mfe_vals = [float(t.max_favorable_excursion) for t in closed if t.max_favorable_excursion is not None]
+    mae_vals = [float(t.max_adverse_excursion) for t in closed if t.max_adverse_excursion is not None]
+
+    # early_exit_viability: estimate of trades where MAE > 60% of SL distance
+    # (proxy: using pnl_pips as denominator if SL distance not stored)
+    early_exit_count = 0
+    for t in closed:
+        if t.max_adverse_excursion is None:
+            continue
+        # Approximate SL distance from pnl_pips on losing trades
+        # If pnl_pips < 0 (loss), SL distance ≈ abs(pnl_pips) pips
+        if t.pnl_pips and t.pnl_pips < 0:
+            sl_dist_est = abs(float(t.pnl_pips))
+            if sl_dist_est > 0:
+                mae_ratio = abs(float(t.max_adverse_excursion)) / sl_dist_est
+                if mae_ratio >= 0.6:
+                    early_exit_count += 1
+    early_exit_viability = (
+        round(early_exit_count / len(closed) * 100, 2) if closed else 0.0
+    )
+
+    return {
+        "total_closed": len(closed),
+        "mfe_distribution": _percentiles(mfe_vals, [10, 25, 50, 75, 90]),
+        "mae_distribution": _percentiles(mae_vals, [10, 25, 50, 75, 90]),
+        "early_exit_viability_pct": early_exit_viability,
+    }
+
+
+@router_v2.get("/diagnostics/signal-timing")
+async def diagnostics_signal_timing(db: AsyncSession = Depends(get_session)):
+    """SIM-23: Signal distribution by hour UTC + win rate per hour."""
+    stmt = select(Signal).where(Signal.direction.in_(["LONG", "SHORT"]))
+    result = await db.execute(stmt)
+    signals = result.scalars().all()
+
+    # For win rate by hour, join with SignalResult
+    stmt2 = select(SignalResult).where(
+        SignalResult.exit_reason.notin_(["cancelled"]),
+        SignalResult.result.in_(["win", "loss", "breakeven"]),
+    )
+    result2 = await db.execute(stmt2)
+    results_list = result2.scalars().all()
+    result_map = {r.signal_id: r for r in results_list}
+
+    by_hour: dict[int, dict] = {h: {"count": 0, "wins": 0, "total_with_result": 0} for h in range(24)}
+    for sig in signals:
+        if sig.created_at:
+            h = sig.created_at.hour
+            by_hour[h]["count"] += 1
+            if sig.id in result_map:
+                r = result_map[sig.id]
+                by_hour[h]["total_with_result"] += 1
+                if r.result == "win":
+                    by_hour[h]["wins"] += 1
+
+    timing = []
+    for h in range(24):
+        rec = by_hour[h]
+        total_r = rec["total_with_result"]
+        win_rate = round(rec["wins"] / total_r * 100, 1) if total_r > 0 else None
+        timing.append({
+            "hour_utc": h,
+            "signal_count": rec["count"],
+            "win_rate_pct": win_rate,
+        })
+
+    return {"by_hour": timing}
+
+
+@router_v2.get("/diagnostics/partial-close-analysis")
+async def diagnostics_partial_close_analysis(db: AsyncSession = Depends(get_session)):
+    """SIM-23: Analysis of partial close execution rates."""
+    # TP1 hits = exit_reason='tp1_hit' in signal_results
+    tp1_q = await db.execute(
+        select(func.count(SignalResult.id)).where(SignalResult.exit_reason == "tp1_hit")
+    )
+    tp1_hit_count = tp1_q.scalar() or 0
+
+    # Partial closes
+    partial_q = await db.execute(
+        select(func.count(VirtualPortfolio.id)).where(
+            VirtualPortfolio.partial_closed == True  # noqa: E712
+        )
+    )
+    partial_close_count = partial_q.scalar() or 0
+
+    # TP2 hits (continued after partial close)
+    tp2_q = await db.execute(
+        select(func.count(SignalResult.id)).where(SignalResult.exit_reason == "tp2_hit")
+    )
+    tp2_hit_count = tp2_q.scalar() or 0
+
+    # SL/breakeven hits on second half (returned to SL after partial close)
+    sl_after_partial_q = await db.execute(
+        select(func.count(SignalResult.id)).where(
+            SignalResult.exit_reason.in_(["sl_hit", "trailing_sl_hit"]),
+            SignalResult.partial_close_pnl_usd.isnot(None),
+        )
+    )
+    sl_after_partial = sl_after_partial_q.scalar() or 0
+
+    # MAE early exits
+    mae_exit_q = await db.execute(
+        select(func.count(SignalResult.id)).where(SignalResult.exit_reason == "mae_early_exit")
+    )
+    mae_early_exits = mae_exit_q.scalar() or 0
+
+    total_closed_q = await db.execute(
+        select(func.count(SignalResult.id)).where(
+            SignalResult.exit_reason.notin_(["cancelled"])
+        )
+    )
+    total_closed = total_closed_q.scalar() or 0
+
+    return {
+        "total_closed_trades": total_closed,
+        "tp1_hit_count": tp1_hit_count,
+        "partial_close_count": partial_close_count,
+        "pct_tp1_hit": round(tp1_hit_count / total_closed * 100, 2) if total_closed else 0,
+        "pct_partial_close": round(partial_close_count / total_closed * 100, 2) if total_closed else 0,
+        "of_tp1_continued_to_tp2": tp2_hit_count,
+        "of_tp1_returned_to_sl": sl_after_partial,
+        "mae_early_exits": mae_early_exits,
+        "pct_mae_early_exits": round(mae_early_exits / total_closed * 100, 2) if total_closed else 0,
+    }
