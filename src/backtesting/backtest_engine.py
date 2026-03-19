@@ -322,6 +322,73 @@ def _compute_summary(
             by_score[bucket]["wins"] += 1
         by_score[bucket]["pnl_usd"] += float(t.pnl_usd or 0)
 
+    # ── SIM-44: Extended metrics ──────────────────────────────────────────────
+
+    # Direction-specific win rates
+    long_trades = [t for t in trades if t.direction == "LONG"]
+    short_trades = [t for t in trades if t.direction == "SHORT"]
+    long_wins = [t for t in long_trades if t.result == "win"]
+    short_wins = [t for t in short_trades if t.result == "win"]
+    win_rate_long = (len(long_wins) / len(long_trades) * 100) if long_trades else 0.0
+    win_rate_short = (len(short_wins) / len(short_trades) * 100) if short_trades else 0.0
+
+    # Duration by result
+    win_durations = [t.duration_minutes or 0 for t in wins]
+    loss_durations = [t.duration_minutes or 0 for t in losses]
+    avg_win_dur = sum(win_durations) / len(win_durations) if win_durations else 0.0
+    avg_loss_dur = sum(loss_durations) / len(loss_durations) if loss_durations else 0.0
+
+    # By weekday
+    by_weekday: dict[str, dict] = {}
+    for t in trades:
+        if t.entry_at:
+            wd = str(t.entry_at.weekday())  # 0=Mon..4=Fri
+            if wd not in by_weekday:
+                by_weekday[wd] = {"trades": 0, "wins": 0, "pnl_usd": 0.0}
+            by_weekday[wd]["trades"] += 1
+            if t.result == "win":
+                by_weekday[wd]["wins"] += 1
+            by_weekday[wd]["pnl_usd"] += float(t.pnl_usd or 0)
+
+    # By hour UTC
+    by_hour: dict[str, dict] = {}
+    for t in trades:
+        if t.entry_at:
+            hr = str(t.entry_at.hour)
+            if hr not in by_hour:
+                by_hour[hr] = {"trades": 0, "wins": 0}
+            by_hour[hr]["trades"] += 1
+            if t.result == "win":
+                by_hour[hr]["wins"] += 1
+    by_hour_utc = {
+        hr: {
+            "trades": v["trades"],
+            "win_rate_pct": round(v["wins"] / v["trades"] * 100, 1) if v["trades"] > 0 else 0.0,
+        }
+        for hr, v in by_hour.items()
+    }
+
+    # By regime
+    by_regime: dict[str, dict] = {}
+    for t in trades:
+        regime_key = getattr(t, "regime", None) or "UNKNOWN"
+        if regime_key not in by_regime:
+            by_regime[regime_key] = {"trades": 0, "wins": 0, "pnl_usd": 0.0}
+        by_regime[regime_key]["trades"] += 1
+        if t.result == "win":
+            by_regime[regime_key]["wins"] += 1
+        by_regime[regime_key]["pnl_usd"] += float(t.pnl_usd or 0)
+
+    # Exit reason counts
+    sl_hit_count = sum(1 for t in trades if t.exit_reason == "sl_hit")
+    tp_hit_count = sum(1 for t in trades if t.exit_reason == "tp_hit")
+    mae_exit_count = sum(1 for t in trades if t.exit_reason == "mae_exit")
+    time_exit_count = sum(1 for t in trades if t.exit_reason == "time_exit")
+
+    # Average MAE (use raw mae field)
+    mae_values = [float(t.mae or 0) for t in trades if t.mae is not None and t.mae > 0]
+    avg_mae_pct_of_sl = sum(mae_values) / len(mae_values) if mae_values else 0.0
+
     return {
         "total_trades": total,
         "win_rate_pct": round(win_rate, 2),
@@ -335,6 +402,19 @@ def _compute_summary(
         "monthly_returns": sorted(monthly.values(), key=lambda x: x["month"]),
         "by_symbol": by_symbol,
         "by_score_bucket": by_score,
+        # SIM-44: Extended metrics
+        "win_rate_long_pct": round(win_rate_long, 2),
+        "win_rate_short_pct": round(win_rate_short, 2),
+        "avg_win_duration_minutes": round(avg_win_dur, 1),
+        "avg_loss_duration_minutes": round(avg_loss_dur, 1),
+        "by_weekday": by_weekday,
+        "by_hour_utc": by_hour_utc,
+        "by_regime": by_regime,
+        "sl_hit_count": sl_hit_count,
+        "tp_hit_count": tp_hit_count,
+        "mae_exit_count": mae_exit_count,
+        "time_exit_count": time_exit_count,
+        "avg_mae_pct_of_sl": round(avg_mae_pct_of_sl, 4),
     }
 
 

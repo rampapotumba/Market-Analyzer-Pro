@@ -18,6 +18,15 @@ class BacktestParams(BaseModel):
     apply_slippage: bool = True
     apply_swap: bool = True
 
+    # SIM-43: Per-filter toggles for parameterized backtesting
+    apply_ranging_filter: bool = True
+    apply_d1_trend_filter: bool = True
+    apply_volume_filter: bool = True
+    apply_weekday_filter: bool = True
+    apply_momentum_filter: bool = True
+    apply_calendar_filter: bool = True
+    min_composite_score: Optional[float] = None  # None = use global config
+
     @field_validator("symbols")
     @classmethod
     def symbols_not_empty(cls, v: list[str]) -> list[str]:
@@ -59,6 +68,7 @@ class BacktestTradeResult(BaseModel):
     duration_minutes: Optional[int] = None
     mfe: Optional[Decimal] = None
     mae: Optional[Decimal] = None
+    regime: Optional[str] = None            # SIM-44: market regime at entry
 
 
 class BacktestResult(BaseModel):

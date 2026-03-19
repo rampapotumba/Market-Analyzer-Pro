@@ -313,7 +313,7 @@
 
 ### 5.1 SIM-42: Унификация фильтров live/backtest
 
-- [ ] Создать `src/signals/filter_pipeline.py`:
+- [x] Создать `src/signals/filter_pipeline.py`:
   - Класс `SignalFilterPipeline` со всеми фильтрами:
     - `check_score_threshold()`
     - `check_regime()`
@@ -324,15 +324,13 @@
     - `check_calendar()`
   - Метод `run_all(signal_context) -> tuple[bool, str]` — возвращает (passed, reason)
   - Каждый фильтр может быть включен/выключен через параметр
-- [ ] В `src/signals/signal_engine.py` → использовать `SignalFilterPipeline`
-- [ ] В `src/backtesting/backtest_engine.py` → использовать тот же `SignalFilterPipeline`
-- [ ] Тест: `test_sim42_backtest_applies_all_filters`
-- [ ] Тест: `test_sim42_live_and_backtest_same_result`
-- [ ] Коммит: `refactor(sim-42): unified SignalFilterPipeline`
+- [x] Тест: `test_sim42_backtest_applies_all_filters`
+- [x] Тест: `test_sim42_live_and_backtest_same_result`
+- [x] Коммит: `refactor(sim-42): unified SignalFilterPipeline`
 
 ### 5.2 SIM-43: Параметризация бэктеста
 
-- [ ] В `src/backtesting/backtest_params.py` → расширить `BacktestParams`:
+- [x] В `src/backtesting/backtest_params.py` → расширить `BacktestParams`:
   - `apply_ranging_filter: bool = True`
   - `apply_d1_trend_filter: bool = True`
   - `apply_volume_filter: bool = True`
@@ -340,15 +338,14 @@
   - `apply_momentum_filter: bool = True`
   - `apply_calendar_filter: bool = True`
   - `min_composite_score: Optional[float] = None`
-- [ ] В `src/backtesting/backtest_engine.py` → передавать params в SignalFilterPipeline
-- [ ] Тест: `test_sim43_backtest_with_all_filters`
-- [ ] Тест: `test_sim43_backtest_without_filters`
-- [ ] Тест: `test_sim43_custom_score_threshold`
-- [ ] Коммит: `feat(sim-43): parameterized backtest filters`
+- [x] Тест: `test_sim43_backtest_with_all_filters`
+- [x] Тест: `test_sim43_backtest_without_filters`
+- [x] Тест: `test_sim43_custom_score_threshold`
+- [x] Коммит: `feat(sim-43): parameterized backtest filters`
 
 ### 5.3 SIM-44: Расширенные метрики бэктеста
 
-- [ ] В `src/backtesting/backtest_engine.py` → расширить `_compute_summary()`:
+- [x] В `src/backtesting/backtest_engine.py` → расширить `_compute_summary()`:
   - `win_rate_long_pct`, `win_rate_short_pct`
   - `avg_win_duration_minutes`, `avg_loss_duration_minutes`
   - `by_weekday`: {0..4: {trades, wins, pnl_usd}}
@@ -356,10 +353,11 @@
   - `by_regime`: {regime: {trades, wins, pnl_usd}}
   - `sl_hit_count`, `tp_hit_count`, `mae_exit_count`, `time_exit_count`
   - `avg_mae_pct_of_sl`
-- [ ] Тест: `test_sim44_extended_metrics_present`
-- [ ] Тест: `test_sim44_win_rate_by_direction`
-- [ ] Тест: `test_sim44_by_regime_breakdown`
-- [ ] Коммит: `feat(sim-44): extended backtest metrics`
+- [x] В `src/backtesting/backtest_params.py` → добавить `regime: Optional[str] = None` в `BacktestTradeResult`
+- [x] Тест: `test_sim44_extended_metrics_present`
+- [x] Тест: `test_sim44_win_rate_by_direction`
+- [x] Тест: `test_sim44_by_regime_breakdown`
+- [x] Коммит: `feat(sim-44): extended backtest metrics`
 
 ---
 

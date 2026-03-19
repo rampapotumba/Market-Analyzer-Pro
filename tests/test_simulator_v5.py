@@ -1170,3 +1170,559 @@ def test_sim41_fa_engine_accepts_cot_macro_data():
     score = fa.calculate_fa_score()
     # Score should be within range and not crash
     assert -100.0 <= score <= 100.0
+
+
+# ── SIM-42: Unified SignalFilterPipeline ──────────────────────────────────────
+
+
+def test_sim42_pipeline_blocks_on_score_below_threshold():
+    """SignalFilterPipeline blocks when composite_score < threshold."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
+    import datetime
+
+    pipeline = SignalFilterPipeline()
+    ctx = {
+        "composite_score": 5.0,
+        "market_type": "forex",
+        "symbol": "EURUSD=X",
+        "regime": "TREND_BULL",
+        "direction": "LONG",
+        "timeframe": "H1",
+        "df": None,
+        "ta_indicators": {},
+        "candle_ts": datetime.datetime(2024, 3, 6, 12, 0, tzinfo=datetime.timezone.utc),
+        "d1_rows": [],
+        "economic_events": [],
+    }
+    passed, reason = pipeline.run_all(ctx)
+    assert not passed
+    assert "score_below_threshold" in reason
+
+
+def test_sim42_pipeline_blocks_on_regime():
+    """SignalFilterPipeline blocks when regime is RANGING."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
+    import datetime
+
+    pipeline = SignalFilterPipeline()
+    ctx = {
+        "composite_score": 20.0,
+        "market_type": "forex",
+        "symbol": "EURUSD=X",
+        "regime": "RANGING",
+        "direction": "LONG",
+        "timeframe": "H1",
+        "df": None,
+        "ta_indicators": {},
+        "candle_ts": datetime.datetime(2024, 3, 6, 12, 0, tzinfo=datetime.timezone.utc),
+        "d1_rows": [],
+        "economic_events": [],
+    }
+    passed, reason = pipeline.run_all(ctx)
+    assert not passed
+    assert "regime_blocked" in reason
+
+
+def test_sim42_pipeline_passes_valid_context():
+    """SignalFilterPipeline passes when all conditions are met."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
+    import datetime
+
+    pipeline = SignalFilterPipeline()
+    ctx = {
+        "composite_score": 20.0,
+        "market_type": "forex",
+        "symbol": "EURUSD=X",
+        "regime": "TREND_BULL",
+        "direction": "LONG",
+        "timeframe": "H1",
+        "df": None,
+        "ta_indicators": {"rsi_14": 60.0, "macd_line": 0.001, "macd_signal": 0.0005},
+        "candle_ts": datetime.datetime(2024, 3, 6, 12, 0, tzinfo=datetime.timezone.utc),  # Wednesday
+        "d1_rows": [],
+        "economic_events": [],
+    }
+    passed, reason = pipeline.run_all(ctx)
+    assert passed is True
+    assert reason == "all_passed"
+
+
+def test_sim42_live_and_backtest_same_result():
+    """Same context → same result regardless of caller."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
+    import datetime
+
+    pipeline = SignalFilterPipeline()
+    ctx = {
+        "composite_score": 20.0,
+        "market_type": "forex",
+        "symbol": "EURUSD=X",
+        "regime": "TREND_BULL",
+        "direction": "LONG",
+        "timeframe": "H1",
+        "df": None,
+        "ta_indicators": {"rsi_14": 60.0, "macd_line": 0.001, "macd_signal": 0.0005},
+        "candle_ts": datetime.datetime(2024, 3, 6, 12, 0, tzinfo=datetime.timezone.utc),
+        "d1_rows": [],
+        "economic_events": [],
+    }
+    result1 = pipeline.run_all(ctx)
+    result2 = pipeline.run_all(ctx)
+    assert result1 == result2
+    assert result1[0] is True
+
+
+def test_sim42_pipeline_disabled_filters_pass():
+    """Disabling score filter allows low-score signal through."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
+    import datetime
+
+    pipeline = SignalFilterPipeline(apply_score_filter=False)
+    ctx = {
+        "composite_score": 1.0,   # would be blocked by score filter
+        "market_type": "forex",
+        "symbol": "EURUSD=X",
+        "regime": "TREND_BULL",
+        "direction": "LONG",
+        "timeframe": "H1",
+        "df": None,
+        "ta_indicators": {},
+        "candle_ts": datetime.datetime(2024, 3, 6, 12, 0, tzinfo=datetime.timezone.utc),
+        "d1_rows": [],
+        "economic_events": [],
+    }
+    passed, reason = pipeline.run_all(ctx)
+    assert passed is True
+
+
+def test_sim42_pipeline_momentum_blocks():
+    """Pipeline blocks when momentum is misaligned for LONG."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
+    import datetime
+
+    pipeline = SignalFilterPipeline()
+    ctx = {
+        "composite_score": 20.0,
+        "market_type": "forex",
+        "symbol": "EURUSD=X",
+        "regime": "TREND_BULL",
+        "direction": "LONG",
+        "timeframe": "H1",
+        "df": None,
+        "ta_indicators": {"rsi_14": 40.0, "macd_line": -0.001, "macd_signal": 0.0005},  # RSI<50 AND MACD<Signal
+        "candle_ts": datetime.datetime(2024, 3, 6, 12, 0, tzinfo=datetime.timezone.utc),
+        "d1_rows": [],
+        "economic_events": [],
+    }
+    passed, reason = pipeline.run_all(ctx)
+    assert not passed
+    assert "momentum_misaligned" in reason
+
+
+def test_sim42_pipeline_weekday_blocks_friday():
+    """Pipeline blocks on Friday evening."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
+    import datetime
+
+    pipeline = SignalFilterPipeline(
+        apply_score_filter=False,
+        apply_regime_filter=False,
+        apply_momentum_filter=False,
+    )
+    ctx = {
+        "composite_score": 20.0,
+        "market_type": "forex",
+        "symbol": "EURUSD=X",
+        "regime": "TREND_BULL",
+        "direction": "LONG",
+        "timeframe": "H1",
+        "df": None,
+        "ta_indicators": {},
+        "candle_ts": datetime.datetime(2024, 1, 5, 20, 0, tzinfo=datetime.timezone.utc),  # Friday 20:00
+        "d1_rows": [],
+        "economic_events": [],
+    }
+    passed, reason = pipeline.run_all(ctx)
+    assert not passed
+    assert "friday_close_filter" in reason
+
+
+def test_sim42_check_score_threshold_uses_instrument_override():
+    """check_score_threshold uses INSTRUMENT_OVERRIDES for GBPUSD."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
+
+    pipeline = SignalFilterPipeline()
+    # GBPUSD=X override is min_composite_score=20; score=16 < 20 → blocked
+    passed, reason = pipeline.check_score_threshold(16.0, "forex", "GBPUSD=X")
+    assert not passed
+    assert "score_below_threshold" in reason
+
+
+def test_sim42_check_score_threshold_custom_min_score():
+    """min_composite_score constructor arg overrides config."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
+
+    pipeline = SignalFilterPipeline(min_composite_score=25.0)
+    passed, reason = pipeline.check_score_threshold(20.0, "forex", "EURUSD=X")
+    assert not passed
+    assert "score_below_threshold" in reason
+
+
+def test_sim42_calendar_block():
+    """Pipeline blocks when economic event is within ±2h."""
+    from src.signals.filter_pipeline import SignalFilterPipeline
+    import datetime
+    from unittest.mock import MagicMock
+
+    pipeline = SignalFilterPipeline(
+        apply_score_filter=False,
+        apply_regime_filter=False,
+        apply_momentum_filter=False,
+        apply_weekday_filter=False,
+    )
+    candle_ts = datetime.datetime(2024, 3, 8, 13, 30, tzinfo=datetime.timezone.utc)
+    event = MagicMock()
+    event.event_date = candle_ts
+
+    ctx = {
+        "composite_score": 20.0,
+        "market_type": "forex",
+        "symbol": "EURUSD=X",
+        "regime": "TREND_BULL",
+        "direction": "LONG",
+        "timeframe": "H1",
+        "df": None,
+        "ta_indicators": {},
+        "candle_ts": candle_ts,
+        "d1_rows": [],
+        "economic_events": [event],
+    }
+    passed, reason = pipeline.run_all(ctx)
+    assert not passed
+    assert reason == "economic_calendar_block"
+
+
+# ── SIM-43: Parameterized backtest ────────────────────────────────────────────
+
+
+def test_sim43_backtest_params_accepts_filter_flags():
+    """BacktestParams accepts all SIM-43 filter flags."""
+    from src.backtesting.backtest_params import BacktestParams
+
+    params = BacktestParams(
+        symbols=["EURUSD=X"],
+        timeframe="H1",
+        start_date="2024-01-01",
+        end_date="2024-06-01",
+        apply_ranging_filter=True,
+        apply_d1_trend_filter=True,
+        apply_volume_filter=True,
+        apply_weekday_filter=True,
+        apply_momentum_filter=True,
+        apply_calendar_filter=True,
+        min_composite_score=15.0,
+    )
+    assert params.apply_ranging_filter is True
+    assert params.apply_d1_trend_filter is True
+    assert params.apply_volume_filter is True
+    assert params.apply_weekday_filter is True
+    assert params.apply_momentum_filter is True
+    assert params.apply_calendar_filter is True
+    assert params.min_composite_score == 15.0
+
+
+def test_sim43_backtest_params_defaults():
+    """BacktestParams filter flags default to True, min_composite_score to None."""
+    from src.backtesting.backtest_params import BacktestParams
+
+    params = BacktestParams(
+        symbols=["EURUSD=X"],
+        start_date="2024-01-01",
+        end_date="2024-06-01",
+    )
+    assert params.apply_ranging_filter is True
+    assert params.apply_d1_trend_filter is True
+    assert params.apply_volume_filter is True
+    assert params.apply_weekday_filter is True
+    assert params.apply_momentum_filter is True
+    assert params.apply_calendar_filter is True
+    assert params.min_composite_score is None
+
+
+def test_sim43_backtest_params_all_filters_disabled():
+    """BacktestParams can disable all filters."""
+    from src.backtesting.backtest_params import BacktestParams
+
+    params = BacktestParams(
+        symbols=["EURUSD=X"],
+        timeframe="H1",
+        start_date="2024-01-01",
+        end_date="2024-06-01",
+        apply_ranging_filter=False,
+        apply_d1_trend_filter=False,
+        apply_volume_filter=False,
+        apply_weekday_filter=False,
+        apply_momentum_filter=False,
+        apply_calendar_filter=False,
+    )
+    assert params.apply_ranging_filter is False
+    assert params.apply_d1_trend_filter is False
+    assert params.apply_volume_filter is False
+    assert params.apply_weekday_filter is False
+    assert params.apply_momentum_filter is False
+    assert params.apply_calendar_filter is False
+
+
+def test_sim43_custom_score_threshold():
+    """BacktestParams accepts custom min_composite_score."""
+    from src.backtesting.backtest_params import BacktestParams
+
+    params = BacktestParams(
+        symbols=["EURUSD=X"],
+        start_date="2024-01-01",
+        end_date="2024-06-01",
+        min_composite_score=25.0,
+    )
+    assert params.min_composite_score == 25.0
+
+
+# ── SIM-44: Extended backtest metrics ─────────────────────────────────────────
+
+
+def test_sim44_extended_metrics_present():
+    """_compute_summary includes all SIM-44 fields."""
+    from src.backtesting.backtest_engine import _compute_summary
+    from src.backtesting.backtest_params import BacktestTradeResult
+    from decimal import Decimal
+    import datetime
+
+    trades = [
+        BacktestTradeResult(
+            symbol="EURUSD=X", timeframe="H1", direction="LONG",
+            entry_price=Decimal("1.1000"), exit_price=Decimal("1.1050"),
+            exit_reason="tp_hit", pnl_usd=Decimal("5.0"), result="win",
+            entry_at=datetime.datetime(2024, 3, 6, 10, 0, tzinfo=datetime.timezone.utc),
+            exit_at=datetime.datetime(2024, 3, 6, 12, 0, tzinfo=datetime.timezone.utc),
+            duration_minutes=120, mfe=Decimal("0.005"), mae=Decimal("0.001"),
+        ),
+        BacktestTradeResult(
+            symbol="EURUSD=X", timeframe="H1", direction="SHORT",
+            entry_price=Decimal("1.1000"), exit_price=Decimal("1.1020"),
+            exit_reason="sl_hit", pnl_usd=Decimal("-2.0"), result="loss",
+            entry_at=datetime.datetime(2024, 3, 7, 14, 0, tzinfo=datetime.timezone.utc),
+            exit_at=datetime.datetime(2024, 3, 7, 16, 0, tzinfo=datetime.timezone.utc),
+            duration_minutes=120, mfe=Decimal("0.001"), mae=Decimal("0.002"),
+        ),
+    ]
+
+    summary = _compute_summary(trades, Decimal("1000"))
+
+    assert "win_rate_long_pct" in summary
+    assert "win_rate_short_pct" in summary
+    assert "avg_win_duration_minutes" in summary
+    assert "avg_loss_duration_minutes" in summary
+    assert "by_weekday" in summary
+    assert "by_hour_utc" in summary
+    assert "by_regime" in summary
+    assert "sl_hit_count" in summary
+    assert "tp_hit_count" in summary
+    assert "mae_exit_count" in summary
+    assert "time_exit_count" in summary
+    assert "avg_mae_pct_of_sl" in summary
+
+
+def test_sim44_win_rate_by_direction():
+    """win_rate_long_pct and win_rate_short_pct computed correctly."""
+    from src.backtesting.backtest_engine import _compute_summary
+    from src.backtesting.backtest_params import BacktestTradeResult
+    from decimal import Decimal
+    import datetime
+
+    base_dt = datetime.datetime(2024, 3, 6, 10, 0, tzinfo=datetime.timezone.utc)
+    trades = [
+        BacktestTradeResult(
+            symbol="EURUSD=X", timeframe="H1", direction="LONG",
+            entry_price=Decimal("1.1"), exit_price=Decimal("1.11"),
+            exit_reason="tp_hit", pnl_usd=Decimal("10.0"), result="win",
+            entry_at=base_dt, exit_at=base_dt, duration_minutes=60,
+        ),
+        BacktestTradeResult(
+            symbol="EURUSD=X", timeframe="H1", direction="LONG",
+            entry_price=Decimal("1.1"), exit_price=Decimal("1.09"),
+            exit_reason="sl_hit", pnl_usd=Decimal("-5.0"), result="loss",
+            entry_at=base_dt, exit_at=base_dt, duration_minutes=60,
+        ),
+        BacktestTradeResult(
+            symbol="EURUSD=X", timeframe="H1", direction="SHORT",
+            entry_price=Decimal("1.1"), exit_price=Decimal("1.09"),
+            exit_reason="tp_hit", pnl_usd=Decimal("10.0"), result="win",
+            entry_at=base_dt, exit_at=base_dt, duration_minutes=60,
+        ),
+    ]
+
+    summary = _compute_summary(trades, Decimal("1000"))
+    assert summary["win_rate_long_pct"] == 50.0   # 1 win / 2 long trades
+    assert summary["win_rate_short_pct"] == 100.0  # 1 win / 1 short trade
+
+
+def test_sim44_exit_reason_counts():
+    """sl_hit_count, tp_hit_count, mae_exit_count, time_exit_count are correct."""
+    from src.backtesting.backtest_engine import _compute_summary
+    from src.backtesting.backtest_params import BacktestTradeResult
+    from decimal import Decimal
+    import datetime
+
+    base_dt = datetime.datetime(2024, 3, 6, 10, 0, tzinfo=datetime.timezone.utc)
+
+    def make_trade(exit_reason: str, result: str, pnl: str) -> BacktestTradeResult:
+        return BacktestTradeResult(
+            symbol="EURUSD=X", timeframe="H1", direction="LONG",
+            entry_price=Decimal("1.1"), exit_price=Decimal("1.11"),
+            exit_reason=exit_reason, pnl_usd=Decimal(pnl), result=result,
+            entry_at=base_dt, exit_at=base_dt, duration_minutes=60,
+        )
+
+    trades = [
+        make_trade("sl_hit", "loss", "-5.0"),
+        make_trade("sl_hit", "loss", "-5.0"),
+        make_trade("tp_hit", "win", "10.0"),
+        make_trade("mae_exit", "loss", "-3.0"),
+        make_trade("time_exit", "loss", "-1.0"),
+    ]
+
+    summary = _compute_summary(trades, Decimal("1000"))
+    assert summary["sl_hit_count"] == 2
+    assert summary["tp_hit_count"] == 1
+    assert summary["mae_exit_count"] == 1
+    assert summary["time_exit_count"] == 1
+
+
+def test_sim44_by_weekday_breakdown():
+    """by_weekday groups trades by weekday correctly."""
+    from src.backtesting.backtest_engine import _compute_summary
+    from src.backtesting.backtest_params import BacktestTradeResult
+    from decimal import Decimal
+    import datetime
+
+    # Wednesday = weekday 2, Thursday = weekday 3
+    wed = datetime.datetime(2024, 3, 6, 10, 0, tzinfo=datetime.timezone.utc)
+    thu = datetime.datetime(2024, 3, 7, 10, 0, tzinfo=datetime.timezone.utc)
+
+    trades = [
+        BacktestTradeResult(
+            symbol="EURUSD=X", timeframe="H1", direction="LONG",
+            entry_price=Decimal("1.1"), exit_price=Decimal("1.11"),
+            exit_reason="tp_hit", pnl_usd=Decimal("10.0"), result="win",
+            entry_at=wed, exit_at=wed, duration_minutes=60,
+        ),
+        BacktestTradeResult(
+            symbol="EURUSD=X", timeframe="H1", direction="SHORT",
+            entry_price=Decimal("1.1"), exit_price=Decimal("1.09"),
+            exit_reason="sl_hit", pnl_usd=Decimal("-5.0"), result="loss",
+            entry_at=thu, exit_at=thu, duration_minutes=60,
+        ),
+    ]
+
+    summary = _compute_summary(trades, Decimal("1000"))
+    assert "by_weekday" in summary
+    wd = summary["by_weekday"]
+    assert "2" in wd  # Wednesday
+    assert "3" in wd  # Thursday
+    assert wd["2"]["trades"] == 1
+    assert wd["2"]["wins"] == 1
+    assert wd["3"]["trades"] == 1
+    assert wd["3"]["wins"] == 0
+
+
+def test_sim44_by_regime_breakdown():
+    """by_regime groups trades by regime correctly."""
+    from src.backtesting.backtest_engine import _compute_summary
+    from src.backtesting.backtest_params import BacktestTradeResult
+    from decimal import Decimal
+    import datetime
+
+    base_dt = datetime.datetime(2024, 3, 6, 10, 0, tzinfo=datetime.timezone.utc)
+    trades = [
+        BacktestTradeResult(
+            symbol="EURUSD=X", timeframe="H1", direction="LONG",
+            entry_price=Decimal("1.1"), exit_price=Decimal("1.11"),
+            exit_reason="tp_hit", pnl_usd=Decimal("10.0"), result="win",
+            entry_at=base_dt, exit_at=base_dt, duration_minutes=60,
+            regime="TREND_BULL",
+        ),
+        BacktestTradeResult(
+            symbol="EURUSD=X", timeframe="H1", direction="SHORT",
+            entry_price=Decimal("1.1"), exit_price=Decimal("1.09"),
+            exit_reason="sl_hit", pnl_usd=Decimal("-5.0"), result="loss",
+            entry_at=base_dt, exit_at=base_dt, duration_minutes=60,
+            regime="VOLATILE",
+        ),
+    ]
+
+    summary = _compute_summary(trades, Decimal("1000"))
+    assert "by_regime" in summary
+    assert "TREND_BULL" in summary["by_regime"]
+    assert "VOLATILE" in summary["by_regime"]
+    assert summary["by_regime"]["TREND_BULL"]["trades"] == 1
+    assert summary["by_regime"]["TREND_BULL"]["wins"] == 1
+    assert summary["by_regime"]["VOLATILE"]["trades"] == 1
+    assert summary["by_regime"]["VOLATILE"]["wins"] == 0
+
+
+def test_sim44_backtest_trade_result_has_regime_field():
+    """BacktestTradeResult accepts regime field."""
+    from src.backtesting.backtest_params import BacktestTradeResult
+    from decimal import Decimal
+    import datetime
+
+    trade = BacktestTradeResult(
+        symbol="EURUSD=X", timeframe="H1", direction="LONG",
+        entry_price=Decimal("1.1"), exit_price=Decimal("1.11"),
+        exit_reason="tp_hit", pnl_usd=Decimal("10.0"), result="win",
+        entry_at=datetime.datetime(2024, 3, 6, 10, 0, tzinfo=datetime.timezone.utc),
+        exit_at=datetime.datetime(2024, 3, 6, 12, 0, tzinfo=datetime.timezone.utc),
+        duration_minutes=120,
+        regime="STRONG_TREND_BULL",
+    )
+    assert trade.regime == "STRONG_TREND_BULL"
+
+
+def test_sim44_backtest_trade_result_regime_defaults_none():
+    """BacktestTradeResult.regime defaults to None (backward compatible)."""
+    from src.backtesting.backtest_params import BacktestTradeResult
+    from decimal import Decimal
+
+    trade = BacktestTradeResult(
+        symbol="EURUSD=X", timeframe="H1", direction="LONG",
+        entry_price=Decimal("1.1"), exit_price=Decimal("1.11"),
+        exit_reason="tp_hit", pnl_usd=Decimal("10.0"), result="win",
+    )
+    assert trade.regime is None
+
+
+def test_sim44_avg_duration_by_result():
+    """avg_win_duration_minutes and avg_loss_duration_minutes are computed."""
+    from src.backtesting.backtest_engine import _compute_summary
+    from src.backtesting.backtest_params import BacktestTradeResult
+    from decimal import Decimal
+    import datetime
+
+    base_dt = datetime.datetime(2024, 3, 6, 10, 0, tzinfo=datetime.timezone.utc)
+    trades = [
+        BacktestTradeResult(
+            symbol="EURUSD=X", timeframe="H1", direction="LONG",
+            entry_price=Decimal("1.1"), exit_price=Decimal("1.11"),
+            exit_reason="tp_hit", pnl_usd=Decimal("10.0"), result="win",
+            entry_at=base_dt, exit_at=base_dt, duration_minutes=120,
+        ),
+        BacktestTradeResult(
+            symbol="EURUSD=X", timeframe="H1", direction="SHORT",
+            entry_price=Decimal("1.1"), exit_price=Decimal("1.09"),
+            exit_reason="sl_hit", pnl_usd=Decimal("-5.0"), result="loss",
+            entry_at=base_dt, exit_at=base_dt, duration_minutes=60,
+        ),
+    ]
+
+    summary = _compute_summary(trades, Decimal("1000"))
+    assert summary["avg_win_duration_minutes"] == 120.0
+    assert summary["avg_loss_duration_minutes"] == 60.0
