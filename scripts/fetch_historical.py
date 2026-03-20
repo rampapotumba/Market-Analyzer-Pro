@@ -20,6 +20,7 @@ import sys
 import time
 from decimal import Decimal
 from pathlib import Path
+from typing import Optional
 
 # Allow running from project root
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -186,7 +187,7 @@ async def fetch_and_store(
 
 async def main(
     timeframes: list[str],
-    symbols_filter: list[str] | None,
+    symbols_filter: Optional[list[str]],
     start: datetime.date,
     end: datetime.date,
 ) -> None:

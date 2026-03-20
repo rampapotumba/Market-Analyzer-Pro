@@ -6,6 +6,14 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, field_validator
 
+# Maps external timeframe aliases to internal canonical format
+_TF_ALIAS_MAP: dict[str, str] = {
+    "1m": "M1", "5m": "M5", "15m": "M15", "30m": "M30",
+    "1h": "H1", "4h": "H4", "1d": "D1", "1w": "W1",
+    "m1": "M1", "m5": "M5", "m15": "M15", "m30": "M30",
+    "h1": "H1", "h4": "H4", "d1": "D1", "w1": "W1",
+}
+
 
 class BacktestParams(BaseModel):
     """Input parameters for a backtest run."""
@@ -32,6 +40,12 @@ class BacktestParams(BaseModel):
     enable_walk_forward: bool = False
     in_sample_months: int = 18
     out_of_sample_months: int = 6
+
+    @field_validator("timeframe")
+    @classmethod
+    def normalize_timeframe(cls, v: str) -> str:
+        """Normalize external timeframe aliases (e.g. '1h') to internal format ('H1')."""
+        return _TF_ALIAS_MAP.get(v, v)
 
     @field_validator("symbols")
     @classmethod

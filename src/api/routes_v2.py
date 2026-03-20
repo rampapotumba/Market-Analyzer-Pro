@@ -571,8 +571,8 @@ async def run_backtest_v4(
             await update_backtest_run(bg_session, run_id, "running")
             await bg_session.commit()
             try:
-                trades = await engine._simulate(params, run_id=run_id)
-                summary = _compute_summary(trades, params.account_size)
+                trades, filter_stats = await engine._simulate(params, run_id=run_id)
+                summary = _compute_summary(trades, params.account_size, filter_stats=filter_stats)
                 trade_dicts = [
                     {
                         "symbol": t.symbol, "timeframe": t.timeframe,
@@ -588,6 +588,7 @@ async def run_backtest_v4(
                         "duration_minutes": t.duration_minutes,
                         "mfe": str(t.mfe) if t.mfe else None,
                         "mae": str(t.mae) if t.mae else None,
+                        "regime": t.regime,
                     }
                     for t in trades
                 ]

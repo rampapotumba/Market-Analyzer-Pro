@@ -16,6 +16,10 @@ INITIAL_INSTRUMENTS = [
     {"symbol": "USDJPY=X", "market": "forex", "name": "USD/JPY", "pip_size": Decimal("0.01")},
     {"symbol": "AUDUSD=X", "market": "forex", "name": "AUD/USD", "pip_size": Decimal("0.0001")},
     {"symbol": "USDCHF=X", "market": "forex", "name": "USD/CHF", "pip_size": Decimal("0.0001")},
+    {"symbol": "NZDUSD=X", "market": "forex", "name": "NZD/USD", "pip_size": Decimal("0.0001")},
+    {"symbol": "USDCAD=X", "market": "forex", "name": "USD/CAD", "pip_size": Decimal("0.0001")},
+    # Commodities
+    {"symbol": "GC=F", "market": "stocks", "name": "Gold Futures", "pip_size": Decimal("0.1")},
     # Stocks
     {"symbol": "AAPL", "market": "stocks", "name": "Apple Inc.", "pip_size": Decimal("0.01")},
     {"symbol": "MSFT", "market": "stocks", "name": "Microsoft Corp.", "pip_size": Decimal("0.01")},
