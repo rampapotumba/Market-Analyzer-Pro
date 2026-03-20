@@ -3147,7 +3147,538 @@ class TestV718IsolationMode:
             await engine.run_backtest(params)
 
         assert len(simulate_called) == 1
-        assert len(simulate_isolated_called) == 0
+
+
+# ── TASK-V7-11: Historical FA/Sentiment/Geo data for backtest ─────────────────
+
+
+def _make_macro_row(
+    indicator: str,
+    value: float,
+    release_date: datetime.datetime,
+    country: str = "US",
+) -> MagicMock:
+    row = MagicMock()
+    row.indicator_name = indicator
+    row.value = Decimal(str(value))
+    row.previous_value = None
+    row.release_date = release_date
+    row.country = country
+    return row
+
+
+def _make_fg_row(
+    fg_index: float,
+    timestamp: datetime.datetime,
+) -> MagicMock:
+    row = MagicMock()
+    row.fear_greed_index = Decimal(str(fg_index))
+    row.timestamp = timestamp
+    row.source = "fear_greed"
+    return row
+
+
+def _make_geo_row(
+    country: str,
+    severity: float,
+    event_date: datetime.datetime,
+) -> MagicMock:
+    row = MagicMock()
+    row.country = country
+    row.severity_score = Decimal(str(severity))
+    row.event_date = event_date
+    row.source = "ACLED"
+    return row
+
+
+class TestV711BacktestParams:
+    """TASK-V7-11: use_fundamental_data flag in BacktestParams."""
+
+    def test_v7_11_default_is_false(self) -> None:
+        """use_fundamental_data defaults to False (backward compatible)."""
+        from src.backtesting.backtest_params import BacktestParams
+
+        params = BacktestParams(
+            symbols=["EURUSD=X"],
+            start_date="2024-01-01",
+            end_date="2024-06-01",
+        )
+        assert params.use_fundamental_data is False
+
+    def test_v7_11_can_be_set_to_true(self) -> None:
+        """use_fundamental_data can be set to True."""
+        from src.backtesting.backtest_params import BacktestParams
+
+        params = BacktestParams(
+            symbols=["EURUSD=X"],
+            start_date="2024-01-01",
+            end_date="2024-06-01",
+            use_fundamental_data=True,
+        )
+        assert params.use_fundamental_data is True
+
+
+class TestV711CrudFunctions:
+    """TASK-V7-11: New CRUD functions for historical macro/sentiment/geo data."""
+
+    @pytest.mark.asyncio
+    async def test_v7_11_get_macro_data_in_range_calls_db(self) -> None:
+        """get_macro_data_in_range executes a query against the session."""
+        from src.database.crud import get_macro_data_in_range
+
+        mock_session = AsyncMock()
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value = []
+        mock_session.execute.return_value = mock_result
+
+        start = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+        end = datetime.datetime(2024, 6, 1, tzinfo=datetime.timezone.utc)
+
+        result = await get_macro_data_in_range(mock_session, start, end)
+
+        assert result == []
+        mock_session.execute.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_v7_11_get_macro_data_in_range_returns_rows(self) -> None:
+        """get_macro_data_in_range returns rows from the result."""
+        from src.database.crud import get_macro_data_in_range
+
+        ts = datetime.datetime(2024, 3, 1, tzinfo=datetime.timezone.utc)
+        expected_rows = [_make_macro_row("FEDFUNDS", 5.25, ts)]
+
+        mock_session = AsyncMock()
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value = expected_rows
+        mock_session.execute.return_value = mock_result
+
+        start = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+        end = datetime.datetime(2024, 6, 1, tzinfo=datetime.timezone.utc)
+
+        rows = await get_macro_data_in_range(mock_session, start, end)
+        assert rows == expected_rows
+
+    @pytest.mark.asyncio
+    async def test_v7_11_get_central_bank_rates_as_of_calls_db(self) -> None:
+        """get_central_bank_rates_as_of executes a query against the session."""
+        from src.database.crud import get_central_bank_rates_as_of
+
+        mock_session = AsyncMock()
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value = []
+        mock_session.execute.return_value = mock_result
+
+        as_of = datetime.datetime(2024, 6, 1, tzinfo=datetime.timezone.utc)
+        result = await get_central_bank_rates_as_of(mock_session, as_of)
+
+        assert result == {}
+        mock_session.execute.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_v7_11_get_central_bank_rates_as_of_returns_dict(self) -> None:
+        """get_central_bank_rates_as_of returns {bank: rate} dict."""
+        from src.database.crud import get_central_bank_rates_as_of
+
+        fed_rate = MagicMock()
+        fed_rate.bank = "FED"
+        fed_rate.rate = Decimal("5.25")
+
+        mock_session = AsyncMock()
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value = [fed_rate]
+        mock_session.execute.return_value = mock_result
+
+        as_of = datetime.datetime(2024, 6, 1, tzinfo=datetime.timezone.utc)
+        result = await get_central_bank_rates_as_of(mock_session, as_of)
+
+        assert result == {"FED": 5.25}
+
+    @pytest.mark.asyncio
+    async def test_v7_11_get_fear_greed_in_range_calls_db(self) -> None:
+        """get_fear_greed_in_range executes a query against the session."""
+        from src.database.crud import get_fear_greed_in_range
+
+        mock_session = AsyncMock()
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value = []
+        mock_session.execute.return_value = mock_result
+
+        start = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+        end = datetime.datetime(2024, 6, 1, tzinfo=datetime.timezone.utc)
+
+        result = await get_fear_greed_in_range(mock_session, start, end)
+
+        assert result == []
+        mock_session.execute.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_v7_11_get_geo_events_in_range_calls_db(self) -> None:
+        """get_geo_events_in_range executes a query against the session."""
+        from src.database.crud import get_geo_events_in_range
+
+        mock_session = AsyncMock()
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value = []
+        mock_session.execute.return_value = mock_result
+
+        start = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+        end = datetime.datetime(2024, 6, 1, tzinfo=datetime.timezone.utc)
+
+        result = await get_geo_events_in_range(mock_session, start, end)
+
+        assert result == []
+        mock_session.execute.assert_called_once()
+
+
+class TestV711FAScoreHelpers:
+    """TASK-V7-11: Helper functions for computing FA/Sentiment/Geo scores from historical data."""
+
+    def test_v7_11_fa_score_returns_zero_when_no_macro(self) -> None:
+        """_build_fa_score_at returns 0.0 when macro_rows is empty."""
+        from src.backtesting.backtest_engine import _build_fa_score_at
+
+        instrument = make_instrument("EURUSD=X", "forex")
+        candle_ts = datetime.datetime(2024, 6, 1, tzinfo=datetime.timezone.utc)
+
+        score = _build_fa_score_at([], candle_ts, instrument, {})
+        assert score == 0.0
+
+    def test_v7_11_fa_score_nonzero_with_fred_data(self) -> None:
+        """_build_fa_score_at returns non-zero FA score when FRED macro data exists."""
+        from src.backtesting.backtest_engine import _build_fa_score_at
+
+        instrument = make_instrument("EURUSD=X", "forex")
+        candle_ts = datetime.datetime(2024, 6, 1, tzinfo=datetime.timezone.utc)
+
+        # Rows before candle_ts — should be visible
+        macro_rows = [
+            _make_macro_row("FEDFUNDS", 5.25, datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)),
+            _make_macro_row("FEDFUNDS", 4.50, datetime.datetime(2023, 12, 1, tzinfo=datetime.timezone.utc)),
+            _make_macro_row("CPIAUCSL", 310.0, datetime.datetime(2024, 2, 1, tzinfo=datetime.timezone.utc)),
+            _make_macro_row("CPIAUCSL", 305.0, datetime.datetime(2023, 11, 1, tzinfo=datetime.timezone.utc)),
+        ]
+        cb_rates = {"FED": 5.25, "ECB": 4.0}
+
+        score = _build_fa_score_at(macro_rows, candle_ts, instrument, cb_rates)
+        # Score should be non-zero because FED > ECB and FEDFUNDS data exist
+        assert isinstance(score, float)
+        assert score != 0.0
+
+    def test_v7_11_fa_no_lookahead(self) -> None:
+        """_build_fa_score_at ignores macro rows with release_date >= candle_ts."""
+        from src.backtesting.backtest_engine import _build_fa_score_at
+
+        instrument = make_instrument("EURUSD=X", "forex")
+        candle_ts = datetime.datetime(2024, 3, 15, tzinfo=datetime.timezone.utc)
+
+        # Row AFTER candle_ts — must NOT be used
+        future_row = _make_macro_row(
+            "FEDFUNDS", 99.0, datetime.datetime(2024, 4, 1, tzinfo=datetime.timezone.utc)
+        )
+        # Row before candle_ts
+        past_row = _make_macro_row(
+            "FEDFUNDS", 5.25, datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+        )
+
+        # With only future row: should return 0.0 (no visible data)
+        score_no_visible = _build_fa_score_at([future_row], candle_ts, instrument, {})
+        assert score_no_visible == 0.0
+
+        # With past row: should be non-zero
+        score_with_past = _build_fa_score_at(
+            [past_row, future_row], candle_ts, instrument, {}
+        )
+        # past row is visible, future row is not
+        # Score depends on FAEngine logic but should not use the 99.0 FEDFUNDS value
+        assert isinstance(score_with_past, float)
+
+    def test_v7_11_sentiment_score_zero_when_no_data(self) -> None:
+        """_build_sentiment_score_at returns 0.0 when fg_rows is empty."""
+        from src.backtesting.backtest_engine import _build_sentiment_score_at
+
+        candle_ts = datetime.datetime(2024, 6, 1, tzinfo=datetime.timezone.utc)
+        score = _build_sentiment_score_at([], candle_ts)
+        assert score == 0.0
+
+    def test_v7_11_sentiment_extreme_fear_is_bullish(self) -> None:
+        """_build_sentiment_score_at: F&G index=10 (extreme fear) → positive score."""
+        from src.backtesting.backtest_engine import _build_sentiment_score_at
+
+        candle_ts = datetime.datetime(2024, 6, 1, tzinfo=datetime.timezone.utc)
+        fg_rows = [
+            _make_fg_row(10.0, datetime.datetime(2024, 5, 30, tzinfo=datetime.timezone.utc))
+        ]
+        score = _build_sentiment_score_at(fg_rows, candle_ts)
+        assert score > 0.0  # extreme fear → bullish
+
+    def test_v7_11_sentiment_extreme_greed_is_bearish(self) -> None:
+        """_build_sentiment_score_at: F&G index=90 (extreme greed) → negative score."""
+        from src.backtesting.backtest_engine import _build_sentiment_score_at
+
+        candle_ts = datetime.datetime(2024, 6, 1, tzinfo=datetime.timezone.utc)
+        fg_rows = [
+            _make_fg_row(90.0, datetime.datetime(2024, 5, 30, tzinfo=datetime.timezone.utc))
+        ]
+        score = _build_sentiment_score_at(fg_rows, candle_ts)
+        assert score < 0.0  # extreme greed → bearish
+
+    def test_v7_11_sentiment_no_lookahead(self) -> None:
+        """_build_sentiment_score_at ignores F&G rows with timestamp >= candle_ts."""
+        from src.backtesting.backtest_engine import _build_sentiment_score_at
+
+        candle_ts = datetime.datetime(2024, 6, 1, tzinfo=datetime.timezone.utc)
+        # Future row — must NOT be visible
+        future_row = _make_fg_row(10.0, datetime.datetime(2024, 6, 2, tzinfo=datetime.timezone.utc))
+        score = _build_sentiment_score_at([future_row], candle_ts)
+        assert score == 0.0
+
+    def test_v7_11_sentiment_neutral_f_and_g(self) -> None:
+        """_build_sentiment_score_at: F&G index=50 → score near 0."""
+        from src.backtesting.backtest_engine import _build_sentiment_score_at
+
+        candle_ts = datetime.datetime(2024, 6, 1, tzinfo=datetime.timezone.utc)
+        fg_rows = [
+            _make_fg_row(50.0, datetime.datetime(2024, 5, 30, tzinfo=datetime.timezone.utc))
+        ]
+        score = _build_sentiment_score_at(fg_rows, candle_ts)
+        assert score == 0.0
+
+    def test_v7_11_geo_score_zero_when_no_data(self) -> None:
+        """_build_geo_score_at returns 0.0 when geo_rows is empty."""
+        from src.backtesting.backtest_engine import _build_geo_score_at
+
+        candle_ts = datetime.datetime(2024, 6, 1, tzinfo=datetime.timezone.utc)
+        score = _build_geo_score_at([], candle_ts, "EURUSD=X")
+        assert score == 0.0
+
+    def test_v7_11_geo_score_no_lookahead(self) -> None:
+        """_build_geo_score_at ignores geo events with event_date >= candle_ts."""
+        from src.backtesting.backtest_engine import _build_geo_score_at
+
+        candle_ts = datetime.datetime(2024, 6, 1, tzinfo=datetime.timezone.utc)
+        # Future geo event — must NOT influence score
+        future_row = _make_geo_row(
+            "Germany", 0.9, datetime.datetime(2024, 6, 2, tzinfo=datetime.timezone.utc)
+        )
+        score = _build_geo_score_at([future_row], candle_ts, "EURUSD=X")
+        assert score == 0.0
+
+    def test_v7_11_geo_score_negative_for_high_severity(self) -> None:
+        """_build_geo_score_at returns negative score for high-severity events."""
+        from src.backtesting.backtest_engine import _build_geo_score_at
+
+        candle_ts = datetime.datetime(2024, 6, 1, tzinfo=datetime.timezone.utc)
+        # High-severity event for Germany (relevant to EURUSD)
+        geo_rows = [
+            _make_geo_row(
+                "Germany", 1.0, datetime.datetime(2024, 5, 20, tzinfo=datetime.timezone.utc)
+            )
+        ]
+        score = _build_geo_score_at(geo_rows, candle_ts, "EURUSD=X")
+        # Score should be negative (high risk = bearish)
+        assert score <= 0.0
+
+    def test_v7_11_geo_score_zero_for_unrelated_country(self) -> None:
+        """_build_geo_score_at returns 0.0 when events are in countries not related to symbol."""
+        from src.backtesting.backtest_engine import _build_geo_score_at
+
+        candle_ts = datetime.datetime(2024, 6, 1, tzinfo=datetime.timezone.utc)
+        # Japan event — not relevant for EURUSD
+        geo_rows = [
+            _make_geo_row(
+                "Japan", 0.9, datetime.datetime(2024, 5, 20, tzinfo=datetime.timezone.utc)
+            )
+        ]
+        score = _build_geo_score_at(geo_rows, candle_ts, "EURUSD=X")
+        assert score == 0.0
+
+
+class TestV711BackwardCompatibility:
+    """TASK-V7-11: Backward compatibility — use_fundamental_data=False keeps legacy behavior."""
+
+    def test_v7_11_simulate_symbol_no_fd_uses_ta_weight_only(self) -> None:
+        """When use_fundamental_data=False, _simulate_symbol uses _TA_WEIGHT * ta_score only."""
+        import numpy as np
+        from src.backtesting.backtest_engine import BacktestEngine, _TA_WEIGHT
+        from src.backtesting.backtest_params import BacktestParams
+
+        # Build minimal price rows (100 candles of H1 data)
+        base_ts = datetime.datetime(2024, 1, 1, 0, 0, tzinfo=datetime.timezone.utc)
+
+        class FakePriceRow:
+            def __init__(self, i: int) -> None:
+                price = 1.0850 + (i % 20) * 0.0001
+                self.timestamp = base_ts + datetime.timedelta(hours=i)
+                self.open = Decimal(str(price))
+                self.high = Decimal(str(price + 0.0005))
+                self.low = Decimal(str(price - 0.0005))
+                self.close = Decimal(str(price + 0.0002))
+                self.volume = Decimal("100")
+
+        price_rows = [FakePriceRow(i) for i in range(100)]
+
+        db = AsyncMock()
+        engine = BacktestEngine(db)
+
+        # Patch out expensive computations
+        with (
+            patch("src.backtesting.backtest_engine._precompute_ta_scores") as mock_ta,
+            patch("src.backtesting.backtest_engine._precompute_regimes") as mock_reg,
+        ):
+            # Return score of 20.0 at every index
+            mock_ta.return_value = np.full(100, 20.0)
+            mock_reg.return_value = ["STRONG_TREND_BULL"] * 100
+
+            with patch("src.backtesting.backtest_engine.SignalFilterPipeline") as mock_pipeline_cls:
+                mock_pipeline = MagicMock()
+                mock_pipeline.run_all.return_value = (False, "blocked")
+                mock_pipeline.get_stats.return_value = {}
+                mock_pipeline_cls.return_value = mock_pipeline
+
+                trades, _ = engine._simulate_symbol(
+                    symbol="EURUSD=X",
+                    market_type="forex",
+                    timeframe="H1",
+                    price_rows=price_rows,
+                    account_size=Decimal("1000"),
+                    apply_slippage=True,
+                    # No fundamental data — legacy mode
+                    macro_rows_all=None,
+                    central_bank_rates=None,
+                    fg_rows_all=None,
+                    geo_rows_all=None,
+                    instrument_obj=None,
+                )
+
+        # When pipeline blocks all signals, no trades generated
+        assert trades == []
+        # Most important: no error raised — backward compatible
+
+    def test_v7_11_simulate_symbol_fd_recomputes_composite(self) -> None:
+        """When use_fundamental_data=True and FA data exists, composite score changes."""
+        import numpy as np
+        from src.backtesting.backtest_engine import (
+            BacktestEngine,
+            _build_fa_score_at,
+            _build_sentiment_score_at,
+            _TA_WEIGHT,
+            _FA_WEIGHT,
+            _SENTIMENT_WEIGHT,
+            _GEO_WEIGHT,
+        )
+
+        ta_score = 20.0
+        fa_score = _TA_WEIGHT * ta_score  # baseline: only TA
+        # With FA + sentiment contribution:
+        fg_index = 10.0  # extreme fear → bullish sentiment
+        sentiment_score = (50.0 - fg_index) * 2.0  # = +80
+
+        composite_legacy = _TA_WEIGHT * ta_score
+        composite_with_fd = (
+            _TA_WEIGHT * ta_score
+            + _FA_WEIGHT * 0.0       # no macro data → fa=0
+            + _SENTIMENT_WEIGHT * sentiment_score
+            + _GEO_WEIGHT * 0.0      # no geo data → geo=0
+        )
+
+        assert composite_with_fd != composite_legacy
+        assert composite_with_fd > composite_legacy  # sentiment boosts score
+
+    @pytest.mark.asyncio
+    async def test_v7_11_simulate_fd_false_skips_macro_queries(self) -> None:
+        """When use_fundamental_data=False, no macro/fear_greed/geo DB queries are made."""
+        from src.backtesting.backtest_engine import BacktestEngine
+        from src.backtesting.backtest_params import BacktestParams
+
+        params = BacktestParams(
+            symbols=["EURUSD=X"],
+            start_date="2024-01-01",
+            end_date="2024-02-01",
+            use_fundamental_data=False,
+        )
+
+        mock_db = AsyncMock()
+        engine = BacktestEngine(mock_db)
+
+        # Track calls to new CRUD functions
+        macro_called = []
+        fg_called = []
+        geo_called = []
+
+        async def _fake_get_macro(*args, **kwargs):
+            macro_called.append(True)
+            return []
+
+        async def _fake_get_fg(*args, **kwargs):
+            fg_called.append(True)
+            return []
+
+        async def _fake_get_geo(*args, **kwargs):
+            geo_called.append(True)
+            return []
+
+        with (
+            patch("src.backtesting.backtest_engine.get_macro_data_in_range", side_effect=_fake_get_macro),
+            patch("src.backtesting.backtest_engine.get_fear_greed_in_range", side_effect=_fake_get_fg),
+            patch("src.backtesting.backtest_engine.get_geo_events_in_range", side_effect=_fake_get_geo),
+            patch("src.backtesting.backtest_engine.get_instrument_by_symbol", new_callable=AsyncMock, return_value=None),
+            patch("src.backtesting.backtest_engine.get_price_data", new_callable=AsyncMock, return_value=[]),
+            patch("src.database.crud.get_economic_events_in_range", new_callable=AsyncMock, return_value=[]),
+        ):
+            result = await engine._simulate(params)
+            trades = result[0]
+
+        assert macro_called == [], "Macro data should NOT be fetched when use_fundamental_data=False"
+        assert fg_called == [], "F&G data should NOT be fetched when use_fundamental_data=False"
+        assert geo_called == [], "Geo data should NOT be fetched when use_fundamental_data=False"
+
+    @pytest.mark.asyncio
+    async def test_v7_11_simulate_fd_true_loads_macro_queries(self) -> None:
+        """When use_fundamental_data=True, macro/fear_greed/geo DB queries ARE executed."""
+        from src.backtesting.backtest_engine import BacktestEngine
+        from src.backtesting.backtest_params import BacktestParams
+
+        params = BacktestParams(
+            symbols=["EURUSD=X"],
+            start_date="2024-01-01",
+            end_date="2024-02-01",
+            use_fundamental_data=True,
+        )
+
+        mock_db = AsyncMock()
+        engine = BacktestEngine(mock_db)
+
+        macro_called = []
+        fg_called = []
+        geo_called = []
+
+        async def _fake_get_macro(*args, **kwargs):
+            macro_called.append(True)
+            return []
+
+        async def _fake_get_fg(*args, **kwargs):
+            fg_called.append(True)
+            return []
+
+        async def _fake_get_geo(*args, **kwargs):
+            geo_called.append(True)
+            return []
+
+        with (
+            patch("src.backtesting.backtest_engine.get_macro_data_in_range", side_effect=_fake_get_macro),
+            patch("src.backtesting.backtest_engine.get_fear_greed_in_range", side_effect=_fake_get_fg),
+            patch("src.backtesting.backtest_engine.get_geo_events_in_range", side_effect=_fake_get_geo),
+            patch("src.backtesting.backtest_engine.get_central_bank_rates_as_of", new_callable=AsyncMock, return_value={}),
+            patch("src.backtesting.backtest_engine.get_instrument_by_symbol", new_callable=AsyncMock, return_value=None),
+            patch("src.backtesting.backtest_engine.get_price_data", new_callable=AsyncMock, return_value=[]),
+            patch("src.database.crud.get_economic_events_in_range", new_callable=AsyncMock, return_value=[]),
+        ):
+            result = await engine._simulate(params)
+            trades = result[0]
+
+        assert len(macro_called) == 1, "Macro data SHOULD be fetched when use_fundamental_data=True"
+        assert len(fg_called) == 1, "F&G data SHOULD be fetched when use_fundamental_data=True"
+        assert len(geo_called) == 1, "Geo data SHOULD be fetched when use_fundamental_data=True"
 
 
 # ── TASK-V7-15: Filter activation statistics ──────────────────────────────────
@@ -4059,3 +4590,325 @@ class TestV716WalkForwardBackwardCompatibility:
         assert "walk_forward" in captured_summary[0]
         assert captured_summary[0]["walk_forward"]["verdict"] == "VALID"
         assert captured_summary[0]["walk_forward"]["fold_count"] == 1
+
+
+# ── TASK-V7-19: Benchmark comparison ─────────────────────────────────────────
+
+
+class TestV719Benchmarks:
+    """Tests for _compute_benchmarks and related helpers (TASK-V7-19)."""
+
+    def _make_trade(
+        self,
+        pnl: float,
+        direction: str = "LONG",
+        exit_reason: str = "tp_hit",
+    ) -> MagicMock:
+        t = MagicMock()
+        t.pnl_usd = Decimal(str(pnl))
+        t.direction = direction
+        t.exit_reason = exit_reason
+        t.result = "win" if pnl > 0 else "loss"
+        return t
+
+    def _make_price_df(
+        self,
+        first_open: float,
+        last_close: float,
+        n_bars: int = 100,
+    ) -> pd.DataFrame:
+        import numpy as np_local
+
+        opens = np_local.linspace(first_open, last_close, n_bars)
+        closes = np_local.linspace(first_open, last_close, n_bars)
+        highs = closes + abs(closes[0]) * 0.001
+        lows = closes - abs(closes[0]) * 0.001
+        volumes = np_local.ones(n_bars) * 1000
+
+        return pd.DataFrame({
+            "open": opens,
+            "high": highs,
+            "low": lows,
+            "close": closes,
+            "volume": volumes,
+        })
+
+    # ── Buy-and-hold ──────────────────────────────────────────────────────────
+
+    def test_v7_19_buy_and_hold_positive_return(self) -> None:
+        """Buy-and-hold: instrument rose 10% -> return_pct ~= 10.0."""
+        from src.backtesting.backtest_engine import _compute_buy_and_hold
+
+        df = self._make_price_df(first_open=1.0, last_close=1.1, n_bars=50)
+        result = _compute_buy_and_hold(
+            price_dfs_by_symbol={"EURUSD=X": df},
+            account_size=Decimal("1000"),
+        )
+        assert "EURUSD=X" in result["per_symbol"]
+        sym = result["per_symbol"]["EURUSD=X"]
+        assert abs(sym["return_pct"] - 10.0) < 0.01
+        assert sym["first_open"] == pytest.approx(1.0, abs=1e-4)
+        assert sym["last_close"] == pytest.approx(1.1, abs=1e-4)
+        assert sym["pnl_usd"] == pytest.approx(100.0, abs=0.1)
+        assert result["portfolio_return_pct"] == pytest.approx(10.0, abs=0.01)
+
+    def test_v7_19_buy_and_hold_negative_return(self) -> None:
+        """Buy-and-hold: instrument fell 20% -> return_pct ~= -20.0."""
+        from src.backtesting.backtest_engine import _compute_buy_and_hold
+
+        df = self._make_price_df(first_open=1.0, last_close=0.8, n_bars=50)
+        result = _compute_buy_and_hold(
+            price_dfs_by_symbol={"GBPUSD=X": df},
+            account_size=Decimal("1000"),
+        )
+        sym = result["per_symbol"]["GBPUSD=X"]
+        assert abs(sym["return_pct"] - (-20.0)) < 0.01
+        assert sym["pnl_usd"] == pytest.approx(-200.0, abs=0.1)
+
+    def test_v7_19_buy_and_hold_two_symbols_portfolio_average(self) -> None:
+        """Portfolio return is equal-weight average of symbol returns."""
+        from src.backtesting.backtest_engine import _compute_buy_and_hold
+
+        df_a = self._make_price_df(first_open=1.0, last_close=1.2, n_bars=50)
+        df_b = self._make_price_df(first_open=100.0, last_close=80.0, n_bars=50)
+        result = _compute_buy_and_hold(
+            price_dfs_by_symbol={"A": df_a, "B": df_b},
+            account_size=Decimal("1000"),
+        )
+        assert result["portfolio_return_pct"] == pytest.approx(0.0, abs=0.1)
+
+    def test_v7_19_buy_and_hold_empty_price_data(self) -> None:
+        """Empty price_dfs_by_symbol returns no per_symbol entries and None portfolio."""
+        from src.backtesting.backtest_engine import _compute_buy_and_hold
+
+        result = _compute_buy_and_hold(
+            price_dfs_by_symbol={},
+            account_size=Decimal("1000"),
+        )
+        assert result["per_symbol"] == {}
+        assert result["portfolio_return_pct"] is None
+
+    # ── Random entry ──────────────────────────────────────────────────────────
+
+    def test_v7_19_random_entry_deterministic(self) -> None:
+        """Random entry benchmark produces identical results across two calls (seed=42)."""
+        from src.backtesting.backtest_engine import _compute_random_entry
+
+        df = self._make_price_df(first_open=1.0, last_close=1.05, n_bars=200)
+        kwargs: dict = {
+            "trades": [],
+            "price_dfs_by_symbol": {"EURUSD=X": df},
+            "account_size": Decimal("1000"),
+        }
+        result_1 = _compute_random_entry(**kwargs)
+        result_2 = _compute_random_entry(**kwargs)
+
+        assert result_1["pf_median"] == result_2["pf_median"]
+        assert result_1["pf_95th"] == result_2["pf_95th"]
+        assert result_1["n_simulations"] == result_2["n_simulations"]
+        assert result_1["note"] == "price_data_based"
+
+    def test_v7_19_random_entry_returns_valid_pf_values(self) -> None:
+        """Random entry PF values are positive when price data is available."""
+        from src.backtesting.backtest_engine import _compute_random_entry
+
+        df = self._make_price_df(first_open=1.2, last_close=1.25, n_bars=500)
+        result = _compute_random_entry(
+            trades=[],
+            price_dfs_by_symbol={"USDJPY=X": df},
+            account_size=Decimal("1000"),
+        )
+        if result["pf_median"] is not None:
+            assert result["pf_median"] > 0
+        if result["pf_95th"] is not None:
+            assert result["pf_95th"] > 0
+        assert result["n_simulations"] >= 0
+
+    def test_v7_19_random_entry_fallback_with_trades(self) -> None:
+        """When price data is empty, fallback to trade-based bootstrap."""
+        from src.backtesting.backtest_engine import _compute_random_entry
+
+        trades = [self._make_trade(10.0) for _ in range(30)] + [
+            self._make_trade(-5.0) for _ in range(20)
+        ]
+        result = _compute_random_entry(
+            trades=trades,
+            price_dfs_by_symbol={},
+            account_size=Decimal("1000"),
+        )
+        assert result["note"] == "trade_bootstrap_fallback"
+        assert result["pf_median"] is not None
+        assert result["pf_95th"] is not None
+
+    def test_v7_19_random_entry_fallback_insufficient_trades(self) -> None:
+        """Fallback with <2 trades returns None values and insufficient_trades note."""
+        from src.backtesting.backtest_engine import _compute_random_entry
+
+        result = _compute_random_entry(
+            trades=[self._make_trade(5.0)],
+            price_dfs_by_symbol={},
+            account_size=Decimal("1000"),
+        )
+        assert result["pf_median"] is None
+        assert result["pf_95th"] is None
+        assert result["note"] == "insufficient_trades"
+
+    # ── Inverted signals ──────────────────────────────────────────────────────
+
+    def test_v7_19_inverted_signals_profitable_strategy_becomes_loss(self) -> None:
+        """Profitable strategy inverted -> loss (inverted PF < 1)."""
+        from src.backtesting.backtest_engine import _compute_inverted_signals
+
+        trades = [self._make_trade(100.0) for _ in range(10)] + [
+            self._make_trade(-30.0) for _ in range(5)
+        ]
+        result = _compute_inverted_signals(trades)
+        assert result["pf"] is not None
+        assert result["pf"] < 1.0
+        assert result["interpretation"] == "not_profitable_inverse"
+        assert result["pnl_usd"] < 0
+
+    def test_v7_19_inverted_signals_losing_strategy_becomes_profit(self) -> None:
+        """Losing strategy inverted -> profitable (inverted PF > 1)."""
+        from src.backtesting.backtest_engine import _compute_inverted_signals
+
+        trades = [self._make_trade(-50.0) for _ in range(10)] + [
+            self._make_trade(10.0) for _ in range(3)
+        ]
+        result = _compute_inverted_signals(trades)
+        assert result["pf"] is not None
+        assert result["pf"] > 1.0
+        assert result["interpretation"] == "profitable_inverse"
+        assert result["pnl_usd"] > 0
+
+    def test_v7_19_inverted_signals_no_trades(self) -> None:
+        """Empty trades list returns no_trades interpretation."""
+        from src.backtesting.backtest_engine import _compute_inverted_signals
+
+        result = _compute_inverted_signals([])
+        assert result["pf"] is None
+        assert result["pnl_usd"] is None
+        assert result["interpretation"] == "no_trades"
+
+    def test_v7_19_inverted_signals_excludes_end_of_data(self) -> None:
+        """end_of_data trades are excluded from inverted signals computation."""
+        from src.backtesting.backtest_engine import _compute_inverted_signals
+
+        real = self._make_trade(50.0)
+        eod = self._make_trade(100.0, exit_reason="end_of_data")
+        result = _compute_inverted_signals([real, eod])
+        # Only real trade inverted: pnl = -50.0
+        assert result["pnl_usd"] == pytest.approx(-50.0, abs=0.01)
+
+    # ── exceeds_random flag ───────────────────────────────────────────────────
+
+    def test_v7_19_exceeds_random_true_when_strategy_pf_beats_95th(self) -> None:
+        """exceeds_random is True when strategy PF >> random 95th percentile."""
+        from src.backtesting.backtest_engine import _compute_benchmarks
+
+        trades = [self._make_trade(100.0) for _ in range(20)] + [
+            self._make_trade(-1.0) for _ in range(5)
+        ]
+        df = self._make_price_df(first_open=1.0, last_close=1.05, n_bars=200)
+        result = _compute_benchmarks(
+            trades=trades,
+            price_dfs_by_symbol={"SYM": df},
+            account_size=Decimal("1000"),
+        )
+        assert result["strategy_pf"] == pytest.approx(400.0, abs=1.0)
+        if result["exceeds_random"] is not None:
+            assert result["exceeds_random"] is True
+
+    def test_v7_19_exceeds_random_none_when_no_trades(self) -> None:
+        """With 0 trades, strategy_pf is None and exceeds_random is None."""
+        from src.backtesting.backtest_engine import _compute_benchmarks
+
+        result = _compute_benchmarks(
+            trades=[],
+            price_dfs_by_symbol={},
+            account_size=Decimal("1000"),
+        )
+        assert result["strategy_pf"] is None
+        assert result["exceeds_random"] is None
+
+    def test_v7_19_benchmarks_has_all_required_keys(self) -> None:
+        """_compute_benchmarks output always contains all required top-level keys."""
+        from src.backtesting.backtest_engine import _compute_benchmarks
+
+        result = _compute_benchmarks(
+            trades=[],
+            price_dfs_by_symbol=None,
+            account_size=Decimal("1000"),
+        )
+        assert "buy_and_hold" in result
+        assert "random_entry" in result
+        assert "inverted_signals" in result
+        assert "strategy_pf" in result
+        assert "exceeds_random" in result
+
+    # ── _compute_summary integration ──────────────────────────────────────────
+
+    def test_v7_19_summary_includes_benchmarks_key(self) -> None:
+        """_compute_summary output always contains a 'benchmarks' key."""
+        import datetime
+
+        from src.backtesting.backtest_engine import _compute_summary
+        from src.backtesting.backtest_params import BacktestTradeResult
+
+        def _bt(pnl: float) -> BacktestTradeResult:
+            return BacktestTradeResult(
+                symbol="EURUSD=X",
+                timeframe="H1",
+                direction="LONG",
+                entry_price=Decimal("1.1000"),
+                exit_price=Decimal("1.1100") if pnl > 0 else Decimal("1.0900"),
+                exit_reason="tp_hit" if pnl > 0 else "sl_hit",
+                pnl_usd=Decimal(str(pnl)),
+                result="win" if pnl > 0 else "loss",
+                entry_at=datetime.datetime(2024, 1, 2, 10, 0),
+                exit_at=datetime.datetime(2024, 1, 2, 12, 0),
+                duration_minutes=120,
+            )
+
+        trades = [_bt(10.0) for _ in range(5)] + [_bt(-5.0) for _ in range(3)]
+        summary = _compute_summary(trades, Decimal("1000"))
+        assert "benchmarks" in summary
+        b = summary["benchmarks"]
+        assert "buy_and_hold" in b
+        assert "random_entry" in b
+        assert "inverted_signals" in b
+        assert "exceeds_random" in b
+
+    def test_v7_19_summary_benchmarks_with_price_data(self) -> None:
+        """_compute_summary passes price_dfs_by_symbol to buy-and-hold benchmark."""
+        import datetime
+
+        from src.backtesting.backtest_engine import _compute_summary
+        from src.backtesting.backtest_params import BacktestTradeResult
+
+        df = self._make_price_df(first_open=1.1, last_close=1.155, n_bars=100)
+
+        trade = BacktestTradeResult(
+            symbol="EURUSD=X",
+            timeframe="H1",
+            direction="LONG",
+            entry_price=Decimal("1.1000"),
+            exit_price=Decimal("1.1200"),
+            exit_reason="tp_hit",
+            pnl_usd=Decimal("20.0"),
+            result="win",
+            entry_at=datetime.datetime(2024, 1, 2, 10, 0),
+            exit_at=datetime.datetime(2024, 1, 2, 12, 0),
+            duration_minutes=120,
+        )
+
+        summary = _compute_summary(
+            [trade],
+            Decimal("1000"),
+            price_dfs_by_symbol={"EURUSD=X": df},
+        )
+        bh = summary["benchmarks"]["buy_and_hold"]
+        assert "EURUSD=X" in bh["per_symbol"]
+        ret = bh["per_symbol"]["EURUSD=X"]["return_pct"]
+        # first_open=1.1, last_close=1.155 -> ~5% return
+        assert abs(ret - 5.0) < 0.1

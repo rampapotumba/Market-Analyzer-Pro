@@ -47,6 +47,12 @@ class BacktestParams(BaseModel):
     # Summary includes per-instrument isolated results and path-dependence flags.
     isolation_mode: bool = False
 
+    # TASK-V7-11: When True, load historical FA/Sentiment/Geo data from the DB and
+    # incorporate them into the composite score computation during the backtest.
+    # When False (default), keeps the legacy behavior: fa/sentiment/geo = 0.0 (neutral),
+    # composite = ta_weight * ta_score only.
+    use_fundamental_data: bool = False
+
     @field_validator("timeframe")
     @classmethod
     def normalize_timeframe(cls, v: str) -> str:

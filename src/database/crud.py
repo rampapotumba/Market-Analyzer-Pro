@@ -19,6 +19,7 @@ from src.database.models import (
     BacktestTrade,
     CentralBankRate,
     EconomicEvent,
+    GeoEvent,
     Instrument,
     MacroData,
     NewsEvent,
@@ -1085,3 +1086,109 @@ async def get_latest_social_sentiment(
         .limit(1)
     )
     return result.scalar_one_or_none()
+
+
+# ── TASK-V7-11: Historical FA/Sentiment/Geo data for backtest ─────────────────
+
+
+async def get_macro_data_in_range(
+    session: AsyncSession,
+    from_dt: datetime.datetime,
+    to_dt: datetime.datetime,
+) -> Sequence[MacroData]:
+    """Return all macro_data rows with release_date in [from_dt, to_dt].
+
+    Results are ordered by release_date ASC so callers can bisect to find
+    the most recent record visible at a given candle timestamp (no lookahead).
+    """
+    stmt = (
+        select(MacroData)
+        .where(
+            and_(
+                MacroData.release_date >= from_dt,
+                MacroData.release_date <= to_dt,
+            )
+        )
+        .order_by(MacroData.release_date.asc())
+    )
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+
+async def get_central_bank_rates_as_of(
+    session: AsyncSession,
+    as_of: datetime.datetime,
+) -> dict[str, float]:
+    """Return the most recent rate per central bank as of a given datetime.
+
+    Only rows with effective_date <= as_of are considered (no lookahead).
+    Returns {bank_code: rate_float} — empty dict if no data.
+    """
+    latest_date_subq = (
+        select(
+            CentralBankRate.bank,
+            func.max(CentralBankRate.effective_date).label("max_date"),
+        )
+        .where(CentralBankRate.effective_date <= as_of)
+        .group_by(CentralBankRate.bank)
+        .subquery()
+    )
+
+    stmt = select(CentralBankRate).join(
+        latest_date_subq,
+        and_(
+            CentralBankRate.bank == latest_date_subq.c.bank,
+            CentralBankRate.effective_date == latest_date_subq.c.max_date,
+        ),
+    )
+    result = await session.execute(stmt)
+    rows = result.scalars().all()
+    return {row.bank: float(row.rate) for row in rows}
+
+
+async def get_geo_events_in_range(
+    session: AsyncSession,
+    from_dt: datetime.datetime,
+    to_dt: datetime.datetime,
+) -> Sequence[GeoEvent]:
+    """Return all geo_events with event_date in [from_dt, to_dt].
+
+    Results are ordered by event_date ASC so callers can iterate
+    chronologically to build a daily aggregate up to any candle timestamp.
+    """
+    stmt = (
+        select(GeoEvent)
+        .where(
+            and_(
+                GeoEvent.event_date >= from_dt,
+                GeoEvent.event_date <= to_dt,
+            )
+        )
+        .order_by(GeoEvent.event_date.asc())
+    )
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+
+async def get_fear_greed_in_range(
+    session: AsyncSession,
+    from_dt: datetime.datetime,
+    to_dt: datetime.datetime,
+) -> Sequence[SocialSentiment]:
+    """Return FEAR_GREED SocialSentiment rows (source='fear_greed') in [from_dt, to_dt].
+
+    Ordered by timestamp ASC for chronological bisect lookups.
+    """
+    stmt = (
+        select(SocialSentiment)
+        .where(
+            and_(
+                SocialSentiment.source == "fear_greed",
+                SocialSentiment.timestamp >= from_dt,
+                SocialSentiment.timestamp <= to_dt,
+            )
+        )
+        .order_by(SocialSentiment.timestamp.asc())
+    )
+    result = await session.execute(stmt)
+    return result.scalars().all()

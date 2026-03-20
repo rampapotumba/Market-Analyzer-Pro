@@ -453,6 +453,7 @@ def _compute_summary(
     trades: list[BacktestTradeResult],
     account_size: Decimal,
     filter_stats: Optional[dict] = None,
+    price_dfs_by_symbol: Optional[dict[str, "pd.DataFrame"]] = None,
 ) -> dict[str, Any]:
     """Compute aggregate backtest statistics.
 
@@ -460,6 +461,9 @@ def _compute_summary(
     end_of_data trades are reported separately in summary["end_of_data_count/pnl"].
 
     V6 TASK-V6-10: filter_stats dict is merged into summary if provided.
+
+    TASK-V7-19: price_dfs_by_symbol enables benchmark comparison (buy-and-hold,
+    random entry, inverted signals). When None, benchmarks use trade-bootstrap fallback.
     """
     total = len(trades)
 
@@ -966,6 +970,13 @@ def _compute_summary(
     # TASK-V7-13: Statistical significance tests
     result["statistical_tests"] = _compute_statistical_tests(metric_trades)
 
+    # TASK-V7-19: Benchmark comparison
+    result["benchmarks"] = _compute_benchmarks(
+        trades=metric_trades,
+        price_dfs_by_symbol=price_dfs_by_symbol,
+        account_size=account_size,
+    )
+
     return result
 
 
@@ -1023,6 +1034,302 @@ def _compute_path_dependence(
         "path_dependent": sorted(path_dependent),
         "comparison": comparison,
         "threshold_pct": threshold_pct,
+    }
+
+
+# ── TASK-V7-19: Benchmark comparison ─────────────────────────────────────────
+
+# Number of random trade sequences to generate for benchmark
+_BENCHMARK_RANDOM_ENTRIES = 1000
+# Deterministic seed — results must be reproducible across runs
+_BENCHMARK_RANDOM_SEED = 42
+# Default R:R for random benchmark (mirrors REGIME_RR_MAP DEFAULT)
+_BENCHMARK_DEFAULT_RR = 1.5
+# SL ATR multiplier for random benchmark (mirrors ATR_SL_MULTIPLIER_MAP DEFAULT)
+_BENCHMARK_SL_ATR_MULT = 2.0
+
+
+def _compute_benchmarks(
+    trades: list[BacktestTradeResult],
+    price_dfs_by_symbol: Optional[dict[str, "pd.DataFrame"]],
+    account_size: Decimal,
+) -> dict[str, Any]:
+    """TASK-V7-19: Compute comparison benchmarks for a backtest result.
+
+    Three benchmarks are computed:
+      buy_and_hold    — return from first candle open to last candle close per symbol
+      random_entry    — PF distribution from 1000 random entry simulations
+      inverted_signals — PF when all LONG/SHORT directions are flipped
+
+    Also sets exceeds_random = True when strategy PF > random 95th-percentile.
+    """
+    strategy_pf = _compute_pf_from_trades(trades)
+
+    buy_and_hold = _compute_buy_and_hold(price_dfs_by_symbol or {}, account_size)
+    random_entry = _compute_random_entry(
+        trades=trades,
+        price_dfs_by_symbol=price_dfs_by_symbol or {},
+        account_size=account_size,
+    )
+    inverted = _compute_inverted_signals(trades)
+
+    random_pf_95th = random_entry.get("pf_95th")
+    if strategy_pf is not None and random_pf_95th is not None:
+        exceeds_random = strategy_pf > random_pf_95th
+    else:
+        exceeds_random = None
+
+    return {
+        "buy_and_hold": buy_and_hold,
+        "random_entry": random_entry,
+        "inverted_signals": inverted,
+        "strategy_pf": round(strategy_pf, 4) if strategy_pf is not None else None,
+        "exceeds_random": exceeds_random,
+    }
+
+
+def _compute_pf_from_trades(trades: list[BacktestTradeResult]) -> Optional[float]:
+    """Compute profit factor from a list of trades (excludes end_of_data exits)."""
+    real_trades = [t for t in trades if t.exit_reason != "end_of_data"]
+    gross_win = sum(float(t.pnl_usd or 0) for t in real_trades if (t.pnl_usd or 0) > 0)
+    gross_loss = abs(
+        sum(float(t.pnl_usd or 0) for t in real_trades if (t.pnl_usd or 0) < 0)
+    )
+    if gross_loss > 0:
+        return gross_win / gross_loss
+    return None
+
+
+def _compute_buy_and_hold(
+    price_dfs_by_symbol: dict[str, "pd.DataFrame"],
+    account_size: Decimal,
+) -> dict[str, Any]:
+    """Compute buy-and-hold return for each instrument.
+
+    For each symbol: enter at first candle open, exit at last candle close.
+    Portfolio B&H assumes equal-weight allocation across all symbols.
+    """
+    per_symbol: dict[str, Any] = {}
+    returns: list[float] = []
+    n_symbols = max(len(price_dfs_by_symbol), 1)
+
+    for symbol, df in price_dfs_by_symbol.items():
+        if df is None or df.empty:
+            continue
+        if "open" not in df.columns or "close" not in df.columns:
+            continue
+        first_open = float(df["open"].iloc[0])
+        last_close = float(df["close"].iloc[-1])
+        if first_open <= 0:
+            continue
+        ret_pct = (last_close - first_open) / first_open * 100.0
+        share = float(account_size) / n_symbols
+        pnl_usd = share * ret_pct / 100.0
+        per_symbol[symbol] = {
+            "first_open": round(first_open, 6),
+            "last_close": round(last_close, 6),
+            "return_pct": round(ret_pct, 4),
+            "pnl_usd": round(pnl_usd, 4),
+        }
+        returns.append(ret_pct)
+
+    portfolio_return_pct = sum(returns) / len(returns) if returns else None
+
+    return {
+        "per_symbol": per_symbol,
+        "portfolio_return_pct": (
+            round(portfolio_return_pct, 4) if portfolio_return_pct is not None else None
+        ),
+    }
+
+
+def _compute_random_entry(
+    trades: list[BacktestTradeResult],
+    price_dfs_by_symbol: dict[str, "pd.DataFrame"],
+    account_size: Decimal,
+) -> dict[str, Any]:
+    """Simulate 1000 random entry points and report PF distribution.
+
+    Samples uniformly from all available price rows across all instruments.
+    Each random trade: direction 50/50, SL = 2*ATR estimate, TP = SL*1.5.
+    Exit determined from the next candle close vs SL/TP levels.
+
+    Groups 1000 trades into 20 windows of 50 to produce a PF distribution.
+    Uses numpy.random.RandomState(seed=42) for full reproducibility.
+
+    Falls back to trade-based bootstrap when price data is not available.
+    """
+    rng = np.random.RandomState(seed=_BENCHMARK_RANDOM_SEED)  # type: ignore[attr-defined]
+
+    rows_pool: list[tuple[str, np.ndarray, int]] = []
+    for symbol, df in price_dfs_by_symbol.items():
+        if df is None or df.empty or "close" not in df.columns:
+            continue
+        closes = df["close"].values.astype(np.float64)
+        n = len(closes)
+        if n < 20:
+            continue
+        for i in range(20, n - 1):
+            rows_pool.append((symbol, closes, i))
+
+    if not rows_pool:
+        return _compute_random_entry_from_trades(trades, rng)
+
+    pf_list = _simulate_random_trades_pf(rows_pool, rng)
+
+    if not pf_list:
+        return {
+            "pf_median": None,
+            "pf_95th": None,
+            "n_simulations": 0,
+            "note": "price_data_based",
+        }
+
+    pf_arr = np.array(pf_list, dtype=np.float64)
+    return {
+        "pf_median": round(float(np.median(pf_arr)), 4),
+        "pf_95th": round(float(np.percentile(pf_arr, 95)), 4),
+        "n_simulations": len(pf_list),
+        "note": "price_data_based",
+    }
+
+
+def _simulate_random_trades_pf(
+    rows_pool: list[tuple[str, np.ndarray, int]],
+    rng: "np.random.RandomState",
+) -> list[float]:
+    """Simulate random trades and return a list of PF values.
+
+    Groups _BENCHMARK_RANDOM_ENTRIES random trades into windows of 50 trades each
+    and computes one PF per window. Returns list of up to 20 PF values.
+    """
+    n_pool = len(rows_pool)
+    batch_size = 50
+    n_windows = _BENCHMARK_RANDOM_ENTRIES // batch_size
+
+    pf_list: list[float] = []
+
+    for _ in range(n_windows):
+        gross_win = 0.0
+        gross_loss = 0.0
+
+        for _ in range(batch_size):
+            idx_in_pool = int(rng.randint(0, n_pool))
+            _sym, closes, candle_idx = rows_pool[idx_in_pool]
+
+            start_atr = max(0, candle_idx - 13)
+            atr_closes = closes[start_atr: candle_idx + 1]
+            if len(atr_closes) < 2:
+                continue
+            changes = np.abs(np.diff(atr_closes))
+            atr_est = float(np.mean(changes)) if len(changes) > 0 else 0.0
+
+            entry_price = float(closes[candle_idx])
+            if entry_price <= 0 or atr_est <= 0:
+                continue
+
+            sl_dist = _BENCHMARK_SL_ATR_MULT * atr_est
+            tp_dist = sl_dist * _BENCHMARK_DEFAULT_RR
+
+            direction = "LONG" if rng.randint(0, 2) == 0 else "SHORT"
+            next_close = float(closes[candle_idx + 1])
+
+            if direction == "LONG":
+                hit_sl = next_close <= (entry_price - sl_dist)
+                hit_tp = next_close >= (entry_price + tp_dist)
+            else:
+                hit_sl = next_close >= (entry_price + sl_dist)
+                hit_tp = next_close <= (entry_price - tp_dist)
+
+            # Worst case: both hit = SL
+            if hit_sl or (not hit_tp):
+                gross_loss += sl_dist
+            else:
+                gross_win += tp_dist
+
+        if gross_loss > 0:
+            pf_list.append(gross_win / gross_loss)
+
+    return pf_list
+
+
+def _compute_random_entry_from_trades(
+    trades: list[BacktestTradeResult],
+    rng: "np.random.RandomState",
+) -> dict[str, Any]:
+    """Fallback: bootstrap PF from existing trade PnLs when price data is unavailable."""
+    real_trades = [t for t in trades if t.exit_reason != "end_of_data"]
+    if len(real_trades) < 2:
+        return {
+            "pf_median": None,
+            "pf_95th": None,
+            "n_simulations": 0,
+            "note": "insufficient_trades",
+        }
+
+    returns = np.array([float(t.pnl_usd or 0) for t in real_trades], dtype=np.float64)
+    batch_size = min(50, len(returns))
+    n_windows = _BENCHMARK_RANDOM_ENTRIES // batch_size
+    pf_list: list[float] = []
+
+    for _ in range(n_windows):
+        sample = rng.choice(returns, size=batch_size, replace=True)
+        gw = float(np.sum(sample[sample > 0]))
+        gl = float(abs(np.sum(sample[sample < 0])))
+        if gl > 0:
+            pf_list.append(gw / gl)
+
+    if not pf_list:
+        return {
+            "pf_median": None,
+            "pf_95th": None,
+            "n_simulations": 0,
+            "note": "no_losses_in_sample",
+        }
+
+    pf_arr = np.array(pf_list, dtype=np.float64)
+    return {
+        "pf_median": round(float(np.median(pf_arr)), 4),
+        "pf_95th": round(float(np.percentile(pf_arr, 95)), 4),
+        "n_simulations": len(pf_list),
+        "note": "trade_bootstrap_fallback",
+    }
+
+
+def _compute_inverted_signals(trades: list[BacktestTradeResult]) -> dict[str, Any]:
+    """TASK-V7-19: PF when all signal directions are inverted (LONG<->SHORT).
+
+    Simplified approximation: negate all PnLs. This represents what would happen
+    if every trade direction were flipped. When inverted PF > 1, the strategy
+    may be profiting from a drift that the opposite strategy captures better.
+    """
+    real_trades = [t for t in trades if t.exit_reason != "end_of_data"]
+    if not real_trades:
+        return {"pf": None, "pnl_usd": None, "interpretation": "no_trades"}
+
+    gross_win = 0.0
+    gross_loss = 0.0
+    total_pnl = 0.0
+
+    for t in real_trades:
+        inverted_pnl = -float(t.pnl_usd or 0)
+        total_pnl += inverted_pnl
+        if inverted_pnl > 0:
+            gross_win += inverted_pnl
+        elif inverted_pnl < 0:
+            gross_loss += abs(inverted_pnl)
+
+    pf = (gross_win / gross_loss) if gross_loss > 0 else None
+    interpretation = (
+        "profitable_inverse"
+        if (pf is not None and pf > 1.0)
+        else "not_profitable_inverse"
+    )
+
+    return {
+        "pf": round(pf, 4) if pf is not None else None,
+        "pnl_usd": round(total_pnl, 4),
+        "interpretation": interpretation,
     }
 
 
@@ -1573,8 +1880,13 @@ class BacktestEngine:
                 # V7-17: data_quality not available in isolation mode
                 summary["data_quality"] = {}
             else:
-                trades, filter_stats, data_quality = await self._simulate(params)
-                summary = _compute_summary(trades, params.account_size, filter_stats=filter_stats)
+                trades, filter_stats, data_quality, price_dfs = await self._simulate(params)
+                summary = _compute_summary(
+                    trades,
+                    params.account_size,
+                    filter_stats=filter_stats,
+                    price_dfs_by_symbol=price_dfs,
+                )
                 # V7-17: attach data quality report to summary
                 summary["data_quality"] = data_quality
 
@@ -1707,8 +2019,8 @@ class BacktestEngine:
                 "enable_walk_forward": False,
             })
 
-            is_trades, is_fs, _is_dq = await self._simulate(is_params)
-            oos_trades, oos_fs, _oos_dq = await self._simulate(oos_params)
+            is_trades, is_fs, _is_dq, _is_dfs = await self._simulate(is_params)
+            oos_trades, oos_fs, _oos_dq, _oos_dfs = await self._simulate(oos_params)
 
             is_summary = _compute_summary(is_trades, params.account_size, filter_stats=is_fs)
             oos_summary = _compute_summary(oos_trades, params.account_size, filter_stats=oos_fs)
@@ -1933,8 +2245,12 @@ class BacktestEngine:
         self,
         params: BacktestParams,
         run_id: Optional[str] = None,
-    ) -> tuple[list[BacktestTradeResult], dict, dict]:
-        """Core simulation loop. Returns (trades, aggregated_filter_stats, data_quality).
+    ) -> tuple[list[BacktestTradeResult], dict, dict, dict[str, pd.DataFrame]]:
+        """Core simulation loop.
+
+        Returns (trades, aggregated_filter_stats, data_quality, price_dfs_by_symbol).
+
+        price_dfs_by_symbol is used by _compute_benchmarks (TASK-V7-19).
 
         If run_id is provided, updates _backtest_progress[run_id] (0–100)
         after each symbol completes so callers can poll progress.
@@ -1944,6 +2260,8 @@ class BacktestEngine:
         agg_filter_stats: dict[str, int] = {}
         # V7-17: per-symbol data quality reports
         data_quality: dict[str, Any] = {}
+        # TASK-V7-19: price DataFrames for benchmark computation
+        price_dfs_by_symbol: dict[str, pd.DataFrame] = {}
 
         start_dt = datetime.datetime.fromisoformat(params.start_date).replace(
             tzinfo=datetime.timezone.utc
@@ -2143,6 +2461,8 @@ class BacktestEngine:
                 d1_rows=d1_data_cache.get(symbol) if params.apply_d1_trend_filter else None,
             )
             data_quality[symbol] = _dq_report
+            # TASK-V7-19: store DataFrame for benchmark computation
+            price_dfs_by_symbol[symbol] = _dq_df
 
             # progress_cb: called from the worker thread after every N candles
             sym_base_pct = sym_idx / total_symbols * 100
@@ -2181,7 +2501,7 @@ class BacktestEngine:
                 _backtest_progress[run_id] = round((sym_idx + 1) / total_symbols * 100, 1)
                 logger.info("[SIM-22] %s done — progress %.1f%%", symbol, _backtest_progress[run_id])
 
-        return trades, agg_filter_stats, data_quality
+        return trades, agg_filter_stats, data_quality, price_dfs_by_symbol
 
     async def _simulate_isolated(
         self,
@@ -2258,6 +2578,31 @@ class BacktestEngine:
             except Exception as exc:
                 logger.warning("[V7-18] Could not load DXY data for %s: %s", _dxy_sym, exc)
 
+        # TASK-V7-11: Pre-load historical FA/Sentiment/Geo data (isolation mode).
+        iso_macro_rows: list = []
+        iso_fg_rows: list = []
+        iso_geo_rows: list = []
+        if params.use_fundamental_data:
+            _iso_fa_start = start_dt - datetime.timedelta(days=365)
+            try:
+                iso_macro_rows = list(
+                    await get_macro_data_in_range(self.db, _iso_fa_start, end_dt)
+                )
+            except Exception as exc:
+                logger.warning("[V7-18] Could not load macro data: %s", exc)
+            try:
+                iso_fg_rows = list(
+                    await get_fear_greed_in_range(self.db, _iso_fa_start, end_dt)
+                )
+            except Exception as exc:
+                logger.warning("[V7-18] Could not load fear_greed data: %s", exc)
+            try:
+                iso_geo_rows = list(
+                    await get_geo_events_in_range(self.db, _iso_fa_start, end_dt)
+                )
+            except Exception as exc:
+                logger.warning("[V7-18] Could not load geo events: %s", exc)
+
         total_symbols = len(symbols_to_run)
         if run_id:
             _backtest_progress[run_id] = 0.0
@@ -2272,6 +2617,14 @@ class BacktestEngine:
                 continue
 
             market_type: str = instrument.market or "forex"
+
+            # TASK-V7-11: central bank rates per symbol in isolation mode
+            iso_cb_rates: dict[str, float] = {}
+            if params.use_fundamental_data:
+                try:
+                    iso_cb_rates = await get_central_bank_rates_as_of(self.db, end_dt)
+                except Exception as exc:
+                    logger.warning("[V7-18] Could not load CB rates for %s: %s", symbol, exc)
 
             price_rows = await get_price_data(
                 self.db,
@@ -2314,6 +2667,12 @@ class BacktestEngine:
                 params=params,
                 d1_rows_all=d1_data_cache.get(symbol, []),
                 dxy_rsi_by_ts=dxy_rsi_by_ts,
+                # TASK-V7-11: historical FA data for isolation mode
+                macro_rows_all=iso_macro_rows,
+                central_bank_rates=iso_cb_rates,
+                fg_rows_all=iso_fg_rows,
+                geo_rows_all=iso_geo_rows,
+                instrument_obj=instrument if params.use_fundamental_data else None,
             )
 
             all_trades.extend(symbol_trades)
