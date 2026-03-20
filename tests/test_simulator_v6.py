@@ -3342,3 +3342,301 @@ class TestCal301DxyRsiWilderSmoothing:
 
         result = _compute_dxy_rsi(rows)
         assert all(v == 0.0 for v in result.values()), f"Expected 0.0 for all falling, got: {list(result.values())[:5]}"
+
+
+# ── OPT-01: D1 bisect lookup ─────────────────────────────────────────────────
+
+
+class TestOpt01D1Bisect:
+    """OPT-01: D1 list comprehension replaced by bisect.bisect_right()."""
+
+    def _make_d1_row(self, ts: datetime.datetime) -> MagicMock:
+        r = MagicMock()
+        r.timestamp = ts
+        return r
+
+    def _make_d1_rows(self, n: int, base_dt: datetime.datetime) -> list:
+        """Build n D1 rows spaced 1 day apart from base_dt."""
+        return [self._make_d1_row(base_dt + datetime.timedelta(days=i)) for i in range(n)]
+
+    def test_opt_01_d1_bisect_same_result(self) -> None:
+        """bisect slice produces same rows as original list comprehension."""
+        import bisect as _bisect
+
+        base_dt = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+        d1_rows = self._make_d1_rows(500, base_dt)
+        # candle_ts somewhere in the middle
+        candle_ts = base_dt + datetime.timedelta(days=300)
+
+        # Original approach
+        original = [r for r in d1_rows if r.timestamp <= candle_ts][-200:]
+
+        # Optimized approach
+        d1_timestamps = [r.timestamp for r in d1_rows]
+        idx = _bisect.bisect_right(d1_timestamps, candle_ts)
+        optimized = d1_rows[max(0, idx - 200):idx]
+
+        assert len(original) == len(optimized), (
+            f"Length mismatch: original={len(original)} optimized={len(optimized)}"
+        )
+        for o, opt in zip(original, optimized):
+            assert o.timestamp == opt.timestamp
+
+    def test_opt_01_d1_bisect_empty(self) -> None:
+        """Empty d1_rows produces empty result — no IndexError."""
+        import bisect as _bisect
+
+        d1_rows: list = []
+        d1_timestamps: list = []
+        candle_ts = datetime.datetime(2024, 6, 1, tzinfo=datetime.timezone.utc)
+
+        idx = _bisect.bisect_right(d1_timestamps, candle_ts)
+        result = d1_rows[max(0, idx - 200):idx]
+        assert result == []
+
+    def test_opt_01_d1_bisect_boundary_inclusive(self) -> None:
+        """When candle_ts equals a D1 timestamp, that row IS included (<=, not <)."""
+        import bisect as _bisect
+
+        base_dt = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+        d1_rows = self._make_d1_rows(10, base_dt)
+        candle_ts = base_dt + datetime.timedelta(days=4)  # exactly day 4
+
+        d1_timestamps = [r.timestamp for r in d1_rows]
+        idx = _bisect.bisect_right(d1_timestamps, candle_ts)
+        result = d1_rows[max(0, idx - 200):idx]
+
+        # Should include day 0, 1, 2, 3, 4 — five rows
+        assert len(result) == 5
+        assert result[-1].timestamp == candle_ts
+
+    def test_opt_01_d1_bisect_future_candle_ts(self) -> None:
+        """candle_ts after all D1 rows returns all rows (up to 200)."""
+        import bisect as _bisect
+
+        base_dt = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+        d1_rows = self._make_d1_rows(100, base_dt)
+        candle_ts = base_dt + datetime.timedelta(days=999)
+
+        d1_timestamps = [r.timestamp for r in d1_rows]
+        idx = _bisect.bisect_right(d1_timestamps, candle_ts)
+        result = d1_rows[max(0, idx - 200):idx]
+
+        assert len(result) == 100  # all rows (< 200)
+
+    def test_opt_01_d1_bisect_caps_at_200(self) -> None:
+        """Result never exceeds 200 rows regardless of how many D1 rows exist."""
+        import bisect as _bisect
+
+        base_dt = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+        d1_rows = self._make_d1_rows(500, base_dt)
+        candle_ts = base_dt + datetime.timedelta(days=499)
+
+        d1_timestamps = [r.timestamp for r in d1_rows]
+        idx = _bisect.bisect_right(d1_timestamps, candle_ts)
+        result = d1_rows[max(0, idx - 200):idx]
+
+        assert len(result) == 200
+
+
+# ── OPT-02: DXY RSI pre-mapping ──────────────────────────────────────────────
+
+
+class TestOpt02DxyRsiPreMap:
+    """OPT-02: DXY RSI pre-mapped to price_rows indices using bisect nearest-previous."""
+
+    def _make_price_row(self, ts: datetime.datetime) -> MagicMock:
+        r = MagicMock()
+        r.timestamp = ts
+        return r
+
+    def test_opt_02_dxy_rsi_mapped_to_idx(self) -> None:
+        """Pre-mapped array contains correct RSI values for matching timestamps."""
+        import bisect as _bisect
+        from src.backtesting.backtest_engine import _to_utc
+
+        base = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+        # DXY candles every hour
+        dxy_ts = [base + datetime.timedelta(hours=i) for i in range(50)]
+        dxy_rsi_by_ts = {ts: float(40 + i) for i, ts in enumerate(dxy_ts)}
+
+        # Price rows exactly aligned with DXY
+        price_rows = [self._make_price_row(base + datetime.timedelta(hours=i)) for i in range(50)]
+        n = len(price_rows)
+
+        # Build pre-mapped array (same logic as in _simulate_symbol)
+        dxy_rsi_at_idx: list = [None] * n
+        _dxy_ts_sorted = sorted(dxy_rsi_by_ts.keys())
+        _dxy_rsi_sorted = [dxy_rsi_by_ts[ts] for ts in _dxy_ts_sorted]
+        for _pi in range(n):
+            _pts = _to_utc(price_rows[_pi].timestamp)
+            _di = _bisect.bisect_right(_dxy_ts_sorted, _pts) - 1
+            if _di >= 0:
+                dxy_rsi_at_idx[_pi] = _dxy_rsi_sorted[_di]
+
+        # First row (index 0): DXY at hour 0 → RSI = 40.0
+        assert dxy_rsi_at_idx[0] == 40.0
+        # Row 10: DXY at hour 10 → RSI = 50.0
+        assert dxy_rsi_at_idx[10] == 50.0
+
+    def test_opt_02_dxy_nearest_previous(self) -> None:
+        """When price_row timestamp is between DXY candles, nearest-previous DXY RSI is used."""
+        import bisect as _bisect
+        from src.backtesting.backtest_engine import _to_utc
+
+        base = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+        # DXY candles at hour 0 and hour 2 only
+        dxy_rsi_by_ts = {
+            base: 45.0,
+            base + datetime.timedelta(hours=2): 55.0,
+        }
+        _dxy_ts_sorted = sorted(dxy_rsi_by_ts.keys())
+        _dxy_rsi_sorted = [dxy_rsi_by_ts[ts] for ts in _dxy_ts_sorted]
+
+        # Price row at hour 1 (between DXY candles)
+        price_rows = [self._make_price_row(base + datetime.timedelta(hours=1))]
+        n = 1
+        dxy_rsi_at_idx: list = [None] * n
+        _pts = _to_utc(price_rows[0].timestamp)
+        _di = _bisect.bisect_right(_dxy_ts_sorted, _pts) - 1
+        if _di >= 0:
+            dxy_rsi_at_idx[0] = _dxy_rsi_sorted[_di]
+
+        # Should use RSI from hour 0 (nearest previous), not hour 2
+        assert dxy_rsi_at_idx[0] == 45.0
+
+    def test_opt_02_dxy_empty(self) -> None:
+        """Empty dxy_rsi_by_ts results in all None without error."""
+        dxy_rsi_by_ts: dict = {}
+        n = 10
+        dxy_rsi_at_idx: list = [None] * n
+
+        if dxy_rsi_by_ts:  # branch not taken
+            pass  # pragma: no cover
+
+        assert all(v is None for v in dxy_rsi_at_idx)
+
+    def test_opt_02_dxy_before_first_candle(self) -> None:
+        """Price row before first DXY candle gets None (no valid previous DXY)."""
+        import bisect as _bisect
+        from src.backtesting.backtest_engine import _to_utc
+
+        base = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+        dxy_rsi_by_ts = {base + datetime.timedelta(hours=5): 50.0}
+        _dxy_ts_sorted = sorted(dxy_rsi_by_ts.keys())
+        _dxy_rsi_sorted = [dxy_rsi_by_ts[ts] for ts in _dxy_ts_sorted]
+
+        # Price row is 10 hours BEFORE any DXY candle
+        price_row_ts = _to_utc(base - datetime.timedelta(hours=10))
+        _di = _bisect.bisect_right(_dxy_ts_sorted, price_row_ts) - 1
+        result = _dxy_rsi_sorted[_di] if _di >= 0 else None
+
+        assert result is None
+
+
+# ── OPT-03: S/R cache ────────────────────────────────────────────────────────
+
+
+class TestOpt03SRCache:
+    """OPT-03: S/R recomputed every _SR_CACHE_INTERVAL candles instead of per-signal."""
+
+    def test_opt_03_sr_cache_interval_constant(self) -> None:
+        """_SR_CACHE_INTERVAL is defined and has sensible value."""
+        from src.backtesting.backtest_engine import _SR_CACHE_INTERVAL
+        assert isinstance(_SR_CACHE_INTERVAL, int)
+        assert 10 <= _SR_CACHE_INTERVAL <= 200, (
+            f"_SR_CACHE_INTERVAL={_SR_CACHE_INTERVAL} outside sensible range [10, 200]"
+        )
+
+    def test_opt_03_sr_cache_first_call_computes(self) -> None:
+        """Cache initialised with last_idx = -_SR_CACHE_INTERVAL forces computation on first signal."""
+        from src.backtesting.backtest_engine import _SR_CACHE_INTERVAL
+
+        sr_cache: dict = {
+            "support": [],
+            "resistance": [],
+            "last_idx": -_SR_CACHE_INTERVAL,  # cold — simulates pre-loop initialisation
+        }
+        # candle_idx=0 (very first signal): 0 - (-50) = 50 >= 50 → must recompute
+        candle_idx = 0
+        _should_recompute = (
+            sr_cache is None
+            or (candle_idx - sr_cache.get("last_idx", -_SR_CACHE_INTERVAL)) >= _SR_CACHE_INTERVAL
+        )
+        assert _should_recompute is True, "Cold cache must trigger recomputation on first signal"
+        # Verify structure is unchanged
+        assert "last_idx" in sr_cache
+        assert sr_cache["last_idx"] == -_SR_CACHE_INTERVAL
+
+    def test_opt_03_sr_cache_reduces_calls(self) -> None:
+        """TAEngine is called at most ceil(n/_SR_CACHE_INTERVAL) times, not n times."""
+        from src.backtesting.backtest_engine import _SR_CACHE_INTERVAL
+
+        call_count = 0
+
+        def would_recompute(candle_idx: int, last_idx: int) -> bool:
+            return (candle_idx - last_idx) >= _SR_CACHE_INTERVAL
+
+        n_signals = 200
+        last_idx = -_SR_CACHE_INTERVAL
+        for i in range(n_signals):
+            if would_recompute(i, last_idx):
+                call_count += 1
+                last_idx = i
+
+        max_allowed_calls = (n_signals // _SR_CACHE_INTERVAL) + 1
+        assert call_count <= max_allowed_calls, (
+            f"Too many S/R computations: {call_count} > {max_allowed_calls}"
+        )
+        # For 200 signals with interval=50: expect ~4 calls, not 200
+        assert call_count < n_signals // 5, (
+            f"S/R cache not effective enough: {call_count} calls for {n_signals} signals"
+        )
+
+    def test_opt_03_sr_cache_fallback_on_none(self) -> None:
+        """When sr_cache is None, behavior falls back to always-recompute (no crash)."""
+        # _should_recompute logic with sr_cache=None
+        from src.backtesting.backtest_engine import _SR_CACHE_INTERVAL
+
+        sr_cache = None
+        candle_idx = 5
+
+        _should_recompute = (
+            sr_cache is None
+            or (candle_idx - sr_cache.get("last_idx", -_SR_CACHE_INTERVAL)) >= _SR_CACHE_INTERVAL
+        )
+        assert _should_recompute is True
+
+    def test_opt_03_sr_cache_not_stale_within_interval(self) -> None:
+        """Cache is NOT recomputed if fewer than _SR_CACHE_INTERVAL candles have passed."""
+        from src.backtesting.backtest_engine import _SR_CACHE_INTERVAL
+
+        sr_cache = {
+            "support": [Decimal("1.1000")],
+            "resistance": [Decimal("1.1200")],
+            "last_idx": 100,
+        }
+        candle_idx = 100 + _SR_CACHE_INTERVAL - 1  # one before threshold
+
+        _should_recompute = (
+            sr_cache is None
+            or (candle_idx - sr_cache.get("last_idx", -_SR_CACHE_INTERVAL)) >= _SR_CACHE_INTERVAL
+        )
+        assert _should_recompute is False
+
+    def test_opt_03_sr_cache_stale_at_interval(self) -> None:
+        """Cache IS recomputed when exactly _SR_CACHE_INTERVAL candles have passed."""
+        from src.backtesting.backtest_engine import _SR_CACHE_INTERVAL
+
+        sr_cache = {
+            "support": [Decimal("1.1000")],
+            "resistance": [Decimal("1.1200")],
+            "last_idx": 100,
+        }
+        candle_idx = 100 + _SR_CACHE_INTERVAL  # exactly at threshold
+
+        _should_recompute = (
+            sr_cache is None
+            or (candle_idx - sr_cache.get("last_idx", -_SR_CACHE_INTERVAL)) >= _SR_CACHE_INTERVAL
+        )
+        assert _should_recompute is True

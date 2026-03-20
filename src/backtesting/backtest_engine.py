@@ -17,6 +17,7 @@ Isolation guarantee: this module NEVER writes to signal_results or virtual_portf
 """
 
 import asyncio
+import bisect
 import datetime
 import hashlib
 import json
@@ -99,6 +100,11 @@ _TIME_EXIT_CANDLES: dict[str, int] = {"H1": 48, "H4": 20, "D1": 10}
 # When MFE >= 50% of TP distance, move SL to lock 20% of TP distance profit.
 _TRAILING_STOP_MFE_TRIGGER = Decimal("0.5")   # activate when MFE >= 50% of TP dist
 _TRAILING_STOP_LOCK_RATIO = Decimal("0.2")    # lock entry + 20% of TP dist
+
+# OPT-03: S/R cache refresh interval in candles.
+# S/R levels are slow-moving (support/resistance from recent highs/lows, ~2 trading days).
+# Recomputing every 50 H1 candles reduces ~3000-5000 full TAEngine calls to ~60-100 per symbol.
+_SR_CACHE_INTERVAL = 50
 
 # EU/NA forex pairs blocked during Asian low-liquidity session (00:00–06:59 UTC)
 # mirrors SignalEngine._FOREX_PAIRS_EU_NA + _is_low_liquidity_session
@@ -1378,6 +1384,39 @@ class BacktestEngine:
             )
             regimes_precomp = ["DEFAULT"] * n
 
+        # ── OPT-01: Pre-sort D1 timestamps for O(log n) bisect lookup ─────────
+        # D1 data is already ORDER BY timestamp from DB — guaranteed sorted.
+        # bisect_right on sorted timestamps replaces O(m) list comprehension
+        # that was running 12,000 × 500 = 6M comparisons per symbol.
+        _d1_all: list = d1_rows_all or []
+        _d1_timestamps: list[datetime.datetime] = [r.timestamp for r in _d1_all]
+
+        # ── OPT-02: Pre-map DXY RSI to price_rows indices ────────────────────
+        # Replaces per-candle _to_utc() + exact dict.get() which:
+        # 1. Allocates a new datetime object 12,000× per symbol
+        # 2. Silently returns None when DXY and symbol timestamps don't align exactly
+        # bisect nearest-previous lookup is both faster and more correct (causal).
+        dxy_rsi_at_idx: list[Optional[float]] = [None] * n
+        if dxy_rsi_by_ts:
+            _dxy_ts_sorted: list[datetime.datetime] = sorted(dxy_rsi_by_ts.keys())
+            _dxy_rsi_sorted: list[float] = [dxy_rsi_by_ts[ts] for ts in _dxy_ts_sorted]
+            for _pi in range(n):
+                _pts = _to_utc(price_rows[_pi].timestamp)
+                _di = bisect.bisect_right(_dxy_ts_sorted, _pts) - 1
+                if _di >= 0:
+                    dxy_rsi_at_idx[_pi] = _dxy_rsi_sorted[_di]
+
+        # ── OPT-03: S/R cache — refresh every 50 candles instead of per-signal
+        # TAEngine.calculate_all_indicators() recomputes RSI/MACD/BB/MA/ADX/etc.
+        # just to extract support/resistance. S/R levels are slow-moving (change
+        # over trading days, not hourly), so caching for 50 H1 candles (~2 days)
+        # reduces ~3,000-5,000 full TAEngine calls to ~60-100 per symbol.
+        _sr_cache: dict[str, Any] = {
+            "support": [],
+            "resistance": [],
+            "last_idx": -_SR_CACHE_INTERVAL,  # force computation on first signal
+        }
+
         for i in range(_MIN_BARS_HISTORY, n - 1):
             # ── Progress callback every N candles ─────────────────────────────
             if progress_cb is not None and (i - _MIN_BARS_HISTORY) % _progress_interval == 0:
@@ -1479,14 +1518,18 @@ class BacktestEngine:
                 market_type=market_type,
                 timeframe=timeframe,
                 df_slice=full_df.iloc[:i],  # O(1) view — for S/R computation only
+                candle_idx=i,
+                sr_cache=_sr_cache,
             )
             if signal is None:
                 continue
 
-            # ── V6 TASK-V6-06: Slice D1 rows up to current candle timestamp ─────
-            # Returns last 200 D1 candles visible before signal timestamp (no lookahead).
-            _d1_all = d1_rows_all or []
-            d1_rows_for_filter = [r for r in _d1_all if r.timestamp <= candle_ts][-200:]
+            # ── OPT-01: O(log m) D1 slice via bisect (replaces O(m) list comprehension) ──
+            # D1 timestamps are pre-sorted in the pre-loop phase above.
+            # bisect_right returns insertion point AFTER candle_ts, so [0:idx] gives
+            # all D1 rows with timestamp <= candle_ts (correct: no lookahead).
+            _d1_idx = bisect.bisect_right(_d1_timestamps, candle_ts)
+            d1_rows_for_filter = _d1_all[max(0, _d1_idx - 200):_d1_idx]
 
             # ── Run unified filter pipeline (SIM-42) ─────────────────────────
             filter_context = {
@@ -1501,11 +1544,12 @@ class BacktestEngine:
                 "candle_ts": candle_ts,
                 "d1_rows": d1_rows_for_filter,  # V6-06: populated from pre-loaded D1 cache
                 "economic_events": economic_events or [],
-                # CAL3-01: Look up DXY RSI using the PREVIOUS candle's timestamp (idx = i-1),
-                # consistent with all other TA indicators that use idx to avoid lookahead.
-                # Both key and lookup are normalized to UTC-aware via _to_utc so that
-                # timezone-naive vs timezone-aware mismatches do not produce silent None.
-                "dxy_rsi": (dxy_rsi_by_ts or {}).get(_to_utc(price_rows[idx].timestamp)),
+                # OPT-02: O(1) array index replaces per-candle _to_utc() + dict.get().
+                # dxy_rsi_at_idx is pre-mapped to price_rows indices using bisect
+                # nearest-previous — more correct than exact-match which could miss
+                # when DXY and symbol timestamps don't align to the same second.
+                # idx = i-1 (previous candle) consistent with all other TA indicators.
+                "dxy_rsi": dxy_rsi_at_idx[idx],
                 # V6 TASK-V6-02: only TA available in backtest → proportional scaling
                 "available_weight": _TA_WEIGHT,
             }
@@ -1818,6 +1862,8 @@ class BacktestEngine:
         market_type: str,
         timeframe: str,
         df_slice: Optional[pd.DataFrame] = None,
+        candle_idx: int = 0,
+        sr_cache: Optional[dict[str, Any]] = None,
     ) -> Optional[dict[str, Any]]:
         """Lightweight signal generation from pre-computed scalar values.
 
@@ -1835,6 +1881,9 @@ class BacktestEngine:
             timeframe:         Timeframe string, e.g. "H1".
             df_slice:          O(1) pandas view full_df.iloc[:i] — used only for
                                S/R computation (called ~200-500 times per symbol).
+            candle_idx:        Current candle index i in the main loop.
+            sr_cache:          Mutable dict shared across calls for S/R caching (OPT-03).
+                               Keys: "support", "resistance", "last_idx".
 
         Returns raw signal dict or None if no signal.
         """
@@ -1848,10 +1897,18 @@ class BacktestEngine:
 
         direction = "LONG" if composite > 0 else "SHORT"
 
-        # S/R levels: compute on the O(1) df view — only called when signal passes
+        # OPT-03: S/R levels with cache — recompute only every _SR_CACHE_INTERVAL candles.
+        # S/R levels are slow-moving (change over trading days, not hourly).
+        # sr_cache is a mutable dict passed from _simulate_symbol() and shared across calls.
+        # When sr_cache is None (e.g. tests calling _generate_signal_fast directly),
+        # falls back to always-recompute behavior for correctness.
         support_levels: list[Decimal] = []
         resistance_levels: list[Decimal] = []
-        if df_slice is not None and len(df_slice) >= 20:
+        _should_recompute = (
+            sr_cache is None
+            or (candle_idx - sr_cache.get("last_idx", -_SR_CACHE_INTERVAL)) >= _SR_CACHE_INTERVAL
+        )
+        if _should_recompute and df_slice is not None and len(df_slice) >= 20:
             try:
                 from src.analysis.ta_engine import TAEngine as _TAE
                 _ta_sr = _TAE(df_slice, timeframe=timeframe)
@@ -1863,12 +1920,21 @@ class BacktestEngine:
                     raw_support = [raw_support]
                 if isinstance(raw_resistance, (int, float)) and raw_resistance:
                     raw_resistance = [raw_resistance]
-                if isinstance(raw_support, list):
-                    support_levels = [Decimal(str(v)) for v in raw_support if v]
-                if isinstance(raw_resistance, list):
-                    resistance_levels = [Decimal(str(v)) for v in raw_resistance if v]
+                new_support = [Decimal(str(v)) for v in raw_support if v] if isinstance(raw_support, list) else []
+                new_resistance = [Decimal(str(v)) for v in raw_resistance if v] if isinstance(raw_resistance, list) else []
+                if sr_cache is not None:
+                    sr_cache["support"] = new_support
+                    sr_cache["resistance"] = new_resistance
+                    sr_cache["last_idx"] = candle_idx
+                support_levels = new_support
+                resistance_levels = new_resistance
             except Exception:
-                pass
+                if sr_cache is not None:
+                    support_levels = sr_cache.get("support", [])
+                    resistance_levels = sr_cache.get("resistance", [])
+        elif sr_cache is not None:
+            support_levels = sr_cache.get("support", [])
+            resistance_levels = sr_cache.get("resistance", [])
 
         atr_decimal = Decimal(str(round(atr_value, 8)))
 
