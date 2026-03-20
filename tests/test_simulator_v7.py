@@ -8039,3 +8039,282 @@ class TestV728SensitivityAnalysis:
             result_with_eod["slippage"]["pf_1x"]
             == result_without_eod["slippage"]["pf_1x"]
         )
+
+
+# ── TASK-V7-27: Strategy comparison and hybrid portfolio allocation ────────────
+
+
+class TestV727CompareStrategies:
+    """Tests for scripts/compare_strategies.py — TASK-V7-27."""
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _make_result(
+        strategy: str,
+        oos_trades: int = 25,
+        oos_pf: Optional[float] = 1.5,
+        oos_sharpe: Optional[float] = 0.8,
+    ) -> dict[str, Any]:
+        return {
+            "strategy": strategy,
+            "display_name": strategy.replace("_", " ").title(),
+            "status": "OK",
+            "oos_trades": oos_trades,
+            "oos_pf": oos_pf,
+            "oos_wr": 0.55,
+            "oos_sharpe": oos_sharpe,
+            "verdict": "VALID",
+            "error": None,
+        }
+
+    # ── Coverage mapping tests ────────────────────────────────────────────────
+
+    def test_v7_27_instrument_coverage_all_strategies_defined(self) -> None:
+        """STRATEGY_INSTRUMENTS must define coverage for all 5 named strategies."""
+        from scripts.compare_strategies import STRATEGY_INSTRUMENTS
+
+        expected_strategies = {
+            "trend_rider",
+            "session_sniper",
+            "crypto_extreme",
+            "gold_macro",
+            "divergence_hunter",
+        }
+        assert set(STRATEGY_INSTRUMENTS.keys()) == expected_strategies
+
+    def test_v7_27_instrument_coverage_trend_rider(self) -> None:
+        """Trend Rider must cover EURUSD, AUDUSD, USDCAD, GC=F, BTC/USDT."""
+        from scripts.compare_strategies import STRATEGY_INSTRUMENTS
+
+        expected = {"EURUSD=X", "AUDUSD=X", "USDCAD=X", "GC=F", "BTC/USDT"}
+        assert set(STRATEGY_INSTRUMENTS["trend_rider"]) == expected
+
+    def test_v7_27_instrument_coverage_session_sniper(self) -> None:
+        """Session Sniper must cover EURUSD, GBPUSD, AUDUSD, USDCAD."""
+        from scripts.compare_strategies import STRATEGY_INSTRUMENTS
+
+        expected = {"EURUSD=X", "GBPUSD=X", "AUDUSD=X", "USDCAD=X"}
+        assert set(STRATEGY_INSTRUMENTS["session_sniper"]) == expected
+
+    def test_v7_27_instrument_coverage_crypto_extreme(self) -> None:
+        """Crypto Extreme must cover BTC/USDT only."""
+        from scripts.compare_strategies import STRATEGY_INSTRUMENTS
+
+        assert set(STRATEGY_INSTRUMENTS["crypto_extreme"]) == {"BTC/USDT"}
+
+    def test_v7_27_instrument_coverage_gold_macro(self) -> None:
+        """Gold Macro must cover GC=F."""
+        from scripts.compare_strategies import STRATEGY_INSTRUMENTS
+
+        assert "GC=F" in STRATEGY_INSTRUMENTS["gold_macro"]
+
+    def test_v7_27_instrument_coverage_divergence_hunter(self) -> None:
+        """Divergence Hunter must cover EURUSD, AUDUSD, USDCAD, GC=F, BTC/USDT."""
+        from scripts.compare_strategies import STRATEGY_INSTRUMENTS
+
+        expected = {"EURUSD=X", "AUDUSD=X", "USDCAD=X", "GC=F", "BTC/USDT"}
+        assert set(STRATEGY_INSTRUMENTS["divergence_hunter"]) == expected
+
+    # ── build_comparison_matrix tests ─────────────────────────────────────────
+
+    def test_v7_27_matrix_includes_all_instruments(self) -> None:
+        """Comparison matrix must contain every instrument covered by any strategy."""
+        from scripts.compare_strategies import (
+            STRATEGY_INSTRUMENTS,
+            build_comparison_matrix,
+        )
+
+        results = [
+            self._make_result("trend_rider"),
+            self._make_result("session_sniper"),
+            self._make_result("crypto_extreme"),
+            self._make_result("gold_macro"),
+            self._make_result("divergence_hunter"),
+        ]
+        matrix = build_comparison_matrix(results)
+
+        all_instruments: set[str] = set()
+        for instruments in STRATEGY_INSTRUMENTS.values():
+            all_instruments.update(instruments)
+
+        assert set(matrix.keys()) == all_instruments
+
+    def test_v7_27_matrix_cell_contains_pf_sharpe_trade_count(self) -> None:
+        """Each populated matrix cell must have pf, sharpe, and trade_count keys."""
+        from scripts.compare_strategies import build_comparison_matrix
+
+        results = [self._make_result("trend_rider", oos_trades=30, oos_pf=1.8, oos_sharpe=1.2)]
+        matrix = build_comparison_matrix(results)
+
+        cell = matrix["EURUSD=X"]["trend_rider"]
+        assert "pf" in cell
+        assert "sharpe" in cell
+        assert "trade_count" in cell
+        assert cell["pf"] == pytest.approx(1.8)
+        assert cell["sharpe"] == pytest.approx(1.2)
+        assert cell["trade_count"] == 30
+
+    def test_v7_27_matrix_instrument_not_covered_by_strategy_is_absent(self) -> None:
+        """GBPUSD=X is covered by session_sniper but not trend_rider — cell must be absent."""
+        from scripts.compare_strategies import build_comparison_matrix
+
+        results = [self._make_result("trend_rider")]
+        matrix = build_comparison_matrix(results)
+
+        # GBPUSD=X is in the matrix (covered by session_sniper/divergence_hunter universe)
+        # but trend_rider did not cover it so no entry for trend_rider.
+        assert "trend_rider" not in matrix.get("GBPUSD=X", {})
+
+    # ── build_hybrid_allocation tests ─────────────────────────────────────────
+
+    def test_v7_27_allocation_selects_highest_pf_strategy(self) -> None:
+        """build_hybrid_allocation selects the strategy with highest OOS PF."""
+        from scripts.compare_strategies import build_hybrid_allocation
+
+        results = [
+            self._make_result("trend_rider", oos_trades=25, oos_pf=1.4, oos_sharpe=0.7),
+            self._make_result("divergence_hunter", oos_trades=25, oos_pf=1.9, oos_sharpe=0.6),
+        ]
+        allocation = build_hybrid_allocation(results)
+
+        # Both strategies cover EURUSD=X; divergence_hunter has higher PF.
+        assert allocation["EURUSD=X"] == "divergence_hunter"
+
+    def test_v7_27_allocation_sharpe_breaks_pf_tie(self) -> None:
+        """When two strategies tie on PF, the one with higher Sharpe wins."""
+        from scripts.compare_strategies import build_hybrid_allocation
+
+        results = [
+            self._make_result("trend_rider", oos_trades=25, oos_pf=1.5, oos_sharpe=0.6),
+            self._make_result("divergence_hunter", oos_trades=25, oos_pf=1.5, oos_sharpe=1.1),
+        ]
+        allocation = build_hybrid_allocation(results)
+
+        # Same PF, divergence_hunter wins on Sharpe for shared instruments.
+        assert allocation["EURUSD=X"] == "divergence_hunter"
+
+    def test_v7_27_allocation_minimum_trade_count_threshold(self) -> None:
+        """Strategy with fewer than 20 OOS trades must not be selected."""
+        from scripts.compare_strategies import MIN_TRADES_THRESHOLD, build_hybrid_allocation
+
+        assert MIN_TRADES_THRESHOLD == 20
+
+        results = [
+            # trend_rider has great PF but only 5 trades — disqualified.
+            self._make_result("trend_rider", oos_trades=5, oos_pf=3.0, oos_sharpe=2.0),
+            # divergence_hunter has modest PF but meets threshold.
+            self._make_result("divergence_hunter", oos_trades=25, oos_pf=1.3, oos_sharpe=0.5),
+        ]
+        allocation = build_hybrid_allocation(results)
+
+        # trend_rider is disqualified; divergence_hunter should win for EURUSD=X.
+        assert allocation["EURUSD=X"] == "divergence_hunter"
+
+    def test_v7_27_allocation_fallback_to_composite_when_no_data(self) -> None:
+        """When no strategy has enough trades, instrument maps to 'composite'."""
+        from scripts.compare_strategies import FALLBACK_STRATEGY, build_hybrid_allocation
+
+        assert FALLBACK_STRATEGY == "composite"
+
+        # All strategies have fewer than MIN_TRADES_THRESHOLD trades.
+        results = [
+            self._make_result("trend_rider", oos_trades=0, oos_pf=None, oos_sharpe=None),
+            self._make_result("session_sniper", oos_trades=0, oos_pf=None, oos_sharpe=None),
+            self._make_result("crypto_extreme", oos_trades=0, oos_pf=None, oos_sharpe=None),
+            self._make_result("gold_macro", oos_trades=0, oos_pf=None, oos_sharpe=None),
+            self._make_result("divergence_hunter", oos_trades=0, oos_pf=None, oos_sharpe=None),
+        ]
+        allocation = build_hybrid_allocation(results)
+
+        for instrument, strategy in allocation.items():
+            assert strategy == "composite", (
+                f"{instrument} should fall back to 'composite' but got '{strategy}'"
+            )
+
+    def test_v7_27_allocation_fallback_empty_results(self) -> None:
+        """build_hybrid_allocation with empty results list falls back to composite for all."""
+        from scripts.compare_strategies import FALLBACK_STRATEGY, build_hybrid_allocation
+
+        allocation = build_hybrid_allocation([])
+        assert all(v == FALLBACK_STRATEGY for v in allocation.values())
+
+    def test_v7_27_allocation_crypto_extreme_preferred_for_btc(self) -> None:
+        """Crypto Extreme should win for BTC/USDT if it has the best PF."""
+        from scripts.compare_strategies import build_hybrid_allocation
+
+        results = [
+            self._make_result("trend_rider", oos_trades=25, oos_pf=1.4, oos_sharpe=0.7),
+            self._make_result("crypto_extreme", oos_trades=30, oos_pf=2.1, oos_sharpe=1.3),
+            self._make_result("divergence_hunter", oos_trades=22, oos_pf=1.6, oos_sharpe=0.9),
+        ]
+        allocation = build_hybrid_allocation(results)
+
+        assert allocation["BTC/USDT"] == "crypto_extreme"
+
+    def test_v7_27_allocation_gold_macro_preferred_for_gcf(self) -> None:
+        """Gold Macro should win for GC=F when it has the best PF."""
+        from scripts.compare_strategies import build_hybrid_allocation
+
+        results = [
+            self._make_result("trend_rider", oos_trades=25, oos_pf=1.3, oos_sharpe=0.5),
+            self._make_result("gold_macro", oos_trades=25, oos_pf=2.5, oos_sharpe=1.5),
+            self._make_result("divergence_hunter", oos_trades=25, oos_pf=1.5, oos_sharpe=0.8),
+        ]
+        allocation = build_hybrid_allocation(results)
+
+        assert allocation["GC=F"] == "gold_macro"
+
+    def test_v7_27_allocation_gbpusd_only_session_sniper_qualifies(self) -> None:
+        """GBPUSD=X is only covered by session_sniper; it must be selected if qualified."""
+        from scripts.compare_strategies import build_hybrid_allocation
+
+        results = [
+            self._make_result("session_sniper", oos_trades=25, oos_pf=1.6, oos_sharpe=0.9),
+        ]
+        allocation = build_hybrid_allocation(results)
+
+        assert allocation["GBPUSD=X"] == "session_sniper"
+
+    def test_v7_27_allocation_accepts_wrapper_dict_with_results_key(self) -> None:
+        """build_hybrid_allocation accepts dict with 'results' key (run_strategy_backtests format)."""
+        from scripts.compare_strategies import build_hybrid_allocation
+
+        wrapper = {
+            "results": [
+                self._make_result("session_sniper", oos_trades=25, oos_pf=1.8, oos_sharpe=1.0),
+            ]
+        }
+        allocation = build_hybrid_allocation(wrapper)
+
+        assert "GBPUSD=X" in allocation
+        assert allocation["GBPUSD=X"] == "session_sniper"
+
+    def test_v7_27_allocation_none_pf_treated_as_best(self) -> None:
+        """Strategy with None PF (all-wins, undefined) must beat any finite PF."""
+        from scripts.compare_strategies import build_hybrid_allocation
+
+        results = [
+            # trend_rider has very high but finite PF.
+            self._make_result("trend_rider", oos_trades=25, oos_pf=5.0, oos_sharpe=2.0),
+            # divergence_hunter has None PF (all wins).
+            self._make_result("divergence_hunter", oos_trades=25, oos_pf=None, oos_sharpe=0.5),
+        ]
+        allocation = build_hybrid_allocation(results)
+
+        # None PF (all wins) should be treated as better than 5.0.
+        assert allocation["EURUSD=X"] == "divergence_hunter"
+
+    def test_v7_27_allocation_all_instruments_present_in_output(self) -> None:
+        """Allocation dict must include every instrument from STRATEGY_INSTRUMENTS."""
+        from scripts.compare_strategies import STRATEGY_INSTRUMENTS, build_hybrid_allocation
+
+        results = [self._make_result("trend_rider", oos_trades=25)]
+        allocation = build_hybrid_allocation(results)
+
+        all_instruments: set[str] = set()
+        for instruments in STRATEGY_INSTRUMENTS.values():
+            all_instruments.update(instruments)
+
+        for instrument in all_instruments:
+            assert instrument in allocation, f"Instrument {instrument!r} missing from allocation"
