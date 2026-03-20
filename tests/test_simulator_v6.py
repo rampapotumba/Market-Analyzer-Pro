@@ -1089,6 +1089,8 @@ class TestV611TimeAndMaeExit:
             "mae": mae,
             "regime": "TREND_BULL",
             "entry_bar_index": entry_bar_index,
+            "trailing_sl_active": False,
+            "original_stop_loss": Decimal(str(stop_loss)),
         }
 
     def test_v6_11_sl_still_works(self) -> None:
@@ -2420,13 +2422,14 @@ class TestCal206TrailingStop:
     def _make_check_exit_trade(self, direction: str = "LONG"):
         """Return open_trade dict for _check_exit testing."""
         from decimal import Decimal
+        sl = Decimal("1.0950") if direction == "LONG" else Decimal("1.1050")
         return {
             "symbol": "EURUSD=X",
             "timeframe": "H1",
             "direction": direction,
             "entry_price": Decimal("1.1000"),
             "entry_at": None,
-            "stop_loss": Decimal("1.0950") if direction == "LONG" else Decimal("1.1050"),
+            "stop_loss": sl,
             "take_profit": Decimal("1.1100") if direction == "LONG" else Decimal("1.0900"),
             "composite_score": Decimal("12.0"),
             "position_pct": 2.0,
@@ -2435,6 +2438,7 @@ class TestCal206TrailingStop:
             "regime": "STRONG_TREND_BULL",
             "entry_bar_index": 0,
             "trailing_sl_active": False,
+            "original_stop_loss": sl,
         }
 
     def _make_candle(self, high: str, low: str, close: str, ts=None):
@@ -2560,6 +2564,92 @@ class TestCal206TrailingStop:
         summary = _compute_summary([t], Decimal("1000"))
         assert "trailing_stop_count" in summary
         assert summary["trailing_stop_count"] == 1
+
+    def test_cal2_06_gap_through_both_sl_worst_case_long(self) -> None:
+        """Worst case: gap through both trailing SL and original SL → exit at original SL (sl_hit)."""
+        from decimal import Decimal
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        engine = BacktestEngine.__new__(BacktestEngine)
+        trade = self._make_check_exit_trade("LONG")
+        # Trailing is already active: trailing_sl=1.1020, original_sl=1.0950
+        trade["trailing_sl_active"] = True
+        trade["stop_loss"] = Decimal("1.1020")
+        trade["original_stop_loss"] = Decimal("1.0950")
+        trade["mfe"] = 0.0055
+        # Candle gaps down through BOTH trailing SL (1.1020) and original SL (1.0950)
+        candle = self._make_candle(high="1.1010", low="1.0920", close="1.0930")
+
+        result = engine._check_exit(
+            open_trade=trade,
+            candle=candle,
+            market_type="forex",
+            apply_slippage=False,
+            candles_since_entry=6,
+            account_size=Decimal("1000"),
+        )
+        assert result is not None
+        # Worst case: must exit at original SL with sl_hit, not trailing_stop
+        assert result.exit_reason == "sl_hit"
+        assert result.exit_price == Decimal("1.0950")
+
+    def test_cal2_06_gap_through_both_sl_worst_case_short(self) -> None:
+        """Worst case SHORT: gap through both trailing SL and original SL → sl_hit at original SL."""
+        from decimal import Decimal
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        engine = BacktestEngine.__new__(BacktestEngine)
+        trade = self._make_check_exit_trade("SHORT")
+        # entry=1.1000, tp=1.0900, original_sl=1.1050
+        # trailing_sl for SHORT = entry - 20% of tp_dist = 1.1000 - 0.002 = 1.0980
+        trade["trailing_sl_active"] = True
+        trade["stop_loss"] = Decimal("1.0980")
+        trade["original_stop_loss"] = Decimal("1.1050")
+        trade["mfe"] = 0.0055
+        # Candle gaps up through BOTH trailing SL (1.0980) and original SL (1.1050)
+        candle = self._make_candle(high="1.1080", low="1.0990", close="1.1070")
+
+        result = engine._check_exit(
+            open_trade=trade,
+            candle=candle,
+            market_type="forex",
+            apply_slippage=False,
+            candles_since_entry=6,
+            account_size=Decimal("1000"),
+        )
+        assert result is not None
+        assert result.exit_reason == "sl_hit"
+        assert result.exit_price == Decimal("1.1050")
+
+    def test_cal2_06_mae_uses_original_sl_distance_after_trailing(self) -> None:
+        """MAE exit uses original_stop_loss distance, not trailing SL distance."""
+        from decimal import Decimal
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        engine = BacktestEngine.__new__(BacktestEngine)
+        trade = self._make_check_exit_trade("LONG")
+        # entry=1.1000, original_sl=1.0950 → sl_distance=0.0050
+        # trailing_sl=1.1020 → if used: sl_distance=0.002, mae_threshold=0.0012
+        # MAE=0.0020 → with original dist: threshold=0.003, 0.002 < 0.003 → NO exit
+        # MAE=0.0020 → with trailing dist: threshold=0.0012, 0.002 >= 0.0012 → false exit
+        trade["trailing_sl_active"] = True
+        trade["stop_loss"] = Decimal("1.1020")
+        trade["original_stop_loss"] = Decimal("1.0950")
+        trade["mfe"] = 0.0055
+        trade["mae"] = 0.0020  # below 60% of original sl_distance (0.003)
+        trade["entry_bar_index"] = 0
+        candle = self._make_candle(high="1.1050", low="1.1022", close="1.1035")
+
+        result = engine._check_exit(
+            open_trade=trade,
+            candle=candle,
+            market_type="forex",
+            apply_slippage=False,
+            candles_since_entry=5,
+            account_size=Decimal("1000"),
+        )
+        # Should NOT exit via MAE — threshold uses original SL distance (0.005), not trailing (0.002)
+        assert result is None
 
 
 class TestCal207TrendBullBlocked:

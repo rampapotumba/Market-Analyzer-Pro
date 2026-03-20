@@ -1396,6 +1396,8 @@ class BacktestEngine:
                 "entry_bar_index": i + 1,  # entry happens at next_candle (i+1)
                 # CAL2-06: trailing stop tracking
                 "trailing_sl_active": False,
+                # Worst-case: preserve original SL even after trailing stop activates
+                "original_stop_loss": sl,
             }
             # Skip to next candle
             i += 1
@@ -1489,19 +1491,36 @@ class BacktestEngine:
             # Update sl to the new trailing value for this candle's hit check
             sl = trailing_sl_new
 
+        # Worst-case: preserve original SL for gap scenarios even when trailing is active.
+        # If price gaps through both trailing SL and original SL, exit at original SL ("sl_hit").
+        original_sl = open_trade.get("original_stop_loss", sl)
+
         sl_hit = False
         tp_hit = False
+        original_sl_hit = False
 
         if direction == "LONG":
             sl_hit = candle_low <= sl
             tp_hit = candle_high >= tp
+            # Worst case: gap through original SL overrides trailing stop exit
+            if open_trade.get("trailing_sl_active") and original_sl != sl:
+                original_sl_hit = candle_low <= original_sl
         else:
             sl_hit = candle_high >= sl
             tp_hit = candle_low <= tp
+            # Worst case: gap through original SL overrides trailing stop exit
+            if open_trade.get("trailing_sl_active") and original_sl != sl:
+                original_sl_hit = candle_high >= original_sl
 
-        if sl_hit or tp_hit:
-            # Worst case (SIM-06): if both hit → SL
-            if sl_hit:
+        if original_sl_hit or sl_hit or tp_hit:
+            # Worst case (CLAUDE.md §6): original SL > trailing SL > TP
+            if original_sl_hit:
+                # Gap hit original SL — worst case, exit at original SL with full loss
+                exit_price = original_sl
+                if apply_slippage:
+                    exit_price = _compute_sl_exit_price(original_sl, direction, market_type, entry)
+                exit_reason = "sl_hit"
+            elif sl_hit:
                 exit_price = sl
                 if apply_slippage:
                     exit_price = _compute_sl_exit_price(sl, direction, market_type, entry)
@@ -1530,7 +1549,10 @@ class BacktestEngine:
         if exit_reason is None:
             current_mae = Decimal(str(open_trade.get("mae", 0)))
             current_mfe = Decimal(str(open_trade.get("mfe", 0)))
-            sl_distance = abs(entry - sl)
+            # Use original_stop_loss for MAE threshold to avoid distortion after trailing
+            # stop activation (trailing SL is much smaller — only 20% of TP distance).
+            mae_sl = open_trade.get("original_stop_loss", sl)
+            sl_distance = abs(entry - mae_sl)
             tp_distance = abs(tp - entry)
             mae_threshold = sl_distance * Decimal("0.60")
             mfe_threshold = tp_distance * Decimal("0.20")
