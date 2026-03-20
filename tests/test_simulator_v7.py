@@ -7676,7 +7676,7 @@ class TestV726StrategyBacktestScript:
 # ── TASK-V7-28: Sensitivity analysis ──────────────────────────────────────────
 
 
-def _make_trade(
+def _make_sensitivity_trade(
     pnl_usd: float,
     exit_at: datetime.datetime,
     result: str = "win",
@@ -7711,9 +7711,9 @@ class TestV728SensitivityAnalysis:
 
         now = datetime.datetime(2024, 6, 1, 12, 0)
         trades = [
-            _make_trade(10.0, now - datetime.timedelta(days=10)),
-            _make_trade(-5.0, now - datetime.timedelta(days=5), result="loss"),
-            _make_trade(10.0, now - datetime.timedelta(days=3)),
+            _make_sensitivity_trade(10.0, now - datetime.timedelta(days=10)),
+            _make_sensitivity_trade(-5.0, now - datetime.timedelta(days=5), result="loss"),
+            _make_sensitivity_trade(10.0, now - datetime.timedelta(days=3)),
         ]
         summary = _compute_summary(trades, Decimal("1000"))
         assert "sensitivity" in summary, "summary must contain 'sensitivity' key"
@@ -7725,8 +7725,8 @@ class TestV728SensitivityAnalysis:
 
         now = datetime.datetime(2024, 6, 1, 12, 0)
         trades = [
-            _make_trade(10.0, now - datetime.timedelta(days=10)),
-            _make_trade(-5.0, now - datetime.timedelta(days=5), result="loss"),
+            _make_sensitivity_trade(10.0, now - datetime.timedelta(days=10)),
+            _make_sensitivity_trade(-5.0, now - datetime.timedelta(days=5), result="loss"),
         ]
         result = _compute_sensitivity(trades, Decimal("1000"))
         assert "end_of_data" in result
@@ -7738,8 +7738,8 @@ class TestV728SensitivityAnalysis:
 
         now = datetime.datetime(2024, 6, 1)
         trades = [
-            _make_trade(10.0, now - datetime.timedelta(days=10)),
-            _make_trade(-5.0, now - datetime.timedelta(days=5), result="loss"),
+            _make_sensitivity_trade(10.0, now - datetime.timedelta(days=10)),
+            _make_sensitivity_trade(-5.0, now - datetime.timedelta(days=5), result="loss"),
         ]
         eod = _compute_sensitivity(trades, Decimal("1000"))["end_of_data"]
         for key in ["full_pf", "excl_7d_pf", "excl_14d_pf", "excl_30d_pf",
@@ -7752,8 +7752,8 @@ class TestV728SensitivityAnalysis:
 
         now = datetime.datetime(2024, 6, 1)
         trades = [
-            _make_trade(10.0, now - datetime.timedelta(days=10)),
-            _make_trade(-5.0, now - datetime.timedelta(days=5), result="loss"),
+            _make_sensitivity_trade(10.0, now - datetime.timedelta(days=10)),
+            _make_sensitivity_trade(-5.0, now - datetime.timedelta(days=5), result="loss"),
         ]
         slip = _compute_sensitivity(trades, Decimal("1000"))["slippage"]
         for key in ["pf_0x", "pf_1x", "pf_2x", "pf_3x", "breakeven_at", "fragile"]:
@@ -7780,11 +7780,11 @@ class TestV728SensitivityAnalysis:
 
         now = datetime.datetime(2024, 6, 1)
         trades = [
-            _make_trade(20.0, now - datetime.timedelta(days=40)),
-            _make_trade(20.0, now - datetime.timedelta(days=30)),
-            _make_trade(-10.0, now - datetime.timedelta(days=20), result="loss"),
-            _make_trade(20.0, now - datetime.timedelta(days=10)),
-            _make_trade(-10.0, now - datetime.timedelta(days=5), result="loss"),
+            _make_sensitivity_trade(20.0, now - datetime.timedelta(days=40)),
+            _make_sensitivity_trade(20.0, now - datetime.timedelta(days=30)),
+            _make_sensitivity_trade(-10.0, now - datetime.timedelta(days=20), result="loss"),
+            _make_sensitivity_trade(20.0, now - datetime.timedelta(days=10)),
+            _make_sensitivity_trade(-10.0, now - datetime.timedelta(days=5), result="loss"),
         ]
         result = _compute_sensitivity(trades, Decimal("1000"))
         expected_pf = _compute_pf_from_trades(trades)
@@ -7797,9 +7797,9 @@ class TestV728SensitivityAnalysis:
         now = datetime.datetime(2024, 6, 10)
         # Only the trade at day -20 is outside the 7-day window
         # The trades at day -5 and day -2 fall within 7 days of latest exit (day 0)
-        old_trade = _make_trade(10.0, now - datetime.timedelta(days=20))
-        recent_win = _make_trade(100.0, now - datetime.timedelta(days=5))
-        very_recent_loss = _make_trade(-50.0, now, result="loss", exit_reason="sl_hit")
+        old_trade = _make_sensitivity_trade(10.0, now - datetime.timedelta(days=20))
+        recent_win = _make_sensitivity_trade(100.0, now - datetime.timedelta(days=5))
+        very_recent_loss = _make_sensitivity_trade(-50.0, now, result="loss", exit_reason="sl_hit")
 
         result = _compute_sensitivity(
             [old_trade, recent_win, very_recent_loss], Decimal("1000")
@@ -7815,14 +7815,14 @@ class TestV728SensitivityAnalysis:
         base = datetime.datetime(2024, 6, 1)
         trades = [
             # Old trades: balanced (PF ≈ 1.0)
-            _make_trade(10.0, base - datetime.timedelta(days=60)),
-            _make_trade(-10.0, base - datetime.timedelta(days=55), result="loss"),
-            _make_trade(10.0, base - datetime.timedelta(days=50)),
-            _make_trade(-10.0, base - datetime.timedelta(days=45), result="loss"),
+            _make_sensitivity_trade(10.0, base - datetime.timedelta(days=60)),
+            _make_sensitivity_trade(-10.0, base - datetime.timedelta(days=55), result="loss"),
+            _make_sensitivity_trade(10.0, base - datetime.timedelta(days=50)),
+            _make_sensitivity_trade(-10.0, base - datetime.timedelta(days=45), result="loss"),
             # Recent trades (last 14 days): all wins, skew PF upward
-            _make_trade(30.0, base - datetime.timedelta(days=10)),
-            _make_trade(30.0, base - datetime.timedelta(days=5)),
-            _make_trade(30.0, base - datetime.timedelta(days=2)),
+            _make_sensitivity_trade(30.0, base - datetime.timedelta(days=10)),
+            _make_sensitivity_trade(30.0, base - datetime.timedelta(days=5)),
+            _make_sensitivity_trade(30.0, base - datetime.timedelta(days=2)),
         ]
         result = _compute_sensitivity(trades, Decimal("1000"))
         eod = result["end_of_data"]
@@ -7840,14 +7840,14 @@ class TestV728SensitivityAnalysis:
         base = datetime.datetime(2024, 6, 1)
         trades = [
             # Ancient trades: mostly wins → high PF baseline before recent
-            _make_trade(20.0, base - datetime.timedelta(days=60)),
-            _make_trade(20.0, base - datetime.timedelta(days=55)),
-            _make_trade(20.0, base - datetime.timedelta(days=50)),
-            _make_trade(-10.0, base - datetime.timedelta(days=45), result="loss"),
+            _make_sensitivity_trade(20.0, base - datetime.timedelta(days=60)),
+            _make_sensitivity_trade(20.0, base - datetime.timedelta(days=55)),
+            _make_sensitivity_trade(20.0, base - datetime.timedelta(days=50)),
+            _make_sensitivity_trade(-10.0, base - datetime.timedelta(days=45), result="loss"),
             # Last week: all big losses to create a large PF swing
-            _make_trade(-100.0, base - datetime.timedelta(days=3), result="loss"),
-            _make_trade(-100.0, base - datetime.timedelta(days=2), result="loss"),
-            _make_trade(-100.0, base - datetime.timedelta(days=1), result="loss"),
+            _make_sensitivity_trade(-100.0, base - datetime.timedelta(days=3), result="loss"),
+            _make_sensitivity_trade(-100.0, base - datetime.timedelta(days=2), result="loss"),
+            _make_sensitivity_trade(-100.0, base - datetime.timedelta(days=1), result="loss"),
         ]
         result = _compute_sensitivity(trades, Decimal("1000"))
         # Removing the last 7 days (big losses) should change PF by > 20%
@@ -7863,10 +7863,10 @@ class TestV728SensitivityAnalysis:
         for i in range(30):
             day_offset = 60 - i * 2
             if i % 2 == 0:
-                trades.append(_make_trade(10.0, base - datetime.timedelta(days=day_offset)))
+                trades.append(_make_sensitivity_trade(10.0, base - datetime.timedelta(days=day_offset)))
             else:
                 trades.append(
-                    _make_trade(-5.0, base - datetime.timedelta(days=day_offset), result="loss")
+                    _make_sensitivity_trade(-5.0, base - datetime.timedelta(days=day_offset), result="loss")
                 )
         result = _compute_sensitivity(trades, Decimal("1000"))
         # With uniform distribution the PF across all windows should stay stable
@@ -7878,9 +7878,9 @@ class TestV728SensitivityAnalysis:
 
         now = datetime.datetime(2024, 6, 1)
         trades = [
-            _make_trade(10.0, now - datetime.timedelta(days=25)),
-            _make_trade(-5.0, now - datetime.timedelta(days=20), result="loss"),
-            _make_trade(10.0, now - datetime.timedelta(days=10)),
+            _make_sensitivity_trade(10.0, now - datetime.timedelta(days=25)),
+            _make_sensitivity_trade(-5.0, now - datetime.timedelta(days=20), result="loss"),
+            _make_sensitivity_trade(10.0, now - datetime.timedelta(days=10)),
         ]
         result = _compute_sensitivity(trades, Decimal("1000"))
         assert result["end_of_data"]["excl_30d_pf"] is None
@@ -7893,8 +7893,8 @@ class TestV728SensitivityAnalysis:
 
         now = datetime.datetime(2024, 6, 1)
         trades = [
-            _make_trade(10.0, now - datetime.timedelta(days=5)),
-            _make_trade(-5.0, now - datetime.timedelta(days=3), result="loss"),
+            _make_sensitivity_trade(10.0, now - datetime.timedelta(days=5)),
+            _make_sensitivity_trade(-5.0, now - datetime.timedelta(days=3), result="loss"),
         ]
         slip = _compute_sensitivity(trades, Decimal("1000"))["slippage"]
         assert slip["pf_0x"] >= slip["pf_1x"]
@@ -7905,9 +7905,9 @@ class TestV728SensitivityAnalysis:
 
         now = datetime.datetime(2024, 6, 1)
         trades = [
-            _make_trade(20.0, now - datetime.timedelta(days=10)),
-            _make_trade(20.0, now - datetime.timedelta(days=8)),
-            _make_trade(-10.0, now - datetime.timedelta(days=5), result="loss"),
+            _make_sensitivity_trade(20.0, now - datetime.timedelta(days=10)),
+            _make_sensitivity_trade(20.0, now - datetime.timedelta(days=8)),
+            _make_sensitivity_trade(-10.0, now - datetime.timedelta(days=5), result="loss"),
         ]
         slip = _compute_sensitivity(trades, Decimal("1000"))["slippage"]
         assert slip["pf_1x"] >= slip["pf_2x"]
@@ -7928,8 +7928,8 @@ class TestV728SensitivityAnalysis:
 
         now = datetime.datetime(2024, 6, 1)
         trades = [
-            _make_trade(100.0, now - datetime.timedelta(days=10)),
-            _make_trade(-99.5, now - datetime.timedelta(days=5), result="loss"),
+            _make_sensitivity_trade(100.0, now - datetime.timedelta(days=10)),
+            _make_sensitivity_trade(-99.5, now - datetime.timedelta(days=5), result="loss"),
         ]
         # Sanity-check: 2x slippage should make PF drop below 1.0
         real_trades = [t for t in trades if t.exit_reason != "end_of_data"]
@@ -7947,10 +7947,10 @@ class TestV728SensitivityAnalysis:
         now = datetime.datetime(2024, 6, 1)
         # Strong strategy: wins are 3x the losses
         trades = [
-            _make_trade(30.0, now - datetime.timedelta(days=10)),
-            _make_trade(30.0, now - datetime.timedelta(days=8)),
-            _make_trade(30.0, now - datetime.timedelta(days=6)),
-            _make_trade(-10.0, now - datetime.timedelta(days=4), result="loss"),
+            _make_sensitivity_trade(30.0, now - datetime.timedelta(days=10)),
+            _make_sensitivity_trade(30.0, now - datetime.timedelta(days=8)),
+            _make_sensitivity_trade(30.0, now - datetime.timedelta(days=6)),
+            _make_sensitivity_trade(-10.0, now - datetime.timedelta(days=4), result="loss"),
         ]
         result = _compute_sensitivity(trades, Decimal("1000"))
         assert result["slippage"]["fragile"] is False
@@ -7965,8 +7965,8 @@ class TestV728SensitivityAnalysis:
 
         now = datetime.datetime(2024, 6, 1)
         trades = [
-            _make_trade(100.0, now - datetime.timedelta(days=10)),
-            _make_trade(-99.5, now - datetime.timedelta(days=5), result="loss"),
+            _make_sensitivity_trade(100.0, now - datetime.timedelta(days=10)),
+            _make_sensitivity_trade(-99.5, now - datetime.timedelta(days=5), result="loss"),
         ]
         result = _compute_sensitivity(trades, Decimal("1000"))
         assert result["slippage"]["breakeven_at"] == 2
@@ -7978,9 +7978,9 @@ class TestV728SensitivityAnalysis:
         now = datetime.datetime(2024, 6, 1)
         # Very strong strategy
         trades = [
-            _make_trade(100.0, now - datetime.timedelta(days=10)),
-            _make_trade(100.0, now - datetime.timedelta(days=8)),
-            _make_trade(-10.0, now - datetime.timedelta(days=4), result="loss"),
+            _make_sensitivity_trade(100.0, now - datetime.timedelta(days=10)),
+            _make_sensitivity_trade(100.0, now - datetime.timedelta(days=8)),
+            _make_sensitivity_trade(-10.0, now - datetime.timedelta(days=4), result="loss"),
         ]
         result = _compute_sensitivity(trades, Decimal("1000"))
         assert result["slippage"]["breakeven_at"] is None
@@ -7992,8 +7992,8 @@ class TestV728SensitivityAnalysis:
         now = datetime.datetime(2024, 6, 1)
         # Clear losing strategy
         trades = [
-            _make_trade(5.0, now - datetime.timedelta(days=10)),
-            _make_trade(-50.0, now - datetime.timedelta(days=5), result="loss"),
+            _make_sensitivity_trade(5.0, now - datetime.timedelta(days=10)),
+            _make_sensitivity_trade(-50.0, now - datetime.timedelta(days=5), result="loss"),
         ]
         result = _compute_sensitivity(trades, Decimal("1000"))
         assert result["slippage"]["breakeven_at"] == 0
@@ -8006,9 +8006,9 @@ class TestV728SensitivityAnalysis:
 
         now = datetime.datetime(2024, 6, 1)
         trades = [
-            _make_trade(10.0, now - datetime.timedelta(days=10)),
-            _make_trade(20.0, now - datetime.timedelta(days=5)),
-            _make_trade(15.0, now - datetime.timedelta(days=2)),
+            _make_sensitivity_trade(10.0, now - datetime.timedelta(days=10)),
+            _make_sensitivity_trade(20.0, now - datetime.timedelta(days=5)),
+            _make_sensitivity_trade(15.0, now - datetime.timedelta(days=2)),
         ]
         result = _compute_sensitivity(trades, Decimal("1000"))
         # All-wins: gross_loss = 0 at all slippage levels near baseline
@@ -8023,9 +8023,9 @@ class TestV728SensitivityAnalysis:
         from src.backtesting.backtest_engine import _compute_sensitivity
 
         now = datetime.datetime(2024, 6, 1)
-        real_win = _make_trade(20.0, now - datetime.timedelta(days=10))
-        real_loss = _make_trade(-10.0, now - datetime.timedelta(days=5), result="loss")
-        eod_trade = _make_trade(
+        real_win = _make_sensitivity_trade(20.0, now - datetime.timedelta(days=10))
+        real_loss = _make_sensitivity_trade(-10.0, now - datetime.timedelta(days=5), result="loss")
+        eod_trade = _make_sensitivity_trade(
             -999.0, now - datetime.timedelta(days=1), result="loss",
             exit_reason="end_of_data",
         )
