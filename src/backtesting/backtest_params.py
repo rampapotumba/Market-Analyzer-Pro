@@ -41,6 +41,12 @@ class BacktestParams(BaseModel):
     in_sample_months: int = 18
     out_of_sample_months: int = 6
 
+    # TASK-V7-18: Isolation mode — run each symbol independently with no shared state.
+    # When True: correlation guard is skipped, each symbol gets full capital allocation,
+    # position cooldowns are per-symbol only (already the default).
+    # Summary includes per-instrument isolated results and path-dependence flags.
+    isolation_mode: bool = False
+
     @field_validator("timeframe")
     @classmethod
     def normalize_timeframe(cls, v: str) -> str:
@@ -114,3 +120,5 @@ class BacktestResult(BaseModel):
     error: Optional[str] = None
     # V6 TASK-V6-13: Walk-forward validation results
     walk_forward: Optional[dict[str, Any]] = None
+    # TASK-V7-18: Isolation mode per-instrument results
+    isolation_results: Optional[dict[str, Any]] = None
