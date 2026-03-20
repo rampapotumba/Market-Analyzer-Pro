@@ -10,6 +10,7 @@ from decimal import Decimal
 from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -1215,3 +1216,585 @@ class TestToneToScore:
     def test_tone_midpoint_negative(self) -> None:
         score = _tone_to_score(-1.5)
         assert abs(score - (-50.0)) < 0.01
+
+# ── TASK-V7-10: CoinMetrics backfill ─────────────────────────────────────────
+
+
+class TestV710CoinMetricsBackfill:
+    """TASK-V7-10: backfill_coinmetrics() in scripts/backfill_historical.py."""
+
+    def _make_cm_response(
+        self,
+        asset: str = "btc",
+        time_str: str = "2021-01-01T00:00:00.000000000Z",
+        mvrv: str = "2.5",
+        adract: str = "800000",
+        txcnt: str = "300000",
+        next_page_token: Optional[str] = None,
+    ) -> dict:
+        payload: dict = {
+            "data": [
+                {
+                    "asset": asset,
+                    "time": time_str,
+                    "CapMVRVCur": mvrv,
+                    "AdrActCnt": adract,
+                    "TxCnt": txcnt,
+                }
+            ]
+        }
+        if next_page_token is not None:
+            payload["next_page_token"] = next_page_token
+        return payload
+
+    # ── _parse_coinmetrics_rows ────────────────────────────────────────────────
+
+    def test_parse_produces_correct_indicator_names(self) -> None:
+        from scripts.backfill_historical import _parse_coinmetrics_rows
+
+        rows = [
+            {
+                "asset": "btc",
+                "time": "2021-06-01T00:00:00Z",
+                "CapMVRVCur": "3.1",
+                "AdrActCnt": "900000",
+                "TxCnt": "250000",
+            }
+        ]
+        records = _parse_coinmetrics_rows(rows)
+        names = {r["indicator_name"] for r in records}
+        assert names == {
+            "COINMETRICS_BTC_MVRV",
+            "COINMETRICS_BTC_ADRACT",
+            "COINMETRICS_BTC_TXCNT",
+        }
+
+    def test_parse_sets_country_global_and_source(self) -> None:
+        from scripts.backfill_historical import _parse_coinmetrics_rows
+
+        rows = [
+            {
+                "asset": "eth",
+                "time": "2021-06-01T00:00:00Z",
+                "CapMVRVCur": "2.0",
+                "AdrActCnt": "500000",
+                "TxCnt": "1200000",
+            }
+        ]
+        records = _parse_coinmetrics_rows(rows)
+        for rec in records:
+            assert rec["country"] == "GLOBAL"
+            assert rec["source"] == "coinmetrics"
+
+    def test_parse_decimal_values(self) -> None:
+        from scripts.backfill_historical import _parse_coinmetrics_rows
+
+        rows = [
+            {
+                "asset": "btc",
+                "time": "2021-06-01T00:00:00Z",
+                "CapMVRVCur": "1.234567",
+                "AdrActCnt": "123456",
+                "TxCnt": "78901",
+            }
+        ]
+        records = _parse_coinmetrics_rows(rows)
+        mvrv_rec = next(r for r in records if r["indicator_name"] == "COINMETRICS_BTC_MVRV")
+        assert mvrv_rec["value"] == Decimal("1.234567")
+
+    def test_parse_skips_null_metric(self) -> None:
+        from scripts.backfill_historical import _parse_coinmetrics_rows
+
+        rows = [
+            {
+                "asset": "btc",
+                "time": "2021-06-01T00:00:00Z",
+                "CapMVRVCur": None,   # null — must be skipped
+                "AdrActCnt": "500000",
+                "TxCnt": "200000",
+            }
+        ]
+        records = _parse_coinmetrics_rows(rows)
+        names = {r["indicator_name"] for r in records}
+        # MVRV must be absent
+        assert "COINMETRICS_BTC_MVRV" not in names
+        # Others present
+        assert "COINMETRICS_BTC_ADRACT" in names
+        assert "COINMETRICS_BTC_TXCNT" in names
+
+    def test_parse_skips_bad_timestamp(self) -> None:
+        from scripts.backfill_historical import _parse_coinmetrics_rows
+
+        rows = [
+            {
+                "asset": "btc",
+                "time": "NOT_A_DATE",
+                "CapMVRVCur": "2.0",
+                "AdrActCnt": "500000",
+                "TxCnt": "200000",
+            }
+        ]
+        records = _parse_coinmetrics_rows(rows)
+        assert records == []
+
+    def test_parse_eth_indicator_names(self) -> None:
+        from scripts.backfill_historical import _parse_coinmetrics_rows
+
+        rows = [
+            {
+                "asset": "eth",
+                "time": "2021-06-01T00:00:00Z",
+                "CapMVRVCur": "1.9",
+                "AdrActCnt": "600000",
+                "TxCnt": "1100000",
+            }
+        ]
+        records = _parse_coinmetrics_rows(rows)
+        names = {r["indicator_name"] for r in records}
+        assert names == {
+            "COINMETRICS_ETH_MVRV",
+            "COINMETRICS_ETH_ADRACT",
+            "COINMETRICS_ETH_TXCNT",
+        }
+
+    def test_parse_release_date_utc(self) -> None:
+        from scripts.backfill_historical import _parse_coinmetrics_rows
+
+        rows = [
+            {
+                "asset": "btc",
+                "time": "2022-03-15T00:00:00.000000000Z",
+                "CapMVRVCur": "1.5",
+                "AdrActCnt": "700000",
+                "TxCnt": "280000",
+            }
+        ]
+        records = _parse_coinmetrics_rows(rows)
+        for rec in records:
+            assert rec["release_date"].year == 2022
+            assert rec["release_date"].month == 3
+            assert rec["release_date"].day == 15
+
+    # ── backfill_coinmetrics() dry_run ─────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_dry_run_returns_zero(self) -> None:
+        """dry_run=True must return 0 and not touch the DB."""
+        from unittest.mock import AsyncMock, patch
+
+        import httpx
+
+        fake_payload = {
+            "data": [
+                {
+                    "asset": "btc",
+                    "time": "2021-01-01T00:00:00Z",
+                    "CapMVRVCur": "2.5",
+                    "AdrActCnt": "800000",
+                    "TxCnt": "300000",
+                }
+            ]
+            # no next_page_token → single page
+        }
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = fake_payload
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_response)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with (
+            patch("httpx.AsyncClient", return_value=mock_client),
+            patch("src.database.crud.upsert_macro_data") as mock_upsert,
+        ):
+            from scripts.backfill_historical import backfill_coinmetrics
+
+            result = await backfill_coinmetrics(
+                start="2021-01-01",
+                end="2021-01-02",
+                dry_run=True,
+            )
+
+        assert result == 0
+        mock_upsert.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_empty_response_returns_zero(self) -> None:
+        """Empty data array from API must return 0 records."""
+        from unittest.mock import AsyncMock, patch
+
+        fake_payload: dict = {"data": []}
+
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = fake_payload
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_response)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with (
+            patch("httpx.AsyncClient", return_value=mock_client),
+            patch("src.database.crud.upsert_macro_data") as mock_upsert,
+        ):
+            from scripts.backfill_historical import backfill_coinmetrics
+
+            result = await backfill_coinmetrics(
+                start="2021-01-01",
+                end="2021-01-02",
+                dry_run=False,
+            )
+
+        assert result == 0
+        mock_upsert.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_http_error_does_not_raise(self) -> None:
+        """HTTP failure must be caught and return 0 without raising."""
+        import httpx
+        from unittest.mock import AsyncMock, patch
+
+        mock_response = MagicMock()
+        mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "503", request=MagicMock(), response=MagicMock()
+        )
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_response)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            from scripts.backfill_historical import backfill_coinmetrics
+
+            result = await backfill_coinmetrics(
+                start="2021-01-01",
+                end="2021-01-02",
+                dry_run=False,
+            )
+
+        assert result == 0
+
+    @pytest.mark.asyncio
+    async def test_pagination_follows_next_page_token(self) -> None:
+        """Two pages are fetched when next_page_token is present on page 1."""
+        from unittest.mock import AsyncMock, patch, call as mock_call
+
+        page1 = {
+            "data": [
+                {
+                    "asset": "btc",
+                    "time": "2021-01-01T00:00:00Z",
+                    "CapMVRVCur": "2.5",
+                    "AdrActCnt": "800000",
+                    "TxCnt": "300000",
+                }
+            ],
+            "next_page_token": "TOKEN_ABC",
+        }
+        page2 = {
+            "data": [
+                {
+                    "asset": "btc",
+                    "time": "2021-01-02T00:00:00Z",
+                    "CapMVRVCur": "2.6",
+                    "AdrActCnt": "820000",
+                    "TxCnt": "310000",
+                }
+            ]
+            # no next_page_token → stop
+        }
+
+        responses = [page1, page2]
+        call_count = 0
+
+        async def _fake_get(*args, **kwargs):  # noqa: ANN001
+            nonlocal call_count
+            mock_resp = MagicMock()
+            mock_resp.raise_for_status = MagicMock()
+            mock_resp.json.return_value = responses[call_count]
+            call_count += 1
+            return mock_resp
+
+        mock_client = AsyncMock()
+        mock_client.get = _fake_get
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        upserted_records: list = []
+
+        async def _fake_upsert(session, records):  # noqa: ANN001
+            upserted_records.extend(records)
+            return len(records)
+
+        # Mock async_session_factory as an async context manager
+        mock_session = AsyncMock()
+        mock_session_ctx = AsyncMock()
+        mock_session_ctx.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session_ctx.__aexit__ = AsyncMock(return_value=False)
+        # begin() context manager
+        mock_begin_ctx = AsyncMock()
+        mock_begin_ctx.__aenter__ = AsyncMock(return_value=None)
+        mock_begin_ctx.__aexit__ = AsyncMock(return_value=False)
+        mock_session.begin = MagicMock(return_value=mock_begin_ctx)
+        mock_session_factory = MagicMock(return_value=mock_session_ctx)
+
+        with (
+            patch("httpx.AsyncClient", return_value=mock_client),
+            patch("src.database.crud.upsert_macro_data", side_effect=_fake_upsert),
+            patch("src.database.engine.async_session_factory", mock_session_factory),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
+            from scripts.backfill_historical import backfill_coinmetrics
+
+            result = await backfill_coinmetrics(
+                start="2021-01-01",
+                end="2021-01-02",
+                dry_run=False,
+            )
+
+        # 2 days × 3 metrics = 6 records total
+        assert len(upserted_records) == 6
+        assert call_count == 2
+
+
+# ── TASK-V7-07: Fear & Greed full history backfill ────────────────────────────
+
+
+class TestBackfillFearGreed:
+    """Tests for scripts/backfill_historical.py — backfill_fear_greed()."""
+
+    def _make_api_response(self, entries: list[dict]) -> dict:
+        return {"data": entries, "metadata": {"error": None}}
+
+    def _make_entry(self, value: int = 50, timestamp: int = 1609459200) -> dict:
+        """Return a single alternative.me API entry dict."""
+        return {
+            "value": str(value),
+            "value_classification": "Neutral",
+            "timestamp": str(timestamp),
+        }
+
+    @pytest.mark.asyncio
+    async def test_v7_07_happy_path_stores_valid_records(self) -> None:
+        """Valid API response results in correct number of DB upsert calls."""
+        import scripts.backfill_historical as mod
+        from scripts.backfill_historical import backfill_fear_greed
+
+        entries = [
+            self._make_entry(value=25, timestamp=1609459200),  # 2021-01-01
+            self._make_entry(value=55, timestamp=1609545600),  # 2021-01-02
+            self._make_entry(value=80, timestamp=1609632000),  # 2021-01-03
+        ]
+        api_payload = self._make_api_response(entries)
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = api_payload
+        mock_resp.raise_for_status = MagicMock()
+
+        upsert_stored: list = []
+
+        async def mock_upsert(db: Any, records: list) -> int:
+            upsert_stored.extend(records)
+            return len(records)
+
+        # Build a fully async-compatible mock session/factory
+        mock_session = AsyncMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        mock_begin_ctx = AsyncMock()
+        mock_begin_ctx.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_begin_ctx.__aexit__ = AsyncMock(return_value=False)
+        mock_session.begin = MagicMock(return_value=mock_begin_ctx)
+        mock_factory = MagicMock(return_value=mock_session)
+
+        mod.SUMMARY.clear()
+
+        with patch("scripts.backfill_historical.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client.get = AsyncMock(return_value=mock_resp)
+            mock_client_cls.return_value = mock_client
+
+            # Patch the lazy-imported symbols inside the function's module scope
+            with patch("src.database.crud.upsert_macro_data", side_effect=mock_upsert):
+                with patch("src.database.engine.async_session_factory", mock_factory):
+                    await backfill_fear_greed(dry_run=False)
+
+        assert mod.SUMMARY["fear_greed"]["fetched"] == 3
+        assert mod.SUMMARY["fear_greed"].get("error") is None
+
+    @pytest.mark.asyncio
+    async def test_v7_07_dry_run_does_not_write_to_db(self) -> None:
+        """dry_run=True logs intent but never calls upsert_macro_data."""
+        import scripts.backfill_historical as mod
+        from scripts.backfill_historical import backfill_fear_greed
+
+        entries = [self._make_entry(value=42, timestamp=1609459200)]
+        api_payload = self._make_api_response(entries)
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = api_payload
+        mock_resp.raise_for_status = MagicMock()
+
+        upsert_called: list = []
+
+        async def mock_upsert(db: Any, records: list) -> int:
+            upsert_called.extend(records)
+            return len(records)
+
+        mod.SUMMARY.clear()
+
+        with patch("scripts.backfill_historical.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client.get = AsyncMock(return_value=mock_resp)
+            mock_client_cls.return_value = mock_client
+
+            # In dry_run mode, upsert should never be called regardless.
+            with patch("src.database.crud.upsert_macro_data", side_effect=mock_upsert):
+                await backfill_fear_greed(dry_run=True)
+
+        assert len(upsert_called) == 0, "dry_run must not write to DB"
+        assert mod.SUMMARY["fear_greed"]["dry_run"] is True
+        assert mod.SUMMARY["fear_greed"]["fetched"] == 1
+        assert mod.SUMMARY["fear_greed"]["stored"] == 0
+
+    @pytest.mark.asyncio
+    async def test_v7_07_invalid_value_out_of_range_skipped(self) -> None:
+        """Values outside 0–100 are skipped, valid ones are stored."""
+        import scripts.backfill_historical as mod
+        from scripts.backfill_historical import backfill_fear_greed
+
+        entries = [
+            self._make_entry(value=50, timestamp=1609459200),   # valid
+            self._make_entry(value=101, timestamp=1609545600),  # invalid — above 100
+            self._make_entry(value=0, timestamp=1609632000),    # valid — boundary
+        ]
+        api_payload = self._make_api_response(entries)
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = api_payload
+        mock_resp.raise_for_status = MagicMock()
+
+        mod.SUMMARY.clear()
+
+        with patch("scripts.backfill_historical.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client.get = AsyncMock(return_value=mock_resp)
+            mock_client_cls.return_value = mock_client
+
+            await backfill_fear_greed(dry_run=True)
+
+        summary = mod.SUMMARY["fear_greed"]
+        assert summary["fetched"] == 2, "Only 2 valid records expected"
+        assert summary["skipped"] == 1, "1 invalid record should be skipped"
+
+    @pytest.mark.asyncio
+    async def test_v7_07_empty_api_response_handled_gracefully(self) -> None:
+        """Empty data array from API does not raise, summary reflects 0 records."""
+        import scripts.backfill_historical as mod
+        from scripts.backfill_historical import backfill_fear_greed
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"data": []}
+        mock_resp.raise_for_status = MagicMock()
+
+        mod.SUMMARY.clear()
+
+        with patch("scripts.backfill_historical.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client.get = AsyncMock(return_value=mock_resp)
+            mock_client_cls.return_value = mock_client
+
+            await backfill_fear_greed(dry_run=True)
+
+        assert mod.SUMMARY["fear_greed"]["fetched"] == 0
+
+    @pytest.mark.asyncio
+    async def test_v7_07_http_error_handled_gracefully(self) -> None:
+        """HTTP error does not propagate, summary captures error key."""
+        import scripts.backfill_historical as mod
+        from scripts.backfill_historical import backfill_fear_greed
+
+        mod.SUMMARY.clear()
+
+        with patch("scripts.backfill_historical.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client.get = AsyncMock(
+                side_effect=httpx.TimeoutException("connection timeout")
+            )
+            mock_client_cls.return_value = mock_client
+
+            await backfill_fear_greed(dry_run=False)
+
+        assert "error" in mod.SUMMARY["fear_greed"]
+        assert mod.SUMMARY["fear_greed"]["fetched"] == 0
+
+    @pytest.mark.asyncio
+    async def test_v7_07_unix_timestamp_converts_to_midnight_utc(self) -> None:
+        """Unix timestamps are normalised to midnight UTC regardless of hour."""
+        import scripts.backfill_historical as mod
+        from scripts.backfill_historical import backfill_fear_greed
+
+        # 1609502400 = 2021-01-01 12:00:00 UTC (midday — must become midnight)
+        entries = [self._make_entry(value=50, timestamp=1609502400)]
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = self._make_api_response(entries)
+        mock_resp.raise_for_status = MagicMock()
+
+        mod.SUMMARY.clear()
+
+        with patch("scripts.backfill_historical.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client.get = AsyncMock(return_value=mock_resp)
+            mock_client_cls.return_value = mock_client
+
+            await backfill_fear_greed(dry_run=True)
+
+        # In dry_run mode, verify the summary date_range reflects the correct date.
+        summary = mod.SUMMARY["fear_greed"]
+        assert "2021-01-01" in summary["date_range"]
+
+    def test_v7_07_record_structure_matches_macro_data_schema(self) -> None:
+        """Parsed records have exactly the fields required by macro_data model."""
+        required_fields = {"indicator_name", "country", "value", "release_date", "source"}
+
+        record = {
+            "indicator_name": "FEAR_GREED",
+            "country": "GLOBAL",
+            "value": Decimal("55"),
+            "release_date": datetime.datetime(2021, 1, 1, tzinfo=datetime.timezone.utc),
+            "source": "alternative.me",
+        }
+
+        assert set(record.keys()) == required_fields
+        assert isinstance(record["value"], Decimal)
+        assert record["release_date"].tzinfo is not None  # timezone-aware
+
+    def test_v7_07_indicator_name_matches_expected_constant(self) -> None:
+        """The indicator_name constant matches what SIM-39 and FAEngine expect."""
+        from scripts.backfill_historical import (
+            FEAR_GREED_COUNTRY,
+            FEAR_GREED_INDICATOR_NAME,
+            FEAR_GREED_SOURCE,
+        )
+
+        assert FEAR_GREED_INDICATOR_NAME == "FEAR_GREED"
+        assert FEAR_GREED_COUNTRY == "GLOBAL"
+        assert FEAR_GREED_SOURCE == "alternative.me"

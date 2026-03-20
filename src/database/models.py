@@ -13,6 +13,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    JSON,
     Numeric,
     String,
     Text,
@@ -561,6 +562,31 @@ class BacktestTrade(Base):
 
     __table_args__ = (
         Index("ix_backtest_trades_run_id", "run_id"),
+    )
+
+
+# ── Geopolitical events (ACLED / GDELT) ──────────────────────────────────────
+
+
+class GeoEvent(Base):
+    __tablename__ = "geo_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(20), nullable=False)   # 'ACLED', 'GDELT'
+    event_date: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    country: Mapped[str] = mapped_column(String(100), nullable=False)
+    event_type: Mapped[Optional[str]] = mapped_column(String(100))
+    fatalities: Mapped[int] = mapped_column(Integer, default=0)
+    severity_score: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 2))
+    raw_data: Mapped[Optional[dict]] = mapped_column(JSON)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_geo_events_country_date", "country", "event_date"),
     )
 
 

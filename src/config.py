@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     GLASSNODE_API_KEY: str = ""       # Deprecated — Glassnode went fully paid
     NEWS_API_KEY: str = ""
 
+    # ── ACLED geopolitical event data ────────────────────
+    ACLED_API_KEY: str = ""
+    ACLED_EMAIL: str = ""
+
     # ── API Keys (optional) ───────────────────────────────
     ANTHROPIC_API_KEY: str = ""
     LLM_VALIDATION_ENABLED: bool = True
