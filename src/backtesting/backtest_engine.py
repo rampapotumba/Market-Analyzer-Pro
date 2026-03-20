@@ -784,6 +784,39 @@ def _compute_summary(
         if mae_pct_values_losers else 0.0
     )
 
+    # TASK-V7-14: Sample size adequacy — binomial CI for win rate using
+    # normal approximation (Wald interval): p ± z * sqrt(p*(1-p)/n)
+    # z=1.96 for 95% CI. CI is clamped to [0, 100].
+    _ADEQUACY_Z95 = 1.96
+    _SAMPLE_SUFFICIENT = 100
+    _SAMPLE_MARGINAL = 50
+    _n_sample = metric_total  # excludes end_of_data trades
+    if _n_sample == 0:
+        _wr_ci_low = 0.0
+        _wr_ci_high = 0.0
+    else:
+        _p = win_rate / 100.0
+        _margin = _ADEQUACY_Z95 * math.sqrt(_p * (1 - _p) / _n_sample)
+        _wr_ci_low = max(0.0, (_p - _margin) * 100.0)
+        _wr_ci_high = min(100.0, (_p + _margin) * 100.0)
+
+    if _n_sample >= _SAMPLE_SUFFICIENT:
+        _adequacy_verdict = "SUFFICIENT"
+    elif _n_sample >= _SAMPLE_MARGINAL:
+        _adequacy_verdict = "MARGINAL"
+    else:
+        _adequacy_verdict = "INSUFFICIENT"
+
+    sample_adequacy = {
+        "n": _n_sample,
+        "verdict": _adequacy_verdict,
+        "min_recommended": _SAMPLE_SUFFICIENT,
+        "win_rate_ci_95": {
+            "low": round(_wr_ci_low, 2),
+            "high": round(_wr_ci_high, 2),
+        },
+    }
+
     # V6 TASK-V6-01: data_hash — deterministic fingerprint of the trade set
     _trade_dicts_for_hash = [
         {
@@ -852,6 +885,8 @@ def _compute_summary(
         "concentration_warning": concentration_warning,
         # CAL3-06: F&G and funding rate adjustment breakdown
         "by_adjustment": by_adjustment,
+        # TASK-V7-14: sample size adequacy assessment with 95% CI for win rate
+        "sample_adequacy": sample_adequacy,
     }
 
     # V6 TASK-V6-10: merge filter diagnostics into summary if provided

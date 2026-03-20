@@ -2668,3 +2668,191 @@ class TestV713StatisticalTests:
         summary = _compute_summary(trades, Decimal("1000"))
         st = summary["statistical_tests"]
         assert st["verdict"] == "INSUFFICIENT_DATA"
+
+
+# ── TASK-V7-14: Sample size adequacy check ────────────────────────────────────
+
+
+class TestV714SampleAdequacy:
+    """TASK-V7-14: sample_adequacy section in _compute_summary()."""
+
+    def _make_trade(
+        self,
+        result: str = "win",
+        exit_reason: str = "tp_hit",
+        pnl_usd: str = "10.00",
+    ) -> MagicMock:
+        t = MagicMock()
+        t.symbol = "EURUSD=X"
+        t.direction = "LONG"
+        t.entry_price = Decimal("1.1000")
+        t.exit_price = Decimal("1.1100")
+        t.pnl_usd = Decimal(pnl_usd)
+        t.result = result
+        t.exit_reason = exit_reason
+        t.pnl_pips = Decimal("100.0000")
+        t.composite_score = Decimal("12.0")
+        t.entry_at = datetime.datetime(2024, 1, 15, 10, 0, tzinfo=datetime.timezone.utc)
+        t.exit_at = datetime.datetime(2024, 1, 16, 10, 0, tzinfo=datetime.timezone.utc)
+        t.duration_minutes = 1440
+        t.mfe = Decimal("0.0100")
+        t.mae = Decimal("0.0020")
+        t.regime = "TREND_BULL"
+        t.timeframe = "H1"
+        return t
+
+    def _make_trades(self, n_wins: int, n_losses: int) -> list:
+        trades = []
+        for _ in range(n_wins):
+            trades.append(self._make_trade(result="win", exit_reason="tp_hit", pnl_usd="10.00"))
+        for _ in range(n_losses):
+            trades.append(self._make_trade(result="loss", exit_reason="sl_hit", pnl_usd="-8.00"))
+        return trades
+
+    def test_v7_14_key_present_in_summary(self) -> None:
+        """sample_adequacy key must be present in _compute_summary() output."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trades = self._make_trades(10, 5)
+        summary = _compute_summary(trades, Decimal("1000"))
+
+        assert "sample_adequacy" in summary
+
+    def test_v7_14_zero_trades(self) -> None:
+        """With 0 trades: n=0, verdict=INSUFFICIENT, CI is [0, 0]."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        summary = _compute_summary([], Decimal("1000"))
+        sa = summary["sample_adequacy"]
+
+        assert sa["n"] == 0
+        assert sa["verdict"] == "INSUFFICIENT"
+        assert sa["min_recommended"] == 100
+        assert sa["win_rate_ci_95"]["low"] == 0.0
+        assert sa["win_rate_ci_95"]["high"] == 0.0
+
+    def test_v7_14_insufficient_below_50(self) -> None:
+        """With 33 trades (< 50): verdict must be INSUFFICIENT."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trades = self._make_trades(20, 13)
+        summary = _compute_summary(trades, Decimal("1000"))
+        sa = summary["sample_adequacy"]
+
+        assert sa["n"] == 33
+        assert sa["verdict"] == "INSUFFICIENT"
+        assert sa["min_recommended"] == 100
+
+    def test_v7_14_marginal_50_to_99(self) -> None:
+        """With 75 trades (50 <= n < 100): verdict must be MARGINAL."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trades = self._make_trades(45, 30)
+        summary = _compute_summary(trades, Decimal("1000"))
+        sa = summary["sample_adequacy"]
+
+        assert sa["n"] == 75
+        assert sa["verdict"] == "MARGINAL"
+
+    def test_v7_14_marginal_exactly_50(self) -> None:
+        """Exactly 50 trades is MARGINAL (lower boundary)."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trades = self._make_trades(30, 20)
+        summary = _compute_summary(trades, Decimal("1000"))
+        sa = summary["sample_adequacy"]
+
+        assert sa["n"] == 50
+        assert sa["verdict"] == "MARGINAL"
+
+    def test_v7_14_sufficient_100_plus(self) -> None:
+        """With 120 trades (>= 100): verdict must be SUFFICIENT."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trades = self._make_trades(70, 50)
+        summary = _compute_summary(trades, Decimal("1000"))
+        sa = summary["sample_adequacy"]
+
+        assert sa["n"] == 120
+        assert sa["verdict"] == "SUFFICIENT"
+
+    def test_v7_14_sufficient_exactly_100(self) -> None:
+        """Exactly 100 trades is SUFFICIENT (lower boundary)."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trades = self._make_trades(60, 40)
+        summary = _compute_summary(trades, Decimal("1000"))
+        sa = summary["sample_adequacy"]
+
+        assert sa["n"] == 100
+        assert sa["verdict"] == "SUFFICIENT"
+
+    def test_v7_14_win_rate_ci_within_0_100(self) -> None:
+        """Win rate CI bounds must always be within [0, 100]."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        # Test with extreme win rates (0% and 100%) on small samples
+        all_wins = self._make_trades(10, 0)
+        summary_wins = _compute_summary(all_wins, Decimal("1000"))
+        ci_wins = summary_wins["sample_adequacy"]["win_rate_ci_95"]
+        assert ci_wins["low"] >= 0.0
+        assert ci_wins["high"] <= 100.0
+
+        all_losses = self._make_trades(0, 10)
+        summary_losses = _compute_summary(all_losses, Decimal("1000"))
+        ci_losses = summary_losses["sample_adequacy"]["win_rate_ci_95"]
+        assert ci_losses["low"] >= 0.0
+        assert ci_losses["high"] <= 100.0
+
+    def test_v7_14_ci_low_less_than_high(self) -> None:
+        """CI low must be <= CI high for any non-trivial sample."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trades = self._make_trades(30, 20)
+        summary = _compute_summary(trades, Decimal("1000"))
+        ci = summary["sample_adequacy"]["win_rate_ci_95"]
+
+        assert ci["low"] <= ci["high"]
+
+    def test_v7_14_end_of_data_excluded_from_n(self) -> None:
+        """end_of_data trades are excluded from n (they are not counted in metric_total)."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        real_trades = self._make_trades(20, 10)
+        eod_trades = [
+            self._make_trade(result="loss", exit_reason="end_of_data", pnl_usd="-5.00")
+            for _ in range(15)
+        ]
+        all_trades = real_trades + eod_trades
+        summary = _compute_summary(all_trades, Decimal("1000"))
+        sa = summary["sample_adequacy"]
+
+        # n must equal only real (non-end_of_data) trades
+        assert sa["n"] == 30
+
+    def test_v7_14_ci_centered_on_win_rate(self) -> None:
+        """CI midpoint should be close to the observed win rate."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trades = self._make_trades(60, 40)  # 60% WR
+        summary = _compute_summary(trades, Decimal("1000"))
+        sa = summary["sample_adequacy"]
+        ci = sa["win_rate_ci_95"]
+
+        midpoint = (ci["low"] + ci["high"]) / 2
+        assert abs(midpoint - 60.0) < 1.0  # midpoint within 1% of actual WR
+
+    def test_v7_14_structure_has_required_keys(self) -> None:
+        """sample_adequacy dict contains all required keys."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trades = self._make_trades(10, 5)
+        summary = _compute_summary(trades, Decimal("1000"))
+        sa = summary["sample_adequacy"]
+
+        assert "n" in sa
+        assert "verdict" in sa
+        assert "min_recommended" in sa
+        assert "win_rate_ci_95" in sa
+        assert "low" in sa["win_rate_ci_95"]
+        assert "high" in sa["win_rate_ci_95"]
