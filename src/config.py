@@ -165,13 +165,13 @@ BLOCKED_REGIMES_BY_MARKET: dict = {
 # ETH/USDT: -$171 r4, -$245 P1, -$26 r3. 20% WR across 6 rounds.
 # Use explicit block rather than raising min_composite_score —
 # explicit is better than implicit (a score of 30+ still allows losers).
-BLOCKED_INSTRUMENTS: set = {"ETH/USDT"}
+BLOCKED_INSTRUMENTS: set[str] = {"ETH/USDT"}
 
 # R5: Backtest-only instrument whitelist. When non-empty, only these symbols
 # are simulated. Empty list = all instruments (backward compatible).
 # Based on r4 results: GC=F (+$150), EURUSD=X (+$52), USDCAD=X (+$35),
 # BTC/USDT (+$51, low N), SPY (+$35, low N).
-BACKTEST_INSTRUMENT_WHITELIST: list = [
+BACKTEST_INSTRUMENT_WHITELIST: list[str] = [
     "GC=F", "EURUSD=X", "USDCAD=X", "BTC/USDT", "SPY",
 ]
 
@@ -183,11 +183,9 @@ INSTRUMENT_OVERRIDES: dict = {
         "min_composite_score": 25,
         "allowed_regimes": ["STRONG_TREND_BULL"],
     },
-    # V6-CAL-05: ETH/USDT — восстановить min_score 20 (как в v5).
-    "ETH/USDT": {
-        "sl_atr_multiplier": 3.5,
-        "min_composite_score": 20,
-    },
+    # ETH/USDT entry removed — instrument is in BLOCKED_INSTRUMENTS (R5).
+    # Override would never be consulted because block fires before score check.
+    # Do not restore this entry without first removing ETH/USDT from BLOCKED_INSTRUMENTS.
     # V6-CAL-06: Восстановить GBPUSD override — -$43 при global threshold.
     "GBPUSD=X": {
         "min_composite_score": 20,

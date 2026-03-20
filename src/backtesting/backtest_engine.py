@@ -1172,16 +1172,33 @@ class BacktestEngine:
         except Exception as exc:
             logger.warning("[SIM-33] Could not load economic events: %s", exc)
 
-        # total_symbols and _backtest_progress are initialized after whitelist
-        # filtering (below), so accurate progress reporting uses the filtered count.
+        # R5: Instrument whitelist — restrict backtest to proven performers.
+        # Placed before D1 and DXY preloads so we don't waste DB queries on
+        # instruments that will be skipped. Does NOT affect live SignalEngine
+        # (filter_pipeline.check_blocked_instrument handles live+backtest blocking;
+        # this is backtest-only scope restriction).
+        from src.config import BACKTEST_INSTRUMENT_WHITELIST
+        if BACKTEST_INSTRUMENT_WHITELIST:
+            original_count = len(params.symbols)
+            symbols_to_run = [s for s in params.symbols if s in BACKTEST_INSTRUMENT_WHITELIST]
+            if len(symbols_to_run) < original_count:
+                filtered_out = [s for s in params.symbols if s not in BACKTEST_INSTRUMENT_WHITELIST]
+                logger.info(
+                    "[R5] Whitelist active: %d/%d symbols will run (%s). "
+                    "Filtered out: %s",
+                    len(symbols_to_run), original_count, symbols_to_run, filtered_out,
+                )
+        else:
+            symbols_to_run = params.symbols
 
         # V6 TASK-V6-06: Pre-load D1 data per symbol for MA200 trend filter.
         # 300 extra days of history before start_dt ensure MA200 is warmed up from day 1.
+        # Iterates symbols_to_run (post-whitelist) to skip instruments that won't be simulated.
         _D1_WARMUP_DAYS = 300
         d1_data_cache: dict[str, list] = {}
         if params.apply_d1_trend_filter:
             d1_start = start_dt - datetime.timedelta(days=_D1_WARMUP_DAYS)
-            for symbol in params.symbols:
+            for symbol in symbols_to_run:
                 try:
                     instrument_for_d1 = await get_instrument_by_symbol(self.db, symbol)
                     if instrument_for_d1 is not None:
@@ -1240,23 +1257,6 @@ class BacktestEngine:
                 "[CAL3-01] DXY data not available (tried %s) — SIM-38 filter will degrade gracefully",
                 _DXY_SYMBOLS,
             )
-
-        # R5: Instrument whitelist — restrict backtest to proven performers.
-        # Does NOT affect live SignalEngine (filter_pipeline.check_blocked_instrument
-        # is used for live+backtest blocking; this is backtest-only scope restriction).
-        from src.config import BACKTEST_INSTRUMENT_WHITELIST
-        if BACKTEST_INSTRUMENT_WHITELIST:
-            original_count = len(params.symbols)
-            symbols_to_run = [s for s in params.symbols if s in BACKTEST_INSTRUMENT_WHITELIST]
-            if len(symbols_to_run) < original_count:
-                filtered_out = [s for s in params.symbols if s not in BACKTEST_INSTRUMENT_WHITELIST]
-                logger.info(
-                    "[R5] Whitelist active: %d/%d symbols will run (%s). "
-                    "Filtered out: %s",
-                    len(symbols_to_run), original_count, symbols_to_run, filtered_out,
-                )
-        else:
-            symbols_to_run = params.symbols
 
         total_symbols = len(symbols_to_run)
         if run_id:

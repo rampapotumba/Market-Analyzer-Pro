@@ -358,12 +358,16 @@ class TestV603BtcUnblock:
         assert score == 25, f"Expected 25 (CAL-05 tightening), got {score}"
 
     def test_v6_03_eth_threshold_updated(self) -> None:
-        """ETH/USDT min_composite_score is 20 (restored by CAL-05)."""
-        from src.config import INSTRUMENT_OVERRIDES
+        """ETH/USDT has no entry in INSTRUMENT_OVERRIDES — it is in BLOCKED_INSTRUMENTS (R5).
+        The override was removed to avoid maintenance confusion: a blocked instrument's
+        score override is never consulted, so keeping it misleads future developers."""
+        from src.config import BLOCKED_INSTRUMENTS, INSTRUMENT_OVERRIDES
 
-        overrides = INSTRUMENT_OVERRIDES.get("ETH/USDT", {})
-        score = overrides.get("min_composite_score")
-        assert score == 20, f"Expected 20 (CAL-05 restore), got {score}"
+        assert "ETH/USDT" in BLOCKED_INSTRUMENTS, "ETH/USDT must remain in BLOCKED_INSTRUMENTS"
+        assert "ETH/USDT" not in INSTRUMENT_OVERRIDES, (
+            "ETH/USDT must not appear in INSTRUMENT_OVERRIDES while it is in BLOCKED_INSTRUMENTS "
+            "(R5 code review: dead entry creates maintenance hazard)"
+        )
 
     def test_v6_03_btc_strong_trend_bull_passes_regime_filter(self) -> None:
         """SignalFilterPipeline allows BTC/USDT in STRONG_TREND_BULL."""

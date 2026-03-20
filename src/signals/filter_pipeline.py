@@ -182,7 +182,10 @@ class SignalFilterPipeline:
                 self.rejection_counts[filter_name] += 1
             return passed, reason
 
-        # R5: Blocked instrument check — O(1) set lookup, runs before all other filters
+        # R5: Blocked instrument check — O(1) set lookup, runs before all other filters.
+        # Intentionally has no apply_* flag: blocked instruments must never trade regardless
+        # of backtest params or test scenarios. Unlike other filters (which can be disabled
+        # for calibration), this block is unconditional by design.
         passed, reason = self.check_blocked_instrument(symbol)
         passed, reason = _check_and_count("instrument_blocked", passed, reason)
         if not passed:
