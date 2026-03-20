@@ -893,6 +893,34 @@ def _compute_summary(
     if filter_stats is not None:
         result["filter_stats"] = filter_stats
 
+    # TASK-V7-15: filter_activation_stats — enriched diagnostics with zero-rejection warnings
+    # and regime uniformity warning.
+    if filter_stats is not None:
+        activation_warnings: list[str] = []
+
+        # Warn for each filter that never rejected a signal.
+        # Keys matching "rejected_by_*" come from SignalFilterPipeline.get_stats().
+        for key, count in filter_stats.items():
+            if key.startswith("rejected_by_") and count == 0:
+                filter_name = key[len("rejected_by_"):]
+                activation_warnings.append(
+                    f"filter_never_activated:{filter_name} (0 rejections)"
+                )
+
+        # Warn if regime is always DEFAULT or always the same single value.
+        if by_regime:
+            unique_regimes = list(by_regime.keys())
+            if len(unique_regimes) == 1:
+                sole_regime = unique_regimes[0]
+                activation_warnings.append(
+                    f"regime_always_same:{sole_regime} — regime filter may not be working"
+                )
+
+        result["filter_activation_stats"] = {
+            **filter_stats,
+            "warnings": activation_warnings,
+        }
+
     # CAL3-05: Viability assessment — automatic pass/fail check for key metrics.
     blocking_factors: list[str] = []
     pf_viable = profit_factor is not None and float(profit_factor) >= 1.3
@@ -1394,61 +1422,9 @@ class BacktestEngine:
                 # V7-17: attach data quality report to summary
                 summary["data_quality"] = data_quality
 
-            # V6 TASK-V6-13: Walk-forward validation — run IS and OOS separately
+            # TASK-V7-16: Walk-forward validation — multi-fold anchored expanding window
             if params.enable_walk_forward:
-                from dateutil.relativedelta import relativedelta
-
-                start_dt = datetime.datetime.fromisoformat(params.start_date)
-                is_end_dt = start_dt + relativedelta(months=params.in_sample_months)
-                oos_end_dt = is_end_dt + relativedelta(months=params.out_of_sample_months)
-
-                is_params = params.model_copy(update={
-                    "start_date": params.start_date,
-                    "end_date": is_end_dt.date().isoformat(),
-                    "enable_walk_forward": False,
-                })
-                oos_params = params.model_copy(update={
-                    "start_date": is_end_dt.date().isoformat(),
-                    "end_date": min(
-                        oos_end_dt.date().isoformat(),
-                        params.end_date,
-                    ),
-                    "enable_walk_forward": False,
-                })
-
-                is_trades, is_filter_stats, _is_dq = await self._simulate(is_params)
-                oos_trades, oos_filter_stats, _oos_dq = await self._simulate(oos_params)
-
-                is_summary = _compute_summary(is_trades, params.account_size, filter_stats=is_filter_stats)
-                oos_summary = _compute_summary(oos_trades, params.account_size, filter_stats=oos_filter_stats)
-
-                is_wr = is_summary.get("win_rate_pct", 0.0)
-                oos_wr = oos_summary.get("win_rate_pct", 0.0)
-                is_pf = is_summary.get("profit_factor") or 0.0
-                oos_pf = oos_summary.get("profit_factor") or 0.0
-
-                summary["walk_forward"] = {
-                    "in_sample_period": f"{params.start_date} – {is_end_dt.date().isoformat()}",
-                    "out_of_sample_period": f"{is_end_dt.date().isoformat()} – {oos_end_dt.date().isoformat()}",
-                    "in_sample": {
-                        "total_trades": is_summary["total_trades"],
-                        "win_rate_pct": is_wr,
-                        "profit_factor": is_pf,
-                        "total_pnl_usd": is_summary["total_pnl_usd"],
-                    },
-                    "out_of_sample": {
-                        "total_trades": oos_summary["total_trades"],
-                        "win_rate_pct": oos_wr,
-                        "profit_factor": oos_pf,
-                        "total_pnl_usd": oos_summary["total_pnl_usd"],
-                    },
-                    "wr_delta": round(oos_wr - is_wr, 2),
-                    "pf_delta": round(float(oos_pf) - float(is_pf), 4),
-                }
-                logger.info(
-                    "[V6-13] Walk-forward: IS WR=%.1f%% PF=%s → OOS WR=%.1f%% PF=%s",
-                    is_wr, is_pf, oos_wr, oos_pf,
-                )
+                summary["walk_forward"] = await self._run_walk_forward(params)
 
             trade_dicts = [
                 {

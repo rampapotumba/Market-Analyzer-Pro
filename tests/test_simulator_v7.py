@@ -3148,3 +3148,187 @@ class TestV718IsolationMode:
 
         assert len(simulate_called) == 1
         assert len(simulate_isolated_called) == 0
+
+
+# ── TASK-V7-15: Filter activation statistics ──────────────────────────────────
+
+
+class TestV715FilterActivationStats:
+    """TASK-V7-15: filter_activation_stats section in _compute_summary()."""
+
+    def _make_trade(
+        self,
+        result: str = "win",
+        exit_reason: str = "tp_hit",
+        pnl_usd: str = "10.00",
+        regime: str = "TREND_BULL",
+    ) -> MagicMock:
+        t = MagicMock()
+        t.symbol = "EURUSD=X"
+        t.direction = "LONG"
+        t.entry_price = Decimal("1.1000")
+        t.exit_price = Decimal("1.1100")
+        t.pnl_usd = Decimal(pnl_usd)
+        t.result = result
+        t.exit_reason = exit_reason
+        t.pnl_pips = Decimal("100.0000")
+        t.composite_score = Decimal("12.0")
+        t.entry_at = datetime.datetime(2024, 3, 12, 10, 0, tzinfo=datetime.timezone.utc)
+        t.exit_at = datetime.datetime(2024, 3, 13, 10, 0, tzinfo=datetime.timezone.utc)
+        t.duration_minutes = 1440
+        t.mfe = Decimal("0.0100")
+        t.mae = Decimal("0.0020")
+        t.sl_price = Decimal("1.0900")
+        t.regime = regime
+        t.timeframe = "H1"
+        t.fg_adjustment = None
+        t.fr_adjustment = None
+        return t
+
+    def _make_trades(self, n_wins: int, n_losses: int, regime: str = "TREND_BULL") -> list:
+        trades = []
+        for _ in range(n_wins):
+            trades.append(self._make_trade(result="win", exit_reason="tp_hit", pnl_usd="10.00", regime=regime))
+        for _ in range(n_losses):
+            trades.append(self._make_trade(result="loss", exit_reason="sl_hit", pnl_usd="-8.00", regime=regime))
+        return trades
+
+    def test_v7_15_summary_includes_filter_activation_stats_key(self) -> None:
+        """_compute_summary() with filter_stats includes filter_activation_stats key."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trades = self._make_trades(5, 3)
+        filter_stats = {
+            "total_raw_signals": 100,
+            "passed_all": 8,
+            "rejected_by_score_threshold": 40,
+            "rejected_by_regime_filter": 20,
+            "rejected_by_momentum_filter": 32,
+        }
+        summary = _compute_summary(trades, Decimal("1000"), filter_stats=filter_stats)
+
+        assert "filter_activation_stats" in summary
+
+    def test_v7_15_filter_activation_stats_absent_when_no_filter_stats(self) -> None:
+        """_compute_summary() without filter_stats has no filter_activation_stats key."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trades = self._make_trades(5, 3)
+        summary = _compute_summary(trades, Decimal("1000"))
+
+        assert "filter_activation_stats" not in summary
+
+    def test_v7_15_nonzero_rejection_counts_preserved(self) -> None:
+        """filter_activation_stats preserves all rejection count fields from filter_stats."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trades = self._make_trades(5, 3)
+        filter_stats = {
+            "total_raw_signals": 100,
+            "passed_all": 8,
+            "rejected_by_score_threshold": 45,
+            "rejected_by_regime_filter": 20,
+            "rejected_by_momentum_filter": 27,
+        }
+        summary = _compute_summary(trades, Decimal("1000"), filter_stats=filter_stats)
+
+        fas = summary["filter_activation_stats"]
+        assert fas["rejected_by_score_threshold"] == 45
+        assert fas["rejected_by_regime_filter"] == 20
+        assert fas["rejected_by_momentum_filter"] == 27
+
+    def test_v7_15_zero_rejection_filter_produces_warning(self) -> None:
+        """A filter with 0 rejections must appear in filter_activation_stats.warnings."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trades = self._make_trades(5, 3)
+        filter_stats = {
+            "total_raw_signals": 100,
+            "passed_all": 90,
+            "rejected_by_score_threshold": 10,
+            "rejected_by_d1_trend_filter": 0,   # never activated
+            "rejected_by_volume_filter": 0,      # never activated
+        }
+        summary = _compute_summary(trades, Decimal("1000"), filter_stats=filter_stats)
+
+        warnings = summary["filter_activation_stats"]["warnings"]
+        assert any("d1_trend_filter" in w for w in warnings), (
+            f"Expected d1_trend_filter warning, got: {warnings}"
+        )
+        assert any("volume_filter" in w for w in warnings), (
+            f"Expected volume_filter warning, got: {warnings}"
+        )
+
+    def test_v7_15_nonzero_rejection_filter_produces_no_warning(self) -> None:
+        """A filter with >0 rejections must NOT appear in warnings."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trades = self._make_trades(5, 3)
+        filter_stats = {
+            "total_raw_signals": 100,
+            "passed_all": 50,
+            "rejected_by_score_threshold": 50,
+        }
+        summary = _compute_summary(trades, Decimal("1000"), filter_stats=filter_stats)
+
+        warnings = summary["filter_activation_stats"]["warnings"]
+        assert not any("score_threshold" in w for w in warnings), (
+            f"score_threshold had rejections but appeared in warnings: {warnings}"
+        )
+
+    def test_v7_15_regime_always_same_produces_warning(self) -> None:
+        """When all trades have the same regime, a uniformity warning is added."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        # All trades use "DEFAULT" regime
+        trades = self._make_trades(5, 3, regime="DEFAULT")
+        filter_stats = {
+            "total_raw_signals": 50,
+            "passed_all": 8,
+        }
+        summary = _compute_summary(trades, Decimal("1000"), filter_stats=filter_stats)
+
+        warnings = summary["filter_activation_stats"]["warnings"]
+        assert any("regime_always_same" in w for w in warnings), (
+            f"Expected regime uniformity warning, got: {warnings}"
+        )
+
+    def test_v7_15_multiple_regimes_no_uniformity_warning(self) -> None:
+        """When trades span multiple regimes, no regime uniformity warning is added."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trades = (
+            self._make_trades(3, 2, regime="TREND_BULL")
+            + self._make_trades(2, 1, regime="STRONG_TREND_BULL")
+        )
+        filter_stats = {
+            "total_raw_signals": 50,
+            "passed_all": 8,
+        }
+        summary = _compute_summary(trades, Decimal("1000"), filter_stats=filter_stats)
+
+        warnings = summary["filter_activation_stats"]["warnings"]
+        assert not any("regime_always_same" in w for w in warnings), (
+            f"Multiple regimes but uniformity warning appeared: {warnings}"
+        )
+
+    def test_v7_15_warnings_key_present_even_when_no_warnings(self) -> None:
+        """filter_activation_stats.warnings is always a list (empty if no issues)."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        # All filters have rejections, multiple regimes — no warnings expected
+        trades = (
+            self._make_trades(3, 2, regime="TREND_BULL")
+            + self._make_trades(2, 1, regime="VOLATILE")
+        )
+        filter_stats = {
+            "total_raw_signals": 50,
+            "passed_all": 5,
+            "rejected_by_score_threshold": 30,
+            "rejected_by_regime_filter": 15,
+        }
+        summary = _compute_summary(trades, Decimal("1000"), filter_stats=filter_stats)
+
+        fas = summary["filter_activation_stats"]
+        assert "warnings" in fas
+        assert isinstance(fas["warnings"], list)
