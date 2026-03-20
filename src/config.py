@@ -151,6 +151,16 @@ MIN_COMPOSITE_SCORE_CRYPTO: int = 20   # for market == "crypto"
 # V6-CAL2-07: TREND_BULL добавлен — 45 trades, 17.8% WR, -$45.83 в v6-cal-r1 backtest.
 BLOCKED_REGIMES: list = ["RANGING", "TREND_BEAR", "STRONG_TREND_BEAR", "TREND_BULL"]
 
+# CAL3-04: Per-market-type regime blocking.
+# VOLATILE blocks forex (95 trades, -$33, WR 19%) but NOT crypto/stocks
+# (GC=F: VOLATILE = trend continuation; crypto: VOLATILE = normal state).
+# Priority: BLOCKED_REGIMES_BY_MARKET checked before BLOCKED_REGIMES global list.
+BLOCKED_REGIMES_BY_MARKET: dict = {
+    "forex": ["VOLATILE"],
+    # "crypto": [],   # crypto and stocks do NOT block VOLATILE
+    # "stocks": [],
+}
+
 INSTRUMENT_OVERRIDES: dict = {
     # V6-CAL-05: Ужесточение — 102 trades, 9.8% WR, -$135 при relaxed settings.
     # min_score 25 (строже v5), только STRONG_TREND_BULL (bear заблокированы глобально).
@@ -216,5 +226,7 @@ AVAILABLE_WEIGHT_FLOOR: float = 0.65
 
 # V6-CAL-09: Monday и Tuesday score penalty для forex.
 # Mon: -$373, Tue: -$365 в v6 backtest. Требуем 1.5x conviction.
+# CAL3-02: Monday убран из WEAK_WEEKDAYS — он теперь блокируется полностью в check_weekday().
+# WEAK_WEEKDAYS используется только для score multiplier (1.5x), не для полной блокировки.
 WEAK_WEEKDAY_SCORE_MULTIPLIER: float = 1.5
-WEAK_WEEKDAYS: list = [0, 1]  # 0=Monday, 1=Tuesday
+WEAK_WEEKDAYS: list = [1]  # 1=Tuesday (Monday блокируется полностью в check_weekday)

@@ -90,6 +90,8 @@ class BacktestTradeResult(BaseModel):
     mae: Optional[Decimal] = None
     regime: Optional[str] = None            # SIM-44: market regime at entry
     sl_price: Optional[Decimal] = None      # V6-CAL-07: SL level for MAE % calculation
+    fg_adjustment: Optional[Decimal] = None  # CAL3-06: Fear&Greed composite score adjustment
+    fr_adjustment: Optional[Decimal] = None  # CAL3-06: Funding Rate composite score adjustment
 
 
 class BacktestResult(BaseModel):

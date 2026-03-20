@@ -99,7 +99,8 @@ _COOLDOWN_MINUTES: dict[str, int] = {
 
 # SIM-35: Maximum candles before time-based exit (only when unrealized PnL <= 0).
 # Mirrors TIME_EXIT_CANDLES in config.py.
-_TIME_EXIT_CANDLES: dict[str, int] = {"H1": 24, "H4": 20, "D1": 10}
+# CAL3-03: Restored H1 to 48 (was 24 in cal-r2 — too aggressive, 70% time_exit rate).
+_TIME_EXIT_CANDLES: dict[str, int] = {"H1": 48, "H4": 20, "D1": 10}
 
 # CAL2-06: Trailing stop constants.
 # When MFE >= 50% of TP distance, move SL to lock 20% of TP distance profit.
@@ -502,6 +503,30 @@ def _compute_summary(
             by_regime[regime_key]["wins"] += 1
         by_regime[regime_key]["pnl_usd"] += float(t.pnl_usd or 0)
 
+    # CAL3-06: by_adjustment — breakdown of crypto trades with F&G and FR adjustments.
+    # Groups trades into 4 buckets based on which adjustments were applied.
+    by_adjustment: dict[str, dict] = {
+        "none": {"trades": 0, "wins": 0, "pnl_usd": 0.0},
+        "fg_only": {"trades": 0, "wins": 0, "pnl_usd": 0.0},
+        "fr_only": {"trades": 0, "wins": 0, "pnl_usd": 0.0},
+        "fg_and_fr": {"trades": 0, "wins": 0, "pnl_usd": 0.0},
+    }
+    for t in metric_trades:
+        has_fg = getattr(t, "fg_adjustment", None) is not None
+        has_fr = getattr(t, "fr_adjustment", None) is not None
+        if has_fg and has_fr:
+            bucket = "fg_and_fr"
+        elif has_fg:
+            bucket = "fg_only"
+        elif has_fr:
+            bucket = "fr_only"
+        else:
+            bucket = "none"
+        by_adjustment[bucket]["trades"] += 1
+        if t.result == "win":
+            by_adjustment[bucket]["wins"] += 1
+        by_adjustment[bucket]["pnl_usd"] += float(t.pnl_usd or 0)
+
     # Exit reason counts
     sl_hit_count = sum(1 for t in trades if t.exit_reason == "sl_hit")
     tp_hit_count = sum(1 for t in trades if t.exit_reason == "tp_hit")
@@ -608,11 +633,45 @@ def _compute_summary(
         "end_of_data_pnl": round(sum(float(t.pnl_usd or 0) for t in eod_trades), 4),
         # CAL2-09: concentration risk warning
         "concentration_warning": concentration_warning,
+        # CAL3-06: F&G and funding rate adjustment breakdown
+        "by_adjustment": by_adjustment,
     }
 
     # V6 TASK-V6-10: merge filter diagnostics into summary if provided
     if filter_stats is not None:
         result["filter_stats"] = filter_stats
+
+    # CAL3-05: Viability assessment — automatic pass/fail check for key metrics.
+    blocking_factors: list[str] = []
+    pf_viable = profit_factor is not None and float(profit_factor) >= 1.3
+    if not pf_viable:
+        blocking_factors.append("pf_below_1.3")
+    wr_viable = win_rate >= 25.0
+    if not wr_viable:
+        blocking_factors.append("wr_below_25pct")
+    dd_viable = max_dd <= 25.0
+    if not dd_viable:
+        blocking_factors.append("dd_above_25pct")
+    # Concentration: no single instrument > 40% of total PnL
+    concentration_viable = True
+    if by_symbol and total_pnl > 0:
+        max_sym_pct = max(d["pnl_usd"] / total_pnl * 100 for d in by_symbol.values())
+        if max_sym_pct > 40:
+            concentration_viable = False
+            blocking_factors.append("concentration_risk")
+    overall_viability = (
+        "VIABLE"
+        if all([pf_viable, wr_viable, dd_viable, concentration_viable])
+        else "NOT_VIABLE"
+    )
+    result["viability_assessment"] = {
+        "pf_viable": pf_viable,
+        "wr_viable": wr_viable,
+        "dd_viable": dd_viable,
+        "concentration_viable": concentration_viable,
+        "overall": overall_viability,
+        "blocking_factors": blocking_factors,
+    }
 
     return result
 
@@ -908,6 +967,53 @@ def _precompute_regimes(
     return regimes
 
 
+def _compute_dxy_rsi(dxy_rows: list) -> dict:
+    """CAL3-01: Compute RSI(14) over DXY H1 price rows using Wilder smoothing.
+
+    Returns a dict mapping each candle's timestamp → RSI value.
+    Only includes timestamps where RSI is defined (from index 14 onward).
+
+    Wilder smoothing: initial avg_gain/avg_loss = simple mean of first 14 changes,
+    then each subsequent: avg = (prev_avg * 13 + current) / 14.
+    """
+    if len(dxy_rows) < 15:
+        return {}
+
+    closes = [float(r.close) for r in dxy_rows]
+    timestamps = [r.timestamp for r in dxy_rows]
+    rsi_period = 14
+    result: dict = {}
+
+    # Compute price changes
+    changes = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+
+    # Seed: simple mean of first 14 changes
+    gains = [max(c, 0.0) for c in changes[:rsi_period]]
+    losses = [abs(min(c, 0.0)) for c in changes[:rsi_period]]
+    avg_gain = sum(gains) / rsi_period
+    avg_loss = sum(losses) / rsi_period
+
+    # RSI at index rsi_period (corresponds to closes[rsi_period])
+    def _rsi_from_avg(ag: float, al: float) -> float:
+        if al == 0.0:
+            return 100.0
+        rs = ag / al
+        return 100.0 - (100.0 / (1.0 + rs))
+
+    result[timestamps[rsi_period]] = _rsi_from_avg(avg_gain, avg_loss)
+
+    # Wilder smoothing for remaining candles
+    for j in range(rsi_period, len(changes)):
+        change = changes[j]
+        gain = max(change, 0.0)
+        loss = abs(min(change, 0.0))
+        avg_gain = (avg_gain * (rsi_period - 1) + gain) / rsi_period
+        avg_loss = (avg_loss * (rsi_period - 1) + loss) / rsi_period
+        result[timestamps[j + 1]] = _rsi_from_avg(avg_gain, avg_loss)
+
+    return result
+
+
 class BacktestEngine:
     """Candle-by-candle backtest engine (SIM-22).
 
@@ -1089,6 +1195,45 @@ class BacktestEngine:
                 except Exception as exc:
                     logger.warning("[V6-D1] Could not load D1 data for %s: %s", symbol, exc)
 
+        # CAL3-01: Pre-load DXY H1 data and compute RSI(14) once for the whole period.
+        # DXY RSI is used by SIM-38 to filter forex LONG/SHORT during strong/weak dollar.
+        # Graceful degradation: if DXY instrument not found → dxy_rsi_by_ts stays empty.
+        dxy_rsi_by_ts: dict[datetime.datetime, float] = {}
+        _DXY_SYMBOLS = ["DX-Y.NYB", "DXY", "DX=F"]
+        _dxy_h1_warmup_days = 30  # need 14+ candles for RSI(14)
+        dxy_start = start_dt - datetime.timedelta(days=_dxy_h1_warmup_days)
+        for _dxy_sym in _DXY_SYMBOLS:
+            try:
+                dxy_instrument = await get_instrument_by_symbol(self.db, _dxy_sym)
+                if dxy_instrument is not None:
+                    dxy_rows = await get_price_data(
+                        self.db,
+                        dxy_instrument.id,
+                        "H1",
+                        from_dt=dxy_start,
+                        to_dt=end_dt,
+                        limit=100_000,
+                    )
+                    if len(dxy_rows) >= 14:
+                        dxy_rsi_by_ts = _compute_dxy_rsi(dxy_rows)
+                        logger.info(
+                            "[CAL3-01] DXY RSI loaded from %s: %d candles → %d RSI values",
+                            _dxy_sym, len(dxy_rows), len(dxy_rsi_by_ts),
+                        )
+                    else:
+                        logger.warning(
+                            "[CAL3-01] DXY %s: only %d candles (need 14+) — SIM-38 will degrade",
+                            _dxy_sym, len(dxy_rows),
+                        )
+                    break  # found instrument — stop trying other symbols
+            except Exception as exc:
+                logger.warning("[CAL3-01] Could not load DXY data for %s: %s", _dxy_sym, exc)
+        if not dxy_rsi_by_ts:
+            logger.warning(
+                "[CAL3-01] DXY data not available (tried %s) — SIM-38 filter will degrade gracefully",
+                _DXY_SYMBOLS,
+            )
+
         for sym_idx, symbol in enumerate(params.symbols):
             instrument = await get_instrument_by_symbol(self.db, symbol)
             if instrument is None:
@@ -1137,6 +1282,7 @@ class BacktestEngine:
                 economic_events=economic_events,
                 params=params,
                 d1_rows_all=d1_data_cache.get(symbol, []),
+                dxy_rsi_by_ts=dxy_rsi_by_ts,
             )
             trades.extend(symbol_trades)
             # V6 TASK-V6-10: accumulate filter stats across symbols
@@ -1161,6 +1307,7 @@ class BacktestEngine:
         economic_events: Optional[list] = None,
         params: Optional[BacktestParams] = None,
         d1_rows_all: Optional[list] = None,
+        dxy_rsi_by_ts: Optional[dict] = None,
     ) -> tuple[list[BacktestTradeResult], dict]:
         """Simulate one symbol over all its candles. Returns closed trades.
 
@@ -1352,7 +1499,9 @@ class BacktestEngine:
                 "candle_ts": candle_ts,
                 "d1_rows": d1_rows_for_filter,  # V6-06: populated from pre-loaded D1 cache
                 "economic_events": economic_events or [],
-                "dxy_rsi": None,  # DXY not available in backtest without external data
+                # CAL3-01: Look up DXY RSI for current candle timestamp.
+                # dxy_rsi_by_ts maps exact H1 timestamps; fallback to None (graceful degradation).
+                "dxy_rsi": (dxy_rsi_by_ts or {}).get(candle_ts),
                 # V6 TASK-V6-02: only TA available in backtest → proportional scaling
                 "available_weight": _TA_WEIGHT,
             }

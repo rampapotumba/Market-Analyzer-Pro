@@ -546,11 +546,15 @@ def test_sim32_monday_morning_blocked():
 
 
 def test_sim32_monday_afternoon_allowed():
-    """Mon 14:00 UTC, forex → allowed."""
+    """Mon 14:00 UTC, forex → blocked (CAL3-02: Monday fully blocked for forex).
+
+    Note: CAL3-02 changed this behaviour — Monday is now fully blocked for forex,
+    not just the first 10 hours. This test reflects the updated specification.
+    """
     from src.backtesting.backtest_engine import BacktestEngine
 
     ts = datetime.datetime(2024, 1, 1, 14, 0, tzinfo=datetime.timezone.utc)
-    assert BacktestEngine._check_weekday_filter(ts, "forex") is True
+    assert BacktestEngine._check_weekday_filter(ts, "forex") is False
 
 
 def test_sim32_friday_evening_blocked():

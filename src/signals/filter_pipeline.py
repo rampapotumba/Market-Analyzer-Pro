@@ -214,9 +214,9 @@ class SignalFilterPipeline:
         if not passed:
             return False, reason
 
-        # SIM-26: RANGING regime block
+        # SIM-26: RANGING regime block (CAL3-04: per-market-type blocking included)
         if self.apply_regime_filter:
-            passed, reason = self.check_regime(regime, symbol)
+            passed, reason = self.check_regime(regime, symbol, market_type)
             passed, reason = _check_and_count("regime_filter", passed, reason)
             if not passed:
                 return False, reason
@@ -336,9 +336,22 @@ class SignalFilterPipeline:
             return False, f"score_below_threshold:{composite:.1f}<{effective_threshold:.2f}"
         return True, "ok"
 
-    def check_regime(self, regime: str, symbol: str = "") -> tuple[bool, str]:
-        """SIM-26 + SIM-28: regime must not be blocked."""
-        from src.config import BLOCKED_REGIMES, INSTRUMENT_OVERRIDES
+    def check_regime(
+        self, regime: str, symbol: str = "", market_type: str = ""
+    ) -> tuple[bool, str]:
+        """SIM-26 + SIM-28 + CAL3-04: regime must not be blocked.
+
+        CAL3-04: BLOCKED_REGIMES_BY_MARKET allows per-market-type blocking.
+        Checked before global BLOCKED_REGIMES. If market_type is blank, only
+        global list is checked (backward compatible).
+        """
+        from src.config import BLOCKED_REGIMES, BLOCKED_REGIMES_BY_MARKET, INSTRUMENT_OVERRIDES
+
+        # CAL3-04: per-market-type blocking (highest priority, before global list)
+        if market_type:
+            market_blocked = BLOCKED_REGIMES_BY_MARKET.get(market_type, [])
+            if regime in market_blocked:
+                return False, f"regime_blocked_for_market:{regime}:{market_type}"
 
         if regime in BLOCKED_REGIMES:
             return False, f"regime_blocked:{regime}"
@@ -428,20 +441,23 @@ class SignalFilterPipeline:
         return True, "ok"
 
     def check_weekday(self, ts: datetime.datetime, market_type: str) -> tuple[bool, str]:
-        """SIM-32 + V6-CAL2-04: Weekday filter.
+        """SIM-32 + V6-CAL2-04 + CAL3-02: Weekday filter.
 
         V6-CAL2-04: blocks Saturday (5) and Sunday (6) for all instruments including crypto.
         9 weekend trades = -$226 with 0 wins in v6-cal-r1 backtest.
+
+        CAL3-02: Block Monday entirely for forex (not just first 10h).
+        Monday forex: 25 trades, 1 win, -$399 (WR 4.0%) in cal-r3 backtest.
+        Crypto is exempt from Monday block (trades 24/7).
         """
         hour = ts.hour if ts.tzinfo else ts.replace(tzinfo=datetime.timezone.utc).hour
         weekday = ts.weekday()
         # V6-CAL2-04: block Saturday and Sunday for ALL market types (no exemptions)
         if weekday in (5, 6):
             return False, f"weekend_block:day={weekday}"
-        if weekday == 0 and hour < 10:
-            if market_type == "crypto":
-                return True, "ok"  # crypto exempt
-            return False, f"monday_gap_filter:hour={hour}"
+        # CAL3-02: Full Monday block for non-crypto (was: only hour < 10)
+        if weekday == 0 and market_type != "crypto":
+            return False, f"monday_full_block:hour={hour}"
         if weekday == 4 and hour >= 18:
             return False, f"friday_close_filter:hour={hour}"
         return True, "ok"

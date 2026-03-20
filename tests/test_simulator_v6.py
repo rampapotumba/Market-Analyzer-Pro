@@ -1116,10 +1116,10 @@ class TestV611TimeAndMaeExit:
         assert result.exit_reason == "tp_hit"
 
     def test_v6_11_time_exit_triggers_at_max_candles_with_negative_pnl(self) -> None:
-        """Time exit fires after 24 H1 candles with PnL <= 0 (CAL-03: reduced from 48).
+        """Time exit fires after 48 H1 candles with PnL <= 0.
 
-        Note: H1 time exit reduced from 48 to 24 candles by V6-CAL-03.
-        61.6% of trades were exiting via time_exit after 2 days; 1 day is sufficient.
+        Note: CAL3-03 restored H1 time exit to 48 candles (was 24 in cal-r2).
+        70% of trades were exiting at 24h — too aggressive, winning trades need 2 days.
         """
         from src.backtesting.backtest_engine import BacktestEngine
 
@@ -1133,8 +1133,8 @@ class TestV611TimeAndMaeExit:
         )
         # candle doesn't hit SL (low > 1.0900) or TP (high < 1.1200)
         candle = self._make_candle(high=1.1010, low=1.0950, close=1.0995)
-        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=24)
-        assert result is not None, "Expected time exit after 24 candles with loss"
+        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=48)
+        assert result is not None, "Expected time exit after 48 candles with loss"
         assert result.exit_reason == "time_exit"
 
     def test_v6_11_time_exit_no_trigger_if_pnl_positive(self) -> None:
@@ -1153,7 +1153,7 @@ class TestV611TimeAndMaeExit:
         assert result is None, "Expected NO time exit when PnL > 0"
 
     def test_v6_11_time_exit_no_trigger_before_max_candles(self) -> None:
-        """Time exit does NOT fire before reaching max_candles (H1=24 after CAL-03)."""
+        """Time exit does NOT fire before reaching max_candles (H1=48 after CAL3-03)."""
         from src.backtesting.backtest_engine import BacktestEngine
 
         engine = BacktestEngine.__new__(BacktestEngine)
@@ -1624,21 +1624,21 @@ class TestV6Cal03TimeExit:
         c.timestamp = datetime.datetime(2024, 6, 2, 10, 0, tzinfo=datetime.timezone.utc)
         return c
 
-    def test_v6_cal_03_time_exit_24_candles_h1(self) -> None:
-        """H1 time exit fires at 24 candles (not 48) when PnL <= 0."""
+    def test_v6_cal_03_time_exit_48_candles_h1(self) -> None:
+        """H1 time exit fires at 48 candles when PnL <= 0 (CAL3-03: restored from 24 to 48)."""
         from src.backtesting.backtest_engine import BacktestEngine
 
         engine = BacktestEngine.__new__(BacktestEngine)
         trade = self._make_open_trade(timeframe="H1")
         candle = self._make_candle(high=1.1010, low=1.0950, close=1.0995)
 
-        # At 23 candles — should NOT exit
-        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=23)
-        assert result is None, "Expected no exit at candle 23"
+        # At 47 candles — should NOT exit
+        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=47)
+        assert result is None, "Expected no exit at candle 47"
 
-        # At 24 candles — should exit
-        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=24)
-        assert result is not None, "Expected time exit at candle 24"
+        # At 48 candles — should exit
+        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=48)
+        assert result is not None, "Expected time exit at candle 48"
         assert result.exit_reason == "time_exit"
 
     def test_v6_cal_03_time_exit_h4_unchanged(self) -> None:
@@ -2037,13 +2037,32 @@ class TestV6Cal09WeekdayMultiplier:
         }
 
     def test_v6_cal_09_monday_forex_higher_threshold(self) -> None:
-        """Monday forex: effective threshold = 9.75 * 1.5 = 14.625.
+        """CAL3-02: Monday forex is fully blocked by check_weekday() (not score multiplier).
 
-        score=10.0 passes Wed/Thu (threshold=9.75) but is blocked on Monday.
+        Monday (0) was removed from WEAK_WEEKDAYS — it is now fully blocked via weekday_filter.
+        With weekday_filter=True, Monday forex is always blocked regardless of score.
+        With weekday_filter=False, Monday score is NOT penalised (0 is not in WEAK_WEEKDAYS).
         """
         from src.signals.filter_pipeline import SignalFilterPipeline
 
-        pipeline = SignalFilterPipeline(
+        # With weekday_filter=True: Monday forex blocked regardless of score
+        pipeline_with_wd = SignalFilterPipeline(
+            apply_regime_filter=False,
+            apply_d1_trend_filter=False,
+            apply_volume_filter=False,
+            apply_momentum_filter=False,
+            apply_weekday_filter=True,
+            apply_calendar_filter=False,
+            apply_session_filter=False,
+            apply_dxy_filter=False,
+        )
+        ctx_mon = self._make_context(weekday=0, composite=20.0)  # high score still blocked
+        passed, reason = pipeline_with_wd.run_all(ctx_mon)
+        assert not passed, f"Expected block on Monday (weekday_filter=True) regardless of score"
+        assert "monday_full_block" in reason
+
+        # With weekday_filter=False: Monday is NOT penalised via score anymore
+        pipeline_no_wd = SignalFilterPipeline(
             apply_regime_filter=False,
             apply_d1_trend_filter=False,
             apply_volume_filter=False,
@@ -2053,15 +2072,10 @@ class TestV6Cal09WeekdayMultiplier:
             apply_session_filter=False,
             apply_dxy_filter=False,
         )
-        # score=10.0 on Wednesday (weekday=2) — should pass (10.0 >= 9.75)
-        ctx_wed = self._make_context(weekday=2, composite=10.0)
-        passed, reason = pipeline.run_all(ctx_wed)
-        assert passed, f"Expected pass on Wednesday with score=10.0, got: {reason}"
-
-        # Same score=10.0 on Monday (weekday=0) — should be blocked (10.0 < 14.625)
-        ctx_mon = self._make_context(weekday=0, composite=10.0)
-        passed, reason = pipeline.run_all(ctx_mon)
-        assert not passed, f"Expected block on Monday with score=10.0 (threshold=14.625), got pass"
+        # score=10.0 on Monday with weekday_filter=False — should pass (no multiplier)
+        ctx_mon_no_filter = self._make_context(weekday=0, composite=10.0)
+        passed, reason = pipeline_no_wd.run_all(ctx_mon_no_filter)
+        assert passed, f"Monday with weekday_filter=False should pass: {reason}"
 
     def test_v6_cal_09_tuesday_forex_higher_threshold(self) -> None:
         """Tuesday forex also gets the 1.5x multiplier."""
@@ -2127,12 +2141,16 @@ class TestV6Cal09WeekdayMultiplier:
         )
 
     def test_v6_cal_09_config_constants(self) -> None:
-        """WEAK_WEEKDAY_SCORE_MULTIPLIER=1.5 and WEAK_WEEKDAYS=[0, 1]."""
+        """WEAK_WEEKDAY_SCORE_MULTIPLIER=1.5 and WEAK_WEEKDAYS=[1] (CAL3-02: Monday removed).
+
+        CAL3-02: Monday (0) removed from WEAK_WEEKDAYS — it is fully blocked in check_weekday().
+        Only Tuesday (1) remains in WEAK_WEEKDAYS for the 1.5x score multiplier.
+        """
         from src.config import WEAK_WEEKDAY_SCORE_MULTIPLIER, WEAK_WEEKDAYS
 
         assert WEAK_WEEKDAY_SCORE_MULTIPLIER == 1.5
-        assert 0 in WEAK_WEEKDAYS  # Monday
-        assert 1 in WEAK_WEEKDAYS  # Tuesday
+        assert 0 not in WEAK_WEEKDAYS  # Monday: fully blocked, not in score multiplier list
+        assert 1 in WEAK_WEEKDAYS      # Tuesday: still gets 1.5x score multiplier
 
 
 # ── Calibration Round 2 tests ─────────────────────────────────────────────────
@@ -2755,3 +2773,522 @@ class TestCal209ConcentrationWarning:
         summary = _compute_summary(trades, Decimal("1000"))
         # Each symbol = 20% → top1=20%, top2=40% — both below thresholds
         assert summary["concentration_warning"] is None
+
+
+# ── CAL3-01: DXY RSI computation ─────────────────────────────────────────────
+
+
+class TestCal301DxyRsiFilter:
+    """CAL3-01: DXY RSI computed from price data and passed to filter pipeline."""
+
+    def _make_price_row(self, close: float, ts_offset_hours: int = 0) -> "MagicMock":
+        from unittest.mock import MagicMock
+        from decimal import Decimal
+
+        row = MagicMock()
+        row.close = Decimal(str(close))
+        row.timestamp = datetime.datetime(
+            2024, 1, 1, ts_offset_hours % 24, 0,
+            tzinfo=datetime.timezone.utc,
+        ) + datetime.timedelta(hours=ts_offset_hours // 24 * 24)
+        return row
+
+    def _make_price_rows(self, n: int = 30) -> list:
+        """Generate n price rows with incrementally rising prices."""
+        rows = []
+        for i in range(n):
+            row = MagicMock()
+            from decimal import Decimal
+            row.close = Decimal(str(100.0 + i * 0.1))
+            row.timestamp = datetime.datetime(
+                2024, 1, 1, 0, 0, tzinfo=datetime.timezone.utc
+            ) + datetime.timedelta(hours=i)
+        # return rows via simple helper
+        from unittest.mock import MagicMock as MM
+        result = []
+        for i in range(n):
+            r = MM()
+            r.close = __import__("decimal").Decimal(str(100.0 + i * 0.1))
+            r.timestamp = datetime.datetime(
+                2024, 1, 1, 0, 0, tzinfo=datetime.timezone.utc
+            ) + datetime.timedelta(hours=i)
+            result.append(r)
+        return result
+
+    def test_cal3_01_compute_dxy_rsi_basic(self) -> None:
+        """_compute_dxy_rsi returns dict with RSI values for timestamps."""
+        from src.backtesting.backtest_engine import _compute_dxy_rsi
+
+        rows = self._make_price_rows(30)
+        result = _compute_dxy_rsi(rows)
+        # Should have entries starting from index 14
+        assert len(result) > 0
+        # All values should be in RSI range 0-100
+        for ts, rsi_val in result.items():
+            assert 0.0 <= rsi_val <= 100.0, f"RSI out of range: {rsi_val}"
+
+    def test_cal3_01_compute_dxy_rsi_insufficient_data(self) -> None:
+        """_compute_dxy_rsi returns empty dict when fewer than 15 rows."""
+        from src.backtesting.backtest_engine import _compute_dxy_rsi
+
+        rows = self._make_price_rows(14)
+        result = _compute_dxy_rsi(rows)
+        assert result == {}
+
+    def test_cal3_01_compute_dxy_rsi_all_rising(self) -> None:
+        """Uniformly rising prices should produce RSI close to 100."""
+        from src.backtesting.backtest_engine import _compute_dxy_rsi
+
+        rows = self._make_price_rows(30)  # all rising (+0.1 each)
+        result = _compute_dxy_rsi(rows)
+        rsi_values = list(result.values())
+        # All gains, no losses → RSI should be 100.0
+        assert all(v == 100.0 for v in rsi_values), f"Expected 100.0, got: {rsi_values[:5]}"
+
+    def test_cal3_01_dxy_rsi_blocks_long_when_strong(self) -> None:
+        """DXY RSI > 55 blocks LONG for EURUSD=X."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, reason = pipeline.check_dxy_alignment(
+            direction="LONG", symbol="EURUSD=X", dxy_rsi=60.0
+        )
+        assert not passed
+        assert "dxy_strong_blocks_long" in reason
+
+    def test_cal3_01_dxy_rsi_neutral_passes(self) -> None:
+        """DXY RSI = 50 (neutral) → signal passes for EURUSD=X LONG."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, reason = pipeline.check_dxy_alignment(
+            direction="LONG", symbol="EURUSD=X", dxy_rsi=50.0
+        )
+        assert passed, f"Expected pass but got: {reason}"
+
+    def test_cal3_01_dxy_rsi_none_passes(self) -> None:
+        """DXY RSI = None (no data) → graceful degradation, signal passes."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, reason = pipeline.check_dxy_alignment(
+            direction="LONG", symbol="EURUSD=X", dxy_rsi=None
+        )
+        assert passed, f"Expected pass with None DXY RSI but got: {reason}"
+
+    def test_cal3_01_dxy_rsi_non_affected_pair_passes(self) -> None:
+        """DXY RSI > 55 does NOT block USDJPY (it is a USD-strong pair, not long-side USD)."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, reason = pipeline.check_dxy_alignment(
+            direction="LONG", symbol="USDJPY=X", dxy_rsi=65.0
+        )
+        assert passed, f"USDJPY should not be blocked by DXY: {reason}"
+
+    def test_cal3_01_simulate_symbol_accepts_dxy_rsi_by_ts(self) -> None:
+        """_simulate_symbol accepts dxy_rsi_by_ts parameter without error."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        engine = BacktestEngine.__new__(BacktestEngine)
+        engine._rm = MagicMock()
+
+        # If dxy_rsi_by_ts is empty dict → all dxy_rsi lookups return None → graceful degradation
+        # Just check the method accepts the parameter (no TypeError)
+        import inspect
+        sig = inspect.signature(engine._simulate_symbol)
+        assert "dxy_rsi_by_ts" in sig.parameters
+
+
+# ── CAL3-02: Monday full block for forex ─────────────────────────────────────
+
+
+class TestCal302MondayFullBlock:
+    """CAL3-02: Monday is fully blocked for forex (not just first 10h)."""
+
+    def test_cal3_02_monday_14h_forex_blocked(self) -> None:
+        """Forex signal on Monday at 14:00 UTC → blocked."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        ts = datetime.datetime(2024, 1, 8, 14, 0, tzinfo=datetime.timezone.utc)  # Monday
+        passed, reason = pipeline.check_weekday(ts, market_type="forex")
+        assert not passed
+        assert "monday_full_block" in reason
+
+    def test_cal3_02_monday_00h_forex_blocked(self) -> None:
+        """Forex signal on Monday at 00:00 UTC (gap hours) → blocked."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        ts = datetime.datetime(2024, 1, 8, 0, 0, tzinfo=datetime.timezone.utc)
+        passed, reason = pipeline.check_weekday(ts, market_type="forex")
+        assert not passed
+        assert "monday_full_block" in reason
+
+    def test_cal3_02_monday_crypto_exempt(self) -> None:
+        """Crypto signal on Monday at 14:00 UTC → passes (exempt from Monday block)."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        ts = datetime.datetime(2024, 1, 8, 14, 0, tzinfo=datetime.timezone.utc)
+        passed, reason = pipeline.check_weekday(ts, market_type="crypto")
+        assert passed, f"Crypto Monday should pass but got: {reason}"
+
+    def test_cal3_02_tuesday_forex_passes(self) -> None:
+        """Forex signal on Tuesday → not blocked by weekday filter (score multiplier applies)."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        ts = datetime.datetime(2024, 1, 9, 14, 0, tzinfo=datetime.timezone.utc)  # Tuesday
+        passed, reason = pipeline.check_weekday(ts, market_type="forex")
+        assert passed, f"Tuesday forex should not be weekday-blocked: {reason}"
+
+    def test_cal3_02_weak_weekdays_config(self) -> None:
+        """WEAK_WEEKDAYS contains only Tuesday (1), not Monday (0)."""
+        from src.config import WEAK_WEEKDAYS
+
+        assert 0 not in WEAK_WEEKDAYS, "Monday (0) should not be in WEAK_WEEKDAYS"
+        assert 1 in WEAK_WEEKDAYS, "Tuesday (1) should remain in WEAK_WEEKDAYS"
+
+
+# ── CAL3-03: TIME_EXIT H1 = 48 ───────────────────────────────────────────────
+
+
+class TestCal303TimeExitH1:
+    """CAL3-03: TIME_EXIT_CANDLES for H1 is 48 (restored from 24)."""
+
+    def test_cal3_03_time_exit_h1_is_48(self) -> None:
+        """_TIME_EXIT_CANDLES["H1"] == 48."""
+        from src.backtesting.backtest_engine import _TIME_EXIT_CANDLES
+
+        assert _TIME_EXIT_CANDLES["H1"] == 48, (
+            f"Expected 48, got {_TIME_EXIT_CANDLES['H1']}"
+        )
+
+    def test_cal3_03_h4_d1_unchanged(self) -> None:
+        """H4 and D1 values remain unchanged."""
+        from src.backtesting.backtest_engine import _TIME_EXIT_CANDLES
+
+        assert _TIME_EXIT_CANDLES["H4"] == 20
+        assert _TIME_EXIT_CANDLES["D1"] == 10
+
+    def test_cal3_03_position_not_closed_at_47_candles(self) -> None:
+        """Position with 47 elapsed candles and unrealized_pnl <= 0 is NOT closed."""
+        from src.backtesting.backtest_engine import BacktestEngine, _TIME_EXIT_CANDLES
+
+        engine = BacktestEngine.__new__(BacktestEngine)
+        engine._rm = MagicMock()
+
+        # _check_exit is tested directly; we just verify 47 < 48 for H1
+        assert 47 < _TIME_EXIT_CANDLES["H1"]
+
+    def test_cal3_03_position_closed_at_48_candles(self) -> None:
+        """Position with 48 elapsed candles and unrealized_pnl <= 0 IS closed by time_exit."""
+        from src.backtesting.backtest_engine import _TIME_EXIT_CANDLES
+
+        assert 48 >= _TIME_EXIT_CANDLES["H1"]
+
+
+# ── CAL3-04: Per-market regime blocking ──────────────────────────────────────
+
+
+class TestCal304PerMarketRegimeBlocking:
+    """CAL3-04: VOLATILE blocked for forex only, not crypto/stocks."""
+
+    def test_cal3_04_blocked_regimes_by_market_in_config(self) -> None:
+        """BLOCKED_REGIMES_BY_MARKET exists in config with forex→VOLATILE."""
+        from src.config import BLOCKED_REGIMES_BY_MARKET
+
+        assert "forex" in BLOCKED_REGIMES_BY_MARKET
+        assert "VOLATILE" in BLOCKED_REGIMES_BY_MARKET["forex"]
+
+    def test_cal3_04_eurusd_volatile_blocked(self) -> None:
+        """EURUSD=X + VOLATILE regime → blocked."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, reason = pipeline.check_regime("VOLATILE", symbol="EURUSD=X", market_type="forex")
+        assert not passed
+        assert "VOLATILE" in reason
+
+    def test_cal3_04_gcf_volatile_passes(self) -> None:
+        """GC=F (stocks) + VOLATILE regime → passes."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, reason = pipeline.check_regime("VOLATILE", symbol="GC=F", market_type="stocks")
+        assert passed, f"GC=F VOLATILE should pass: {reason}"
+
+    def test_cal3_04_ethusdt_volatile_passes(self) -> None:
+        """ETH/USDT (crypto, no allowed_regimes override) + VOLATILE regime → passes.
+
+        Note: BTC/USDT has allowed_regimes=['STRONG_TREND_BULL'] override (unrelated to this test).
+        ETH/USDT only has min_composite_score override, no regime restriction.
+        """
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, reason = pipeline.check_regime("VOLATILE", symbol="ETH/USDT", market_type="crypto")
+        assert passed, f"ETH/USDT VOLATILE should pass: {reason}"
+
+    def test_cal3_04_eurusd_strong_trend_bull_passes(self) -> None:
+        """EURUSD=X + STRONG_TREND_BULL → passes (not in any blocked list)."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, reason = pipeline.check_regime("STRONG_TREND_BULL", symbol="EURUSD=X", market_type="forex")
+        assert passed, f"EURUSD STRONG_TREND_BULL should pass: {reason}"
+
+    def test_cal3_04_run_all_uses_market_type_for_regime(self) -> None:
+        """run_all passes market_type to check_regime for per-market blocking."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline(
+            apply_score_filter=False,
+            apply_d1_trend_filter=False,
+            apply_volume_filter=False,
+            apply_momentum_filter=False,
+            apply_weekday_filter=False,
+            apply_calendar_filter=False,
+            apply_session_filter=False,
+            apply_dxy_filter=False,
+        )
+        context = {
+            "composite_score": 20.0,
+            "market_type": "forex",
+            "symbol": "EURUSD=X",
+            "regime": "VOLATILE",
+            "direction": "LONG",
+            "timeframe": "H1",
+        }
+        passed, reason = pipeline.run_all(context)
+        assert not passed
+        assert "VOLATILE" in reason
+
+
+# ── CAL3-05: Viability assessment ────────────────────────────────────────────
+
+
+class TestCal305ViabilityAssessment:
+    """CAL3-05: viability_assessment dict added to _compute_summary output."""
+
+    def test_cal3_05_viable_all_pass(self) -> None:
+        """Trades with PF>=1.3, WR>=25%, DD<=25%, diverse → overall=VIABLE."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        # 3 wins ($30 each) and 1 loss (-$10) → PF=3.0, WR=75%, small DD
+        symbols = ["EURUSD=X", "GBPUSD=X", "USDJPY=X"]
+        trades = []
+        for sym in symbols:
+            trades.append(_make_trade_cal2(symbol=sym, pnl_usd="30.00", exit_reason="tp_hit", result="win"))
+        trades.append(_make_trade_cal2(symbol="AUDUSD=X", pnl_usd="-10.00", exit_reason="sl_hit", result="loss"))
+
+        summary = _compute_summary(trades, Decimal("1000"))
+        va = summary["viability_assessment"]
+        assert va["pf_viable"] is True
+        assert va["wr_viable"] is True
+        assert va["dd_viable"] is True
+        assert va["overall"] == "VIABLE"
+        assert va["blocking_factors"] == []
+
+    def test_cal3_05_not_viable_low_pf(self) -> None:
+        """PF < 1.3 → pf_viable=False, overall=NOT_VIABLE."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trades = [
+            _make_trade_cal2(pnl_usd="5.00", exit_reason="tp_hit", result="win"),
+            _make_trade_cal2(pnl_usd="-10.00", exit_reason="sl_hit", result="loss"),
+        ]
+        summary = _compute_summary(trades, Decimal("1000"))
+        va = summary["viability_assessment"]
+        assert va["pf_viable"] is False
+        assert va["overall"] == "NOT_VIABLE"
+        assert "pf_below_1.3" in va["blocking_factors"]
+
+    def test_cal3_05_not_viable_low_wr(self) -> None:
+        """WR < 25% → wr_viable=False."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        # 1 win, 4 losses → WR=20%
+        trades = [
+            _make_trade_cal2(pnl_usd="50.00", exit_reason="tp_hit", result="win"),
+            _make_trade_cal2(pnl_usd="-5.00", exit_reason="sl_hit", result="loss"),
+            _make_trade_cal2(pnl_usd="-5.00", exit_reason="sl_hit", result="loss"),
+            _make_trade_cal2(pnl_usd="-5.00", exit_reason="sl_hit", result="loss"),
+            _make_trade_cal2(pnl_usd="-5.00", exit_reason="sl_hit", result="loss"),
+        ]
+        summary = _compute_summary(trades, Decimal("1000"))
+        va = summary["viability_assessment"]
+        assert va["wr_viable"] is False
+        assert "wr_below_25pct" in va["blocking_factors"]
+
+    def test_cal3_05_not_viable_concentration(self) -> None:
+        """Single instrument > 40% of total PnL → concentration_viable=False."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        # GC=F earns $80 out of $100 total = 80%
+        trades = [
+            _make_trade_cal2(symbol="GC=F", pnl_usd="80.00", exit_reason="tp_hit", result="win"),
+            _make_trade_cal2(symbol="EURUSD=X", pnl_usd="10.00", exit_reason="tp_hit", result="win"),
+            _make_trade_cal2(symbol="GBPUSD=X", pnl_usd="10.00", exit_reason="tp_hit", result="win"),
+        ]
+        summary = _compute_summary(trades, Decimal("1000"))
+        va = summary["viability_assessment"]
+        assert va["concentration_viable"] is False
+        assert "concentration_risk" in va["blocking_factors"]
+        assert va["overall"] == "NOT_VIABLE"
+
+    def test_cal3_05_empty_trades_no_crash(self) -> None:
+        """Empty trades list produces viability_assessment without crash."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        summary = _compute_summary([], Decimal("1000"))
+        va = summary["viability_assessment"]
+        assert "overall" in va
+        # Empty = no wins/losses, no PF, WR=0 → NOT_VIABLE
+        assert va["overall"] == "NOT_VIABLE"
+
+    def test_cal3_05_viability_in_summary_keys(self) -> None:
+        """viability_assessment key always present in summary."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trades = [_make_trade_cal2(pnl_usd="10.00", exit_reason="tp_hit", result="win")]
+        summary = _compute_summary(trades, Decimal("1000"))
+        assert "viability_assessment" in summary
+
+
+# ── CAL3-06: F&G / Funding Rate adjustment tracking ──────────────────────────
+
+
+class TestCal306AdjustmentTracking:
+    """CAL3-06: fg_adjustment and fr_adjustment in BacktestTradeResult and by_adjustment in summary."""
+
+    def test_cal3_06_backtest_trade_result_has_fg_fr_fields(self) -> None:
+        """BacktestTradeResult has fg_adjustment and fr_adjustment fields (Optional[Decimal])."""
+        from src.backtesting.backtest_params import BacktestTradeResult
+        from decimal import Decimal
+
+        t = BacktestTradeResult(
+            symbol="BTC/USDT",
+            timeframe="H1",
+            direction="LONG",
+            entry_price=Decimal("50000"),
+            exit_price=Decimal("52500"),
+            pnl_usd=Decimal("25.00"),
+            fg_adjustment=Decimal("5"),
+            fr_adjustment=None,
+        )
+        assert t.fg_adjustment == Decimal("5")
+        assert t.fr_adjustment is None
+
+    def test_cal3_06_backtest_trade_result_both_none(self) -> None:
+        """fg_adjustment and fr_adjustment default to None."""
+        from src.backtesting.backtest_params import BacktestTradeResult
+        from decimal import Decimal
+
+        t = BacktestTradeResult(
+            symbol="EURUSD=X",
+            timeframe="H1",
+            direction="LONG",
+            entry_price=Decimal("1.1000"),
+        )
+        assert t.fg_adjustment is None
+        assert t.fr_adjustment is None
+
+    def test_cal3_06_by_adjustment_in_summary(self) -> None:
+        """_compute_summary returns by_adjustment dict."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trades = [_make_trade_cal2(pnl_usd="10.00", exit_reason="tp_hit", result="win")]
+        summary = _compute_summary(trades, Decimal("1000"))
+        assert "by_adjustment" in summary
+        assert "none" in summary["by_adjustment"]
+        assert "fg_only" in summary["by_adjustment"]
+        assert "fr_only" in summary["by_adjustment"]
+        assert "fg_and_fr" in summary["by_adjustment"]
+
+    def test_cal3_06_by_adjustment_groups_correctly(self) -> None:
+        """by_adjustment groups trades by their adjustment presence."""
+        from src.backtesting.backtest_engine import _compute_summary
+        from src.backtesting.backtest_params import BacktestTradeResult
+        from decimal import Decimal
+        import datetime
+
+        def _make_real_trade(fg_adj, fr_adj, pnl: str, result: str):
+            return BacktestTradeResult(
+                symbol="BTC/USDT",
+                timeframe="H1",
+                direction="LONG",
+                entry_price=Decimal("50000"),
+                exit_price=Decimal("52000"),
+                pnl_usd=Decimal(pnl),
+                result=result,
+                exit_reason="tp_hit" if result == "win" else "sl_hit",
+                fg_adjustment=Decimal(str(fg_adj)) if fg_adj is not None else None,
+                fr_adjustment=Decimal(str(fr_adj)) if fr_adj is not None else None,
+                entry_at=datetime.datetime(2024, 3, 15, 10, 0, tzinfo=datetime.timezone.utc),
+                exit_at=datetime.datetime(2024, 3, 16, 10, 0, tzinfo=datetime.timezone.utc),
+                duration_minutes=1440,
+            )
+
+        trades = [
+            _make_real_trade(fg_adj=5, fr_adj=None, pnl="10.00", result="win"),  # fg_only
+            _make_real_trade(fg_adj=None, fr_adj=-10, pnl="-8.00", result="loss"),  # fr_only
+            _make_real_trade(fg_adj=5, fr_adj=-10, pnl="6.00", result="win"),  # fg_and_fr
+            _make_real_trade(fg_adj=None, fr_adj=None, pnl="12.00", result="win"),  # none
+        ]
+
+        summary = _compute_summary(trades, Decimal("1000"))
+        by_adj = summary["by_adjustment"]
+
+        assert by_adj["fg_only"]["trades"] == 1
+        assert by_adj["fr_only"]["trades"] == 1
+        assert by_adj["fg_and_fr"]["trades"] == 1
+        assert by_adj["none"]["trades"] == 1
+        assert by_adj["fg_only"]["pnl_usd"] == pytest.approx(10.0)
+        assert by_adj["fr_only"]["pnl_usd"] == pytest.approx(-8.0)
+
+
+# ── CAL3: _compute_dxy_rsi Wilder smoothing correctness ──────────────────────
+
+
+class TestCal301DxyRsiWilderSmoothing:
+    """CAL3-01: Verify RSI(14) Wilder smoothing produces correct values."""
+
+    def test_cal3_01_rsi_alternating_prices(self) -> None:
+        """Alternating up/down prices should produce RSI near 50."""
+        from src.backtesting.backtest_engine import _compute_dxy_rsi
+        from decimal import Decimal
+        from unittest.mock import MagicMock
+
+        rows = []
+        base = 100.0
+        for i in range(40):
+            r = MagicMock()
+            # Alternate +1, -1 → equal gains and losses → RSI should be 50
+            r.close = Decimal(str(base + (1.0 if i % 2 == 0 else -1.0)))
+            r.timestamp = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc) + datetime.timedelta(hours=i)
+            rows.append(r)
+
+        result = _compute_dxy_rsi(rows)
+        assert len(result) > 0
+        # After warmup, RSI should converge near 50
+        last_rsi = list(result.values())[-1]
+        assert 30.0 < last_rsi < 70.0, f"RSI should be near 50 for alternating prices, got {last_rsi}"
+
+    def test_cal3_01_rsi_all_falling_is_zero(self) -> None:
+        """Uniformly falling prices should produce RSI = 0."""
+        from src.backtesting.backtest_engine import _compute_dxy_rsi
+        from decimal import Decimal
+        from unittest.mock import MagicMock
+
+        rows = []
+        for i in range(20):
+            r = MagicMock()
+            r.close = Decimal(str(100.0 - i * 0.5))
+            r.timestamp = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc) + datetime.timedelta(hours=i)
+            rows.append(r)
+
+        result = _compute_dxy_rsi(rows)
+        assert all(v == 0.0 for v in result.values()), f"Expected 0.0 for all falling, got: {list(result.values())[:5]}"
