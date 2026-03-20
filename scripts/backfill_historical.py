@@ -16,16 +16,23 @@ Usage:
 
 import argparse
 import asyncio
+import datetime
 import logging
 import sys
+from decimal import Decimal
 from pathlib import Path
-from typing import Callable, Coroutine
+from typing import Any, Callable, Coroutine
+
+import httpx
 
 # Allow running from project root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.collectors.macro_collector import FRED_BASE_URL, FRED_SERIES
+from src.config import settings
+from src.database.crud import upsert_macro_data
 from src.database.engine import async_session_factory
 
 logging.basicConfig(
@@ -35,6 +42,81 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+_FRED_BACKFILL_START = "2000-01-01"
+_FRED_REQUEST_LIMIT = 10000
+_FRED_RATE_LIMIT_SECONDS = 1.0  # conservative: FRED allows 120/min
+
+
+async def _fetch_fred_series(
+    client: httpx.AsyncClient,
+    series_id: str,
+    api_key: str,
+    observation_start: str,
+) -> list[dict[str, Any]]:
+    """Fetch all observations for a single FRED series.
+
+    Args:
+        client: Shared httpx async client.
+        series_id: FRED series identifier (e.g. "FEDFUNDS").
+        api_key: FRED API key from settings.
+        observation_start: ISO date string, e.g. "2000-01-01".
+
+    Returns:
+        List of observation dicts from the FRED API response.
+    """
+    params = {
+        "series_id": series_id,
+        "api_key": api_key,
+        "file_type": "json",
+        "observation_start": observation_start,
+        "sort_order": "asc",
+        "limit": _FRED_REQUEST_LIMIT,
+    }
+    response = await client.get(FRED_BASE_URL, params=params)
+    response.raise_for_status()
+    data = response.json()
+    return data.get("observations", [])
+
+
+def _parse_fred_observations(
+    series_id: str,
+    observations: list[dict[str, Any]],
+    country: str,
+) -> list[dict[str, Any]]:
+    """Convert raw FRED observations into records ready for upsert.
+
+    Skips observations where value == "." (FRED missing data marker).
+
+    Args:
+        series_id: FRED series identifier used as indicator_name.
+        observations: Raw list from FRED API.
+        country: Country code from FRED_SERIES metadata (e.g. "US").
+
+    Returns:
+        List of dicts matching MacroData table fields.
+    """
+    records: list[dict[str, Any]] = []
+    for obs in observations:
+        raw_value = obs.get("value", ".")
+        if raw_value == ".":
+            continue
+        try:
+            release_dt = datetime.datetime.strptime(
+                obs["date"], "%Y-%m-%d"
+            ).replace(tzinfo=datetime.timezone.utc)
+            records.append({
+                "indicator_name": series_id,
+                "country": country,
+                "value": Decimal(str(raw_value)),
+                "previous_value": None,
+                "forecast_value": None,
+                "release_date": release_dt,
+                "source": "FRED",
+            })
+        except (ValueError, KeyError, Exception) as exc:
+            logger.warning("[FRED] Skipping observation for %s date=%s: %s", series_id, obs.get("date"), exc)
+    return records
+
 
 async def backfill_fred(session: AsyncSession, dry_run: bool = False) -> int:
     """Backfill FRED macro data (25-year history).
@@ -42,9 +124,88 @@ async def backfill_fred(session: AsyncSession, dry_run: bool = False) -> int:
     Fetches macroeconomic indicators from the Federal Reserve Economic Data API:
     GDP, CPI, unemployment rate, federal funds rate, etc.
     Implemented in TASK-V7-06.
+
+    Args:
+        session: Async SQLAlchemy session (transaction managed here).
+        dry_run: If True, log what would be inserted but skip DB writes.
+
+    Returns:
+        Total number of records upserted (0 in dry_run mode).
     """
-    logger.warning("backfill_fred: not yet implemented (TASK-V7-06)")
-    return 0
+    api_key = settings.FRED_KEY
+    if not api_key:
+        logger.warning("[FRED] FRED_KEY not configured — skipping backfill")
+        return 0
+
+    total_upserted = 0
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for series_id, meta in FRED_SERIES.items():
+            country = meta.get("country", "US")
+            series_name = meta.get("name", series_id)
+
+            try:
+                observations = await _fetch_fred_series(
+                    client=client,
+                    series_id=series_id,
+                    api_key=api_key,
+                    observation_start=_FRED_BACKFILL_START,
+                )
+            except httpx.HTTPStatusError as exc:
+                logger.error(
+                    "[FRED] HTTP error fetching %s: %s %s",
+                    series_id,
+                    exc.response.status_code,
+                    exc.response.text[:200],
+                )
+                await asyncio.sleep(_FRED_RATE_LIMIT_SECONDS)
+                continue
+            except httpx.RequestError as exc:
+                logger.error("[FRED] Request error fetching %s: %s", series_id, exc)
+                await asyncio.sleep(_FRED_RATE_LIMIT_SECONDS)
+                continue
+
+            records = _parse_fred_observations(series_id, observations, country)
+            skipped = len(observations) - len(records)
+
+            if dry_run:
+                logger.info(
+                    "[FRED] DRY-RUN %s (%s): would upsert %d records, skipped %d missing",
+                    series_id,
+                    series_name,
+                    len(records),
+                    skipped,
+                )
+            else:
+                if records:
+                    async with session.begin():
+                        count = await upsert_macro_data(session, records)
+                    total_upserted += count
+                    logger.info(
+                        "[FRED] %s (%s): upserted %d / %d observations (skipped %d missing)",
+                        series_id,
+                        series_name,
+                        count,
+                        len(observations),
+                        skipped,
+                    )
+                else:
+                    logger.info(
+                        "[FRED] %s (%s): no valid observations (all %d were missing)",
+                        series_id,
+                        series_name,
+                        len(observations),
+                    )
+
+            # Rate limit between requests
+            await asyncio.sleep(_FRED_RATE_LIMIT_SECONDS)
+
+    if not dry_run:
+        logger.info("[FRED] Backfill complete. Total upserted: %d", total_upserted)
+    else:
+        logger.info("[FRED] DRY-RUN complete. No records written.")
+
+    return total_upserted
 
 
 async def backfill_fear_greed(session: AsyncSession, dry_run: bool = False) -> int:
