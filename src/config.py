@@ -167,7 +167,19 @@ INSTRUMENT_OVERRIDES: dict = {
     "USDCHF=X": {
         "min_composite_score": 18,
     },
+    # V6 TASK-V6-09: SPY is consistently unprofitable (16.7% WR, -$114); apply strict
+    # regime + score gating. If still losing after tuning, exclude from default symbols.
+    "SPY": {
+        "min_composite_score": 25,
+        "allowed_regimes": ["STRONG_TREND_BULL", "STRONG_TREND_BEAR"],
+    },
 }
+
+# ── v6: SHORT signal quality (TASK-V6-08) ────────────────────────────────────
+# SHORT signals require stricter threshold (×1.2) and stronger momentum (RSI < 40).
+# Rationale: SHORT WR 36.84%, PnL -$72.18 — asymmetric penalty vs LONG.
+SHORT_SCORE_MULTIPLIER: float = 1.2   # SHORT effective_threshold *= 1.2
+SHORT_RSI_THRESHOLD: int = 40         # SHORT: RSI must be < 40 (not just < 50)
 
 # ── v6: Score component weights (TASK-V6-02) ─────────────────────────────────
 # Used for proportional threshold scaling.

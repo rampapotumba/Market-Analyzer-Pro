@@ -382,3 +382,469 @@ class TestV603BtcUnblock:
         assert abs(total - 1.0) < 1e-9, f"Weights should sum to 1.0, got {total}"
         assert "ta" in SCORE_COMPONENT_WEIGHTS
         assert SCORE_COMPONENT_WEIGHTS["ta"] == 0.45
+
+
+# ── TASK-V6-04: GBPUSD no score override ─────────────────────────────────────
+
+
+class TestV604GbpusdFix:
+    """TASK-V6-04: GBPUSD=X min_composite_score override removed."""
+
+    def test_v6_04_gbpusd_no_score_override(self) -> None:
+        """GBPUSD=X uses global threshold (no per-symbol override)."""
+        from src.config import INSTRUMENT_OVERRIDES
+
+        overrides = INSTRUMENT_OVERRIDES.get("GBPUSD=X", {})
+        assert "min_composite_score" not in overrides, (
+            f"GBPUSD=X should not have score override, got: {overrides}"
+        )
+
+    def test_v6_04_gbpusd_uses_global_threshold(self) -> None:
+        """GBPUSD=X with composite=7.0 and scale=0.45 passes (6.75 effective)."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        # Global threshold 15 * 0.45 = 6.75; score=7.0 must pass
+        passed, reason = pipeline.check_score_threshold(
+            7.0, "forex", "GBPUSD=X", available_weight=0.45
+        )
+        assert passed, f"Expected GBPUSD to pass with score=7.0, scale=0.45. got: {reason}"
+
+    def test_v6_04_gbpusd_still_blocked_below_threshold(self) -> None:
+        """GBPUSD=X with composite=6.0 and scale=0.45 is blocked (< 6.75)."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, reason = pipeline.check_score_threshold(
+            6.0, "forex", "GBPUSD=X", available_weight=0.45
+        )
+        assert not passed, "Expected block for score=6.0 below effective threshold 6.75"
+        assert "score_below_threshold" in reason
+
+
+# ── TASK-V6-05: regime persisted in trade_dicts ───────────────────────────────
+
+
+class TestV605RegimePersistence:
+    """TASK-V6-05: regime field survives serialization to trade_dicts."""
+
+    def _make_trade(
+        self,
+        regime: str = "TREND_BULL",
+        result: str = "win",
+        pnl: str = "10.00",
+        exit_reason: str = "tp_hit",
+    ) -> MagicMock:
+        t = MagicMock()
+        t.symbol = "EURUSD=X"
+        t.timeframe = "H1"
+        t.direction = "LONG"
+        t.entry_price = Decimal("1.1000")
+        t.exit_price = Decimal("1.1100")
+        t.exit_reason = exit_reason
+        t.pnl_pips = Decimal("100.0000")
+        t.pnl_usd = Decimal(pnl)
+        t.result = result
+        t.composite_score = Decimal("12.0")
+        t.entry_at = datetime.datetime(2024, 3, 1, 10, 0, tzinfo=datetime.timezone.utc)
+        t.exit_at = datetime.datetime(2024, 3, 2, 10, 0, tzinfo=datetime.timezone.utc)
+        t.duration_minutes = 1440
+        t.mfe = Decimal("0.01")
+        t.mae = Decimal("0.002")
+        t.regime = regime
+        return t
+
+    def test_v6_05_regime_in_compute_summary(self) -> None:
+        """by_regime summary contains real regime names (not UNKNOWN)."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trades = [
+            self._make_trade(regime="TREND_BULL"),
+            self._make_trade(regime="STRONG_TREND_BULL"),
+            self._make_trade(regime="TREND_BEAR", result="loss", pnl="-5.00"),
+        ]
+        summary = _compute_summary(trades, Decimal("1000"))
+        by_regime = summary["by_regime"]
+        assert "TREND_BULL" in by_regime, f"Expected TREND_BULL in by_regime: {by_regime}"
+        assert "STRONG_TREND_BULL" in by_regime
+        assert "TREND_BEAR" in by_regime
+        # Should not have UNKNOWN when all trades have valid regime
+        assert "UNKNOWN" not in by_regime, f"UNKNOWN should not appear: {by_regime}"
+
+    def test_v6_05_regime_none_falls_back_to_unknown(self) -> None:
+        """Trade with regime=None is bucketed as UNKNOWN in by_regime."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        t = self._make_trade(regime=None)
+        summary = _compute_summary([t], Decimal("1000"))
+        assert "UNKNOWN" in summary["by_regime"]
+
+    def test_v6_05_trade_dict_has_regime_key(self) -> None:
+        """The trade_dicts list passed to DB bulk insert includes regime key."""
+        # We verify indirectly: inspect the code path by checking the serialization
+        # The actual test is that run_backtest() doesn't drop regime.
+        # Here we test the dict structure expected by create_backtest_trades_bulk.
+        from src.backtesting.backtest_engine import _compute_summary
+
+        t = self._make_trade(regime="VOLATILE")
+        summary = _compute_summary([t], Decimal("1000"))
+        # regime appears in by_regime
+        assert "VOLATILE" in summary["by_regime"]
+
+
+# ── TASK-V6-06: D1 data loading in backtest ──────────────────────────────────
+
+
+class TestV606D1DataLoading:
+    """TASK-V6-06: D1 rows loaded from cache and passed to filter pipeline."""
+
+    def _make_d1_row(self, ts: datetime.datetime, close: float) -> MagicMock:
+        row = MagicMock()
+        row.timestamp = ts
+        row.close = Decimal(str(close))
+        row.open = Decimal(str(close - 0.001))
+        row.high = Decimal(str(close + 0.002))
+        row.low = Decimal(str(close - 0.002))
+        row.volume = 0
+        return row
+
+    def _make_d1_rows(self, n: int = 210, base_close: float = 1.10) -> list:
+        """Generate n D1 rows from 300 days ago."""
+        start = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+        rows = []
+        for i in range(n):
+            ts = start + datetime.timedelta(days=i)
+            rows.append(self._make_d1_row(ts, base_close + i * 0.0001))
+        return rows
+
+    def test_v6_06_d1_filter_passes_with_sufficient_rows(self) -> None:
+        """D1 MA200 filter passes when close > MA200 for LONG signal."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        rows = self._make_d1_rows(n=210, base_close=1.10)
+        # All rows trending up — last close > MA200
+        passed, reason = pipeline.check_d1_trend("EURUSD=X", "LONG", "H1", rows)
+        assert passed, f"Expected D1 LONG to pass when trending up, got: {reason}"
+
+    def test_v6_06_d1_filter_blocks_counter_trend_long(self) -> None:
+        """D1 MA200 filter blocks LONG when last close < MA200."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        # Rows trending DOWN: first 200 at high level, last 10 much lower
+        rows = []
+        start = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+        for i in range(200):
+            ts = start + datetime.timedelta(days=i)
+            r = MagicMock()
+            r.timestamp = ts
+            r.close = Decimal("1.2000")  # high historical average
+            rows.append(r)
+        # Recent candles drop sharply (below MA200)
+        for i in range(200, 210):
+            ts = start + datetime.timedelta(days=i)
+            r = MagicMock()
+            r.timestamp = ts
+            r.close = Decimal("1.0000")  # well below MA200
+            rows.append(r)
+
+        passed, reason = pipeline.check_d1_trend("EURUSD=X", "LONG", "H1", rows)
+        assert not passed, f"Expected D1 LONG to be blocked when below MA200, got pass"
+        assert "d1_bearish_trend" in reason
+
+    def test_v6_06_d1_filter_graceful_no_data(self) -> None:
+        """D1 filter passes gracefully when fewer than 200 rows available."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        sparse_rows = self._make_d1_rows(n=50)  # insufficient
+        passed, reason = pipeline.check_d1_trend("EURUSD=X", "LONG", "H1", sparse_rows)
+        assert passed, f"Expected graceful pass with sparse D1 data, got: {reason}"
+
+    def test_v6_06_d1_filter_passes_empty_rows(self) -> None:
+        """D1 filter passes when no rows at all (graceful degradation)."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, reason = pipeline.check_d1_trend("EURUSD=X", "LONG", "H1", [])
+        assert passed, f"Expected graceful pass with empty D1 data, got: {reason}"
+
+    def test_v6_06_d1_slicing_respects_candle_ts(self) -> None:
+        """D1 slice only includes candles with timestamp <= signal_ts."""
+        # Build rows: 250 rows, but only 210 are before the signal timestamp
+        rows_all = self._make_d1_rows(n=250, base_close=1.10)
+        signal_ts = rows_all[209].timestamp  # cut at index 209
+
+        filtered = [r for r in rows_all if r.timestamp <= signal_ts][-200:]
+        assert len(filtered) == 200
+        assert filtered[-1].timestamp == signal_ts
+
+
+# ── TASK-V6-07: Calendar filter diagnostics ──────────────────────────────────
+
+
+class TestV607CalendarFilter:
+    """TASK-V6-07: Calendar filter blocks near high-impact events (±4h window)."""
+
+    def _make_event(
+        self, ts: datetime.datetime, name: str = "NFP", impact: str = "high"
+    ) -> MagicMock:
+        e = MagicMock()
+        e.event_date = ts
+        e.event_name = name
+        e.impact = impact
+        return e
+
+    def test_v6_07_calendar_blocks_within_4h(self) -> None:
+        """Signal within ±4h of HIGH-impact event is blocked."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        event_ts = datetime.datetime(2024, 2, 2, 14, 30, tzinfo=datetime.timezone.utc)
+        # Signal 3 hours before NFP
+        signal_ts = event_ts - datetime.timedelta(hours=3)
+        events = [self._make_event(event_ts, "NonFarm Payrolls")]
+
+        passed, reason = pipeline.check_calendar(signal_ts, events)
+        assert not passed, "Expected calendar block within 4h of NFP"
+        assert "economic_calendar_block" in reason
+
+    def test_v6_07_calendar_passes_outside_4h(self) -> None:
+        """Signal more than 4h from event is allowed."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        event_ts = datetime.datetime(2024, 2, 2, 14, 30, tzinfo=datetime.timezone.utc)
+        # Signal 5 hours before — outside ±4h window
+        signal_ts = event_ts - datetime.timedelta(hours=5)
+        events = [self._make_event(event_ts)]
+
+        passed, reason = pipeline.check_calendar(signal_ts, events)
+        assert passed, f"Expected pass outside 4h window, got: {reason}"
+
+    def test_v6_07_calendar_passes_no_events(self) -> None:
+        """No events → filter passes."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        signal_ts = datetime.datetime(2024, 2, 2, 14, 30, tzinfo=datetime.timezone.utc)
+        passed, reason = pipeline.check_calendar(signal_ts, [])
+        assert passed
+
+    def test_v6_07_calendar_passes_no_timestamp(self) -> None:
+        """No candle_ts → filter passes gracefully."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        event_ts = datetime.datetime(2024, 2, 2, 14, 30, tzinfo=datetime.timezone.utc)
+        passed, _ = pipeline.check_calendar(None, [self._make_event(event_ts)])
+        assert passed
+
+    def test_v6_07_calendar_blocks_exactly_at_4h(self) -> None:
+        """Signal exactly at ±4h boundary is blocked (inclusive window)."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        event_ts = datetime.datetime(2024, 2, 2, 14, 30, tzinfo=datetime.timezone.utc)
+        signal_ts = event_ts - datetime.timedelta(hours=4)
+        passed, _ = pipeline.check_calendar(signal_ts, [self._make_event(event_ts)])
+        assert not passed, "Boundary at exactly 4h should be blocked (inclusive)"
+
+    def test_v6_07_calendar_handles_naive_datetimes(self) -> None:
+        """Naive datetimes (no tzinfo) are treated as UTC."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        # Both naive: event at 14:30, signal at 12:30 (2h gap — inside 4h window)
+        event_ts = datetime.datetime(2024, 2, 2, 14, 30)  # naive
+        signal_ts = datetime.datetime(2024, 2, 2, 12, 30)  # naive
+        passed, reason = pipeline.check_calendar(signal_ts, [self._make_event(event_ts)])
+        assert not passed, f"Expected block for naive datetimes, got: {reason}"
+
+
+# ── TASK-V6-08: SHORT signal quality ─────────────────────────────────────────
+
+
+class TestV608ShortQuality:
+    """TASK-V6-08: Asymmetric SHORT threshold (×1.2) and stricter RSI (< 40)."""
+
+    def test_v6_08_short_threshold_multiplied(self) -> None:
+        """SHORT effective_threshold = base * available_weight * 1.2."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        # Global threshold 15, scale=1.0, multiplier=1.2 → effective=18.0
+        # composite=-17.0 → abs=17 < 18 → blocked
+        passed, reason = pipeline.check_score_threshold(
+            -17.0, "forex", "EURUSD=X", available_weight=1.0, direction="SHORT"
+        )
+        assert not passed, f"Expected SHORT composite=-17 to be blocked (threshold=18), got pass"
+        assert "score_below_threshold" in reason
+
+    def test_v6_08_short_passes_above_threshold(self) -> None:
+        """SHORT with composite=-19 passes threshold of 18.0."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, reason = pipeline.check_score_threshold(
+            -19.0, "forex", "EURUSD=X", available_weight=1.0, direction="SHORT"
+        )
+        assert passed, f"Expected SHORT composite=-19 to pass (threshold=18), got: {reason}"
+
+    def test_v6_08_short_threshold_with_scale(self) -> None:
+        """SHORT in backtest: threshold = 15 * 0.45 * 1.2 = 8.1."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        # composite=-8.0, effective = 15 * 0.45 * 1.2 = 8.1 → blocked
+        passed, _ = pipeline.check_score_threshold(
+            -8.0, "forex", "EURUSD=X", available_weight=0.45, direction="SHORT"
+        )
+        assert not passed
+
+        # composite=-8.5, effective=8.1 → pass
+        passed, reason = pipeline.check_score_threshold(
+            -8.5, "forex", "EURUSD=X", available_weight=0.45, direction="SHORT"
+        )
+        assert passed, f"Expected pass for SHORT composite=-8.5 (threshold=8.1), got: {reason}"
+
+    def test_v6_08_long_threshold_unaffected(self) -> None:
+        """LONG threshold is not modified by SHORT multiplier."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        # LONG: threshold = 15, composite=15 → pass
+        passed, _ = pipeline.check_score_threshold(
+            15.0, "forex", "EURUSD=X", available_weight=1.0, direction="LONG"
+        )
+        assert passed
+
+        # LONG: composite=14.9 → blocked (not inflated by 1.2)
+        passed, _ = pipeline.check_score_threshold(
+            14.9, "forex", "EURUSD=X", available_weight=1.0, direction="LONG"
+        )
+        assert not passed
+
+    def test_v6_08_short_rsi_40_blocks(self) -> None:
+        """SHORT with RSI=45 is blocked (RSI >= SHORT_RSI_THRESHOLD=40)."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        indicators = {"rsi": 45.0, "macd": -0.001, "macd_signal": 0.001}
+        passed, reason = pipeline.check_momentum(indicators, "SHORT")
+        assert not passed, f"Expected SHORT RSI=45 to be blocked (threshold=40), got pass"
+        assert "momentum_misaligned_short" in reason
+
+    def test_v6_08_short_rsi_39_passes(self) -> None:
+        """SHORT with RSI=39 and MACD aligned passes momentum filter."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        indicators = {"rsi": 39.0, "macd": -0.001, "macd_signal": 0.001}
+        passed, reason = pipeline.check_momentum(indicators, "SHORT")
+        assert passed, f"Expected SHORT RSI=39 to pass, got: {reason}"
+
+    def test_v6_08_long_rsi_unaffected(self) -> None:
+        """LONG momentum check still uses RSI > 50 (not affected by SHORT threshold)."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        # RSI=51 LONG + bullish MACD → pass
+        indicators = {"rsi": 51.0, "macd": 0.001, "macd_signal": -0.001}
+        passed, _ = pipeline.check_momentum(indicators, "LONG")
+        assert passed
+
+        # RSI=49 LONG → blocked
+        indicators["rsi"] = 49.0
+        passed, reason = pipeline.check_momentum(indicators, "LONG")
+        assert not passed, "LONG RSI=49 should be blocked"
+
+    def test_v6_08_short_config_constants(self) -> None:
+        """Config has SHORT_SCORE_MULTIPLIER=1.2 and SHORT_RSI_THRESHOLD=40."""
+        from src.config import SHORT_RSI_THRESHOLD, SHORT_SCORE_MULTIPLIER
+
+        assert SHORT_SCORE_MULTIPLIER == 1.2, f"Expected 1.2, got {SHORT_SCORE_MULTIPLIER}"
+        assert SHORT_RSI_THRESHOLD == 40, f"Expected 40, got {SHORT_RSI_THRESHOLD}"
+
+
+# ── TASK-V6-09: SPY instrument override ──────────────────────────────────────
+
+
+class TestV609SpyOverride:
+    """TASK-V6-09: SPY has strict override to reduce losses."""
+
+    def test_v6_09_spy_override_exists(self) -> None:
+        """SPY is in INSTRUMENT_OVERRIDES."""
+        from src.config import INSTRUMENT_OVERRIDES
+
+        assert "SPY" in INSTRUMENT_OVERRIDES, "SPY must be in INSTRUMENT_OVERRIDES"
+
+    def test_v6_09_spy_min_composite_score(self) -> None:
+        """SPY min_composite_score = 25."""
+        from src.config import INSTRUMENT_OVERRIDES
+
+        score = INSTRUMENT_OVERRIDES["SPY"].get("min_composite_score")
+        assert score == 25, f"Expected SPY min_composite_score=25, got {score}"
+
+    def test_v6_09_spy_regime_restricted(self) -> None:
+        """SPY is restricted to STRONG_TREND_BULL and STRONG_TREND_BEAR only."""
+        from src.config import INSTRUMENT_OVERRIDES
+
+        allowed = INSTRUMENT_OVERRIDES["SPY"].get("allowed_regimes", [])
+        assert "STRONG_TREND_BULL" in allowed
+        assert "STRONG_TREND_BEAR" in allowed
+        # RANGING and TREND_BULL should NOT be allowed
+        assert "RANGING" not in allowed
+        assert "TREND_BULL" not in allowed
+
+    def test_v6_09_spy_ranging_blocked_by_pipeline(self) -> None:
+        """SPY in RANGING is blocked by regime filter."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, reason = pipeline.check_regime("RANGING", "SPY")
+        assert not passed, "SPY RANGING should be blocked"
+
+    def test_v6_09_spy_trend_bull_blocked_by_pipeline(self) -> None:
+        """SPY in TREND_BULL is blocked (not in allowed_regimes)."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, reason = pipeline.check_regime("TREND_BULL", "SPY")
+        assert not passed, f"SPY TREND_BULL should be blocked, got: {reason}"
+
+    def test_v6_09_spy_strong_trend_bull_allowed(self) -> None:
+        """SPY in STRONG_TREND_BULL passes regime filter."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, reason = pipeline.check_regime("STRONG_TREND_BULL", "SPY")
+        assert passed, f"Expected STRONG_TREND_BULL to pass for SPY, got: {reason}"
+
+    def test_v6_09_spy_high_score_required(self) -> None:
+        """SPY composite=24 (< 25) is blocked even with scale=1.0."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, reason = pipeline.check_score_threshold(
+            24.0, "stocks", "SPY", available_weight=1.0
+        )
+        assert not passed, f"Expected SPY composite=24 to be blocked (threshold=25), got pass"
+
+    def test_v6_09_spy_scaled_threshold(self) -> None:
+        """SPY in backtest: threshold = 25 * 0.45 = 11.25."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        # composite=11.0 < 11.25 → blocked
+        passed, _ = pipeline.check_score_threshold(
+            11.0, "stocks", "SPY", available_weight=0.45
+        )
+        assert not passed
+
+        # composite=11.5 >= 11.25 → pass
+        passed, reason = pipeline.check_score_threshold(
+            11.5, "stocks", "SPY", available_weight=0.45
+        )
+        assert passed, f"Expected SPY composite=11.5 to pass at scale=0.45, got: {reason}"

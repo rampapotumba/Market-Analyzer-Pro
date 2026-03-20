@@ -790,6 +790,8 @@ class BacktestEngine:
                     "duration_minutes": t.duration_minutes,
                     "mfe": str(t.mfe) if t.mfe is not None else None,
                     "mae": str(t.mae) if t.mae is not None else None,
+                    # V6 TASK-V6-05: persist regime so by_regime summary has real names
+                    "regime": t.regime,
                 }
                 for t in trades
             ]
@@ -844,6 +846,33 @@ class BacktestEngine:
         if run_id:
             _backtest_progress[run_id] = 0.0
 
+        # V6 TASK-V6-06: Pre-load D1 data per symbol for MA200 trend filter.
+        # 300 extra days of history before start_dt ensure MA200 is warmed up from day 1.
+        _D1_WARMUP_DAYS = 300
+        d1_data_cache: dict[str, list] = {}
+        if params.apply_d1_trend_filter:
+            d1_start = start_dt - datetime.timedelta(days=_D1_WARMUP_DAYS)
+            for symbol in params.symbols:
+                try:
+                    instrument_for_d1 = await get_instrument_by_symbol(self.db, symbol)
+                    if instrument_for_d1 is not None:
+                        d1_rows = await get_price_data(
+                            self.db,
+                            instrument_for_d1.id,
+                            "D1",
+                            from_dt=d1_start,
+                            to_dt=end_dt,
+                            limit=10_000,
+                        )
+                        d1_data_cache[symbol] = d1_rows
+                        logger.info(
+                            "[V6-D1] D1 data for %s: %d rows (MA200 filter %s)",
+                            symbol, len(d1_rows),
+                            "active" if len(d1_rows) >= 200 else "will degrade (insufficient rows)",
+                        )
+                except Exception as exc:
+                    logger.warning("[V6-D1] Could not load D1 data for %s: %s", symbol, exc)
+
         for sym_idx, symbol in enumerate(params.symbols):
             instrument = await get_instrument_by_symbol(self.db, symbol)
             if instrument is None:
@@ -891,6 +920,7 @@ class BacktestEngine:
                 progress_cb=_progress_cb,
                 economic_events=economic_events,
                 params=params,
+                d1_rows_all=d1_data_cache.get(symbol, []),
             )
             trades.extend(symbol_trades)
 
@@ -911,6 +941,7 @@ class BacktestEngine:
         progress_cb: Any = None,
         economic_events: Optional[list] = None,
         params: Optional[BacktestParams] = None,
+        d1_rows_all: Optional[list] = None,
     ) -> list[BacktestTradeResult]:
         """Simulate one symbol over all its candles. Returns closed trades.
 
@@ -1081,6 +1112,11 @@ class BacktestEngine:
             if signal is None:
                 continue
 
+            # ── V6 TASK-V6-06: Slice D1 rows up to current candle timestamp ─────
+            # Returns last 200 D1 candles visible before signal timestamp (no lookahead).
+            _d1_all = d1_rows_all or []
+            d1_rows_for_filter = [r for r in _d1_all if r.timestamp <= candle_ts][-200:]
+
             # ── Run unified filter pipeline (SIM-42) ─────────────────────────
             filter_context = {
                 "composite_score": float(signal["composite_score"]),
@@ -1092,7 +1128,7 @@ class BacktestEngine:
                 "df": full_df.iloc[:i],   # O(1) pandas view — no copy
                 "ta_indicators": signal.get("ta_indicators", {}),
                 "candle_ts": candle_ts,
-                "d1_rows": [],   # D1 data not available in candle-level loop
+                "d1_rows": d1_rows_for_filter,  # V6-06: populated from pre-loaded D1 cache
                 "economic_events": economic_events or [],
                 "dxy_rsi": None,  # DXY not available in backtest without external data
                 # V6 TASK-V6-02: only TA available in backtest → proportional scaling

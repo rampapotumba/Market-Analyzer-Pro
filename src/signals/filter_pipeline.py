@@ -172,10 +172,12 @@ class SignalFilterPipeline:
             if not passed:
                 return False, reason
 
-        # SIM-25: Score threshold
+        # SIM-25: Score threshold (V6-08: direction passed for asymmetric SHORT threshold)
         if self.apply_score_filter:
             passed, reason = self.check_score_threshold(
-                composite, market_type, symbol, available_weight=available_weight
+                composite, market_type, symbol,
+                available_weight=available_weight,
+                direction=direction,
             )
             if not passed:
                 return False, reason
@@ -236,8 +238,9 @@ class SignalFilterPipeline:
         market_type: str,
         symbol: str,
         available_weight: float = 1.0,
+        direction: str = "LONG",
     ) -> tuple[bool, str]:
-        """SIM-25 + SIM-28 + V6-TASK-V6-02: composite score must exceed threshold.
+        """SIM-25 + SIM-28 + V6-TASK-V6-02 + V6-TASK-V6-08: composite score must exceed threshold.
 
         Priority (highest to lowest):
           1. instrument_override (INSTRUMENT_OVERRIDES[symbol])
@@ -248,8 +251,16 @@ class SignalFilterPipeline:
         V6 (TASK-V6-02): effective_threshold = threshold * available_weight.
         In backtest (only TA, available_weight=0.45): threshold 15 → 6.75.
         In live (all components, available_weight=1.0): threshold 15 → 15.0.
+
+        V6 (TASK-V6-08): SHORT signals require SHORT_SCORE_MULTIPLIER (×1.2) higher threshold.
+        SHORT WR was 36.84%, so we demand stronger conviction before going short.
         """
-        from src.config import INSTRUMENT_OVERRIDES, MIN_COMPOSITE_SCORE, MIN_COMPOSITE_SCORE_CRYPTO
+        from src.config import (
+            INSTRUMENT_OVERRIDES,
+            MIN_COMPOSITE_SCORE,
+            MIN_COMPOSITE_SCORE_CRYPTO,
+            SHORT_SCORE_MULTIPLIER,
+        )
 
         threshold = MIN_COMPOSITE_SCORE_CRYPTO if market_type == "crypto" else MIN_COMPOSITE_SCORE
         # Constructor override takes precedence over market default
@@ -262,6 +273,10 @@ class SignalFilterPipeline:
 
         # V6 TASK-V6-02: proportional scaling
         effective_threshold = threshold * available_weight
+
+        # V6 TASK-V6-08: asymmetric threshold — SHORT requires stricter conviction
+        if direction == "SHORT":
+            effective_threshold *= SHORT_SCORE_MULTIPLIER
 
         if abs(composite) < effective_threshold:
             return False, f"score_below_threshold:{composite:.1f}<{effective_threshold:.2f}"
@@ -325,7 +340,16 @@ class SignalFilterPipeline:
         return True, "ok"
 
     def check_momentum(self, ta_indicators: dict, direction: str) -> tuple[bool, str]:
-        """SIM-30: RSI and MACD alignment."""
+        """SIM-30 + V6-TASK-V6-08: RSI and MACD alignment.
+
+        LONG:  RSI > 50 AND MACD line > Signal line
+        SHORT: RSI < SHORT_RSI_THRESHOLD (40) AND MACD line < Signal line
+
+        V6 (TASK-V6-08): SHORT uses stricter RSI threshold (< 40 instead of < 50)
+        to filter out weak bearish signals that caused -$72.18 PnL.
+        """
+        from src.config import SHORT_RSI_THRESHOLD
+
         rsi = ta_indicators.get("rsi_14") or ta_indicators.get("rsi")
         macd_line = ta_indicators.get("macd_line") or ta_indicators.get("macd")
         macd_signal = ta_indicators.get("macd_signal") or ta_indicators.get("macd_signal_line")
@@ -341,8 +365,12 @@ class SignalFilterPipeline:
         )
         if direction == "LONG" and not (rsi_f > 50 and macd_f > sig_f):
             return False, f"momentum_misaligned_long:rsi={rsi_f:.1f},macd_diff={macd_f - sig_f:.5f}"
-        if direction == "SHORT" and not (rsi_f < 50 and macd_f < sig_f):
-            return False, f"momentum_misaligned_short:rsi={rsi_f:.1f},macd_diff={macd_f - sig_f:.5f}"
+        # V6 TASK-V6-08: SHORT requires RSI < 40 (not just < 50) for stronger bearish conviction
+        if direction == "SHORT" and not (rsi_f < SHORT_RSI_THRESHOLD and macd_f < sig_f):
+            return False, (
+                f"momentum_misaligned_short:rsi={rsi_f:.1f}"
+                f"(threshold<{SHORT_RSI_THRESHOLD}),macd_diff={macd_f - sig_f:.5f}"
+            )
         return True, "ok"
 
     def check_weekday(self, ts: datetime.datetime, market_type: str) -> tuple[bool, str]:
@@ -362,16 +390,72 @@ class SignalFilterPipeline:
         candle_ts: Optional[datetime.datetime],
         economic_events: list,
     ) -> tuple[bool, str]:
-        """SIM-33: Economic calendar ±2h filter."""
-        if not economic_events or candle_ts is None:
+        """SIM-33 + V6-TASK-V6-07: Economic calendar ±4h filter for HIGH-impact events.
+
+        V6 (TASK-V6-07): Window extended from ±2h to ±4h for HIGH-impact events.
+        Rationale: Phase 2 (calendar OFF) and Phase 3 (calendar ON) produced identical
+        results because the 2h window was too narrow — many H1 signals landed just outside.
+
+        Timezone handling: both candle_ts and event_dt are treated as UTC.
+        If both are naive datetimes they are compared directly (same tz assumption).
+        """
+        if candle_ts is None:
+            logger.debug("[SIM-33] Calendar check skipped: no candle timestamp")
             return True, "ok"
-        window = datetime.timedelta(hours=2)
+        if not economic_events:
+            logger.debug("[SIM-33] Calendar check: no events loaded, signal passes")
+            return True, "ok"
+
+        # V6-07: use ±4h window instead of ±2h
+        window = datetime.timedelta(hours=4)
+
+        # Normalise candle_ts to UTC-aware for comparison
+        if candle_ts.tzinfo is None:
+            candle_ts_utc = candle_ts.replace(tzinfo=datetime.timezone.utc)
+        else:
+            candle_ts_utc = candle_ts
+
+        nearest_event_name: Optional[str] = None
+        nearest_delta_h: Optional[float] = None
+
         for event in economic_events:
             event_dt = getattr(event, "event_date", None) or getattr(event, "scheduled_at", None)
             if event_dt is None:
                 continue
-            if abs((candle_ts - event_dt).total_seconds()) <= window.total_seconds():
+            # Normalise event_dt timezone
+            if event_dt.tzinfo is None:
+                event_dt_utc = event_dt.replace(tzinfo=datetime.timezone.utc)
+            else:
+                event_dt_utc = event_dt
+
+            delta = abs((candle_ts_utc - event_dt_utc).total_seconds())
+            if delta <= window.total_seconds():
+                event_name = getattr(event, "event_name", str(event))
+                logger.info(
+                    "[SIM-33] Calendar BLOCK: signal_ts=%s, event='%s' at %s, delta=%.1fh",
+                    candle_ts_utc.isoformat(),
+                    event_name,
+                    event_dt_utc.isoformat(),
+                    delta / 3600,
+                )
+                # Keep reason = "economic_calendar_block" for backward compatibility.
+                # Event name is logged above for diagnostics (not included in reason string).
                 return False, "economic_calendar_block"
+
+            # Track nearest event for diagnostics
+            delta_h = delta / 3600
+            if nearest_delta_h is None or delta_h < nearest_delta_h:
+                nearest_delta_h = delta_h
+                nearest_event_name = getattr(event, "event_name", str(event))
+
+        logger.debug(
+            "[SIM-33] Calendar PASS: signal_ts=%s, checked %d events, "
+            "nearest='%s' at %.1fh",
+            candle_ts_utc.isoformat(),
+            len(economic_events),
+            nearest_event_name,
+            nearest_delta_h if nearest_delta_h is not None else -1.0,
+        )
         return True, "ok"
 
     def check_signal_strength(
