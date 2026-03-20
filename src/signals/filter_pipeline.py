@@ -182,6 +182,12 @@ class SignalFilterPipeline:
                 self.rejection_counts[filter_name] += 1
             return passed, reason
 
+        # R5: Blocked instrument check — O(1) set lookup, runs before all other filters
+        passed, reason = self.check_blocked_instrument(symbol)
+        passed, reason = _check_and_count("instrument_blocked", passed, reason)
+        if not passed:
+            return False, reason
+
         # Session filter: must run first (cheapest check)
         if self.apply_session_filter and candle_ts is not None:
             passed, reason = self.check_session_liquidity(candle_ts, symbol, market_type)
@@ -580,6 +586,20 @@ class SignalFilterPipeline:
         if dxy_rsi < 45 and direction == "SHORT":
             logger.debug("[SIM-38] DXY RSI=%.1f < 45: blocking SHORT for %s", dxy_rsi, symbol)
             return False, f"dxy_weak_blocks_short:{symbol}"
+        return True, "ok"
+
+    def check_blocked_instrument(self, symbol: str) -> tuple[bool, str]:
+        """R5: Block instruments with no demonstrated edge.
+
+        BLOCKED_INSTRUMENTS applies to both live and backtest paths.
+        This is distinct from BACKTEST_INSTRUMENT_WHITELIST which is backtest-only.
+
+        Returns False (block) if instrument is in BLOCKED_INSTRUMENTS.
+        """
+        from src.config import BLOCKED_INSTRUMENTS
+        if symbol in BLOCKED_INSTRUMENTS:
+            logger.info("[R5] Instrument %s is blocked (no demonstrated edge)", symbol)
+            return False, f"instrument_blocked:{symbol}"
         return True, "ok"
 
     def check_session_liquidity(

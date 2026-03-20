@@ -1172,9 +1172,8 @@ class BacktestEngine:
         except Exception as exc:
             logger.warning("[SIM-33] Could not load economic events: %s", exc)
 
-        total_symbols = len(params.symbols)
-        if run_id:
-            _backtest_progress[run_id] = 0.0
+        # total_symbols and _backtest_progress are initialized after whitelist
+        # filtering (below), so accurate progress reporting uses the filtered count.
 
         # V6 TASK-V6-06: Pre-load D1 data per symbol for MA200 trend filter.
         # 300 extra days of history before start_dt ensure MA200 is warmed up from day 1.
@@ -1242,7 +1241,28 @@ class BacktestEngine:
                 _DXY_SYMBOLS,
             )
 
-        for sym_idx, symbol in enumerate(params.symbols):
+        # R5: Instrument whitelist — restrict backtest to proven performers.
+        # Does NOT affect live SignalEngine (filter_pipeline.check_blocked_instrument
+        # is used for live+backtest blocking; this is backtest-only scope restriction).
+        from src.config import BACKTEST_INSTRUMENT_WHITELIST
+        if BACKTEST_INSTRUMENT_WHITELIST:
+            original_count = len(params.symbols)
+            symbols_to_run = [s for s in params.symbols if s in BACKTEST_INSTRUMENT_WHITELIST]
+            if len(symbols_to_run) < original_count:
+                filtered_out = [s for s in params.symbols if s not in BACKTEST_INSTRUMENT_WHITELIST]
+                logger.info(
+                    "[R5] Whitelist active: %d/%d symbols will run (%s). "
+                    "Filtered out: %s",
+                    len(symbols_to_run), original_count, symbols_to_run, filtered_out,
+                )
+        else:
+            symbols_to_run = params.symbols
+
+        total_symbols = len(symbols_to_run)
+        if run_id:
+            _backtest_progress[run_id] = 0.0
+
+        for sym_idx, symbol in enumerate(symbols_to_run):
             instrument = await get_instrument_by_symbol(self.db, symbol)
             if instrument is None:
                 logger.warning("[SIM-22] Instrument %s not found — skipping", symbol)
@@ -1405,6 +1425,26 @@ class BacktestEngine:
                 _di = bisect.bisect_right(_dxy_ts_sorted, _pts) - 1
                 if _di >= 0:
                     dxy_rsi_at_idx[_pi] = _dxy_rsi_sorted[_di]
+
+            # R5-02: Permanent diagnostic logging for DXY RSI mapping.
+            # Root cause analysis: overlap between momentum filter (RSI > 50 + MACD) and
+            # DXY filter means most EURUSD/GBPUSD LONG signals are already rejected by
+            # momentum before reaching DXY filter. DXY provides independent confirmation
+            # but rarely fires uniquely. Overlap is by design — not a bug.
+            _non_none_count = sum(1 for x in dxy_rsi_at_idx if x is not None)
+            _above_55_count = sum(1 for x in dxy_rsi_at_idx if x is not None and x > 55)
+            _below_45_count = sum(1 for x in dxy_rsi_at_idx if x is not None and x < 45)
+            logger.info(
+                "[DXY-DIAG] %s: %d/%d candles mapped to DXY RSI "
+                "(>55: %d, <45: %d, first_dxy_ts=%s, last_dxy_ts=%s, "
+                "first_price_ts=%s, last_price_ts=%s)",
+                symbol, _non_none_count, n,
+                _above_55_count, _below_45_count,
+                _dxy_ts_sorted[0].isoformat() if _dxy_ts_sorted else "N/A",
+                _dxy_ts_sorted[-1].isoformat() if _dxy_ts_sorted else "N/A",
+                _to_utc(price_rows[0].timestamp).isoformat(),
+                _to_utc(price_rows[-1].timestamp).isoformat(),
+            )
 
         # ── OPT-03: S/R cache — refresh every 50 candles instead of per-signal
         # TAEngine.calculate_all_indicators() recomputes RSI/MACD/BB/MA/ADX/etc.

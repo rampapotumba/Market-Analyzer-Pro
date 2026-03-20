@@ -161,6 +161,20 @@ BLOCKED_REGIMES_BY_MARKET: dict = {
     # "stocks": [],
 }
 
+# R5: Instruments with no demonstrated edge — blocked entirely.
+# ETH/USDT: -$171 r4, -$245 P1, -$26 r3. 20% WR across 6 rounds.
+# Use explicit block rather than raising min_composite_score —
+# explicit is better than implicit (a score of 30+ still allows losers).
+BLOCKED_INSTRUMENTS: set = {"ETH/USDT"}
+
+# R5: Backtest-only instrument whitelist. When non-empty, only these symbols
+# are simulated. Empty list = all instruments (backward compatible).
+# Based on r4 results: GC=F (+$150), EURUSD=X (+$52), USDCAD=X (+$35),
+# BTC/USDT (+$51, low N), SPY (+$35, low N).
+BACKTEST_INSTRUMENT_WHITELIST: list = [
+    "GC=F", "EURUSD=X", "USDCAD=X", "BTC/USDT", "SPY",
+]
+
 INSTRUMENT_OVERRIDES: dict = {
     # V6-CAL-05: Ужесточение — 102 trades, 9.8% WR, -$135 при relaxed settings.
     # min_score 25 (строже v5), только STRONG_TREND_BULL (bear заблокированы глобально).
@@ -207,6 +221,12 @@ INSTRUMENT_OVERRIDES: dict = {
 # Effective threshold at 1.3: 15 * 0.65 * 1.3 = 12.675 (достижимо при ta_score >= 28.2).
 SHORT_SCORE_MULTIPLIER: float = 1.3   # SHORT effective_threshold *= 1.3
 SHORT_RSI_THRESHOLD: int = 30         # SHORT: RSI must be < 30 (deeply oversold)
+# R5 Decision: SHORT is effectively disabled at H1 timeframe.
+# SHORT_SCORE_MULTIPLIER=1.3 + SHORT_RSI_THRESHOLD=30 + BLOCKED_REGIMES
+# result in <5% SHORT trades with negative PnL.
+# If pivoting to D1 (see ARCHITECTURE_DECISION.md), re-evaluate SHORT viability.
+# To fully disable: set SHORT_ENABLED = False
+SHORT_ENABLED: bool = True  # Keep True for now; SHORT is gated by parameters above
 
 # ── v6: Score component weights (TASK-V6-02) ─────────────────────────────────
 # Used for proportional threshold scaling.

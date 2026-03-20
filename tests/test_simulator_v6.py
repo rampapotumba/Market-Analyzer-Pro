@@ -3640,3 +3640,182 @@ class TestOpt03SRCache:
             or (candle_idx - sr_cache.get("last_idx", -_SR_CACHE_INTERVAL)) >= _SR_CACHE_INTERVAL
         )
         assert _should_recompute is True
+
+
+# ── TASK-R5-01: Blocked instruments ──────────────────────────────────────────
+
+
+class TestR501BlockedInstruments:
+    """TASK-R5-01: ETH/USDT and other blocked instruments rejected by filter pipeline."""
+
+    def test_r5_blocked_instrument_eth_rejected(self) -> None:
+        """ETH/USDT is in BLOCKED_INSTRUMENTS → filter pipeline returns False."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, reason = pipeline.check_blocked_instrument("ETH/USDT")
+        assert passed is False
+        assert "instrument_blocked" in reason
+        assert "ETH/USDT" in reason
+
+    def test_r5_non_blocked_instrument_passes(self) -> None:
+        """BTC/USDT is NOT in BLOCKED_INSTRUMENTS → check passes."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, reason = pipeline.check_blocked_instrument("BTC/USDT")
+        assert passed is True
+
+    def test_r5_blocked_instrument_first_in_run_all(self) -> None:
+        """ETH/USDT is blocked even with a valid composite score — blocked early."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        context = {
+            "composite_score": 25.0,
+            "market_type": "crypto",
+            "symbol": "ETH/USDT",
+            "regime": "STRONG_TREND_BULL",
+            "direction": "LONG",
+            "timeframe": "H1",
+            "available_weight": 0.45,
+        }
+        passed, reason = pipeline.run_all(context)
+        assert passed is False
+        assert "instrument_blocked" in reason
+
+    def test_r5_blocked_rejection_counted_in_stats(self) -> None:
+        """Rejection counter incremented under 'instrument_blocked' key."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        context = {
+            "composite_score": 25.0,
+            "market_type": "crypto",
+            "symbol": "ETH/USDT",
+            "regime": "STRONG_TREND_BULL",
+            "direction": "LONG",
+            "timeframe": "H1",
+            "available_weight": 0.45,
+        }
+        pipeline.run_all(context)
+        stats = pipeline.get_stats()
+        assert stats["rejected_by_instrument_blocked"] == 1
+
+    def test_r5_blocked_instruments_config_exists(self) -> None:
+        """BLOCKED_INSTRUMENTS exists in config and is a set containing ETH/USDT."""
+        from src.config import BLOCKED_INSTRUMENTS
+
+        assert isinstance(BLOCKED_INSTRUMENTS, set)
+        assert "ETH/USDT" in BLOCKED_INSTRUMENTS
+
+
+# ── TASK-R5-02: DXY filter diagnostic ────────────────────────────────────────
+
+
+class TestR502DxyFilter:
+    """TASK-R5-02: DXY filter with real RSI values blocks correctly."""
+
+    def test_r5_dxy_filter_with_real_rsi_above_55_blocks_long_eurusd(self) -> None:
+        """DXY RSI > 55 → LONG EURUSD=X blocked."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, reason = pipeline.check_dxy_alignment("LONG", "EURUSD=X", dxy_rsi=67.3)
+        assert passed is False
+        assert "dxy_strong_blocks_long" in reason
+
+    def test_r5_dxy_filter_with_rsi_below_45_blocks_short_eurusd(self) -> None:
+        """DXY RSI < 45 → SHORT EURUSD=X blocked."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, reason = pipeline.check_dxy_alignment("SHORT", "EURUSD=X", dxy_rsi=38.0)
+        assert passed is False
+        assert "dxy_weak_blocks_short" in reason
+
+    def test_r5_dxy_filter_neutral_rsi_passes_long(self) -> None:
+        """DXY RSI in 45-55 neutral zone → LONG EURUSD=X passes."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, _ = pipeline.check_dxy_alignment("LONG", "EURUSD=X", dxy_rsi=50.0)
+        assert passed is True
+
+    def test_r5_dxy_filter_no_data_passes_gracefully(self) -> None:
+        """DXY RSI = None → filter passes (graceful degradation)."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, _ = pipeline.check_dxy_alignment("LONG", "EURUSD=X", dxy_rsi=None)
+        assert passed is True
+
+    def test_r5_dxy_filter_gbpusd_long_blocked_above_55(self) -> None:
+        """DXY RSI > 55 also blocks LONG GBPUSD=X (in _USD_LONG_SIDE_PAIRS)."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, reason = pipeline.check_dxy_alignment("LONG", "GBPUSD=X", dxy_rsi=72.6)
+        assert passed is False
+        assert "GBPUSD=X" in reason
+
+    def test_r5_dxy_filter_usdcad_not_affected(self) -> None:
+        """DXY RSI > 55 does NOT block LONG USDCAD=X (not in _USD_LONG_SIDE_PAIRS)."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        # USDCAD is not in _USD_LONG_SIDE_PAIRS — USD is the base currency here
+        passed, _ = pipeline.check_dxy_alignment("LONG", "USDCAD=X", dxy_rsi=80.0)
+        assert passed is True
+
+
+# ── TASK-R5-03: Instrument whitelist for backtest ─────────────────────────────
+
+
+class TestR503BacktestWhitelist:
+    """TASK-R5-03: BACKTEST_INSTRUMENT_WHITELIST filters symbols in backtest."""
+
+    def test_r5_backtest_whitelist_config_exists(self) -> None:
+        """BACKTEST_INSTRUMENT_WHITELIST exists in config and is a list."""
+        from src.config import BACKTEST_INSTRUMENT_WHITELIST
+
+        assert isinstance(BACKTEST_INSTRUMENT_WHITELIST, list)
+
+    def test_r5_backtest_whitelist_contains_expected_symbols(self) -> None:
+        """Whitelist contains the 5 expected profitable instruments."""
+        from src.config import BACKTEST_INSTRUMENT_WHITELIST
+
+        expected = {"GC=F", "EURUSD=X", "USDCAD=X", "BTC/USDT", "SPY"}
+        assert expected.issubset(set(BACKTEST_INSTRUMENT_WHITELIST)), (
+            f"Expected all of {expected} in whitelist, got: {BACKTEST_INSTRUMENT_WHITELIST}"
+        )
+
+    def test_r5_backtest_whitelist_filters_symbols_logic(self) -> None:
+        """Whitelist filtering logic: non-whitelisted symbols are excluded."""
+        whitelist = ["GC=F", "EURUSD=X", "USDCAD=X"]
+        all_symbols = ["GC=F", "EURUSD=X", "USDCAD=X", "ETH/USDT", "USDJPY=X", "NZDUSD=X"]
+
+        symbols_to_run = [s for s in all_symbols if s in whitelist]
+        filtered_out = [s for s in all_symbols if s not in whitelist]
+
+        assert symbols_to_run == ["GC=F", "EURUSD=X", "USDCAD=X"]
+        assert "ETH/USDT" in filtered_out
+        assert "USDJPY=X" in filtered_out
+        assert "NZDUSD=X" in filtered_out
+
+    def test_r5_backtest_whitelist_empty_means_all_symbols(self) -> None:
+        """Empty whitelist = all symbols processed (backward compatible)."""
+        whitelist: list = []
+        all_symbols = ["GC=F", "EURUSD=X", "ETH/USDT"]
+
+        symbols_to_run = [s for s in all_symbols if s in whitelist] if whitelist else all_symbols
+
+        assert symbols_to_run == all_symbols
+
+    def test_r5_backtest_whitelist_order_preserved(self) -> None:
+        """Symbol order from params.symbols is preserved after whitelist filtering."""
+        whitelist = ["SPY", "GC=F", "EURUSD=X"]
+        all_symbols = ["EURUSD=X", "GC=F", "SPY", "ETH/USDT"]
+
+        symbols_to_run = [s for s in all_symbols if s in whitelist]
+        assert symbols_to_run == ["EURUSD=X", "GC=F", "SPY"]
