@@ -17,6 +17,7 @@ from src.database.models import (
     AccuracyStats,
     BacktestRun,
     BacktestTrade,
+    CentralBankRate,
     EconomicEvent,
     Instrument,
     MacroData,
@@ -316,6 +317,37 @@ async def get_macro_data(
         stmt = stmt.where(MacroData.country == country)
     result = await session.execute(stmt)
     return result.scalars().all()
+
+
+# ── CentralBankRates ──────────────────────────────────────────────────────────
+
+
+async def get_central_bank_rates(session: AsyncSession) -> dict[str, float]:
+    """Return the latest rate per central bank as {bank_code: rate_float}.
+
+    Fetches one row per bank (the most recent by effective_date).
+    Returns an empty dict if the table has no data.
+    """
+    # Subquery: max effective_date per bank
+    latest_date_subq = (
+        select(
+            CentralBankRate.bank,
+            func.max(CentralBankRate.effective_date).label("max_date"),
+        )
+        .group_by(CentralBankRate.bank)
+        .subquery()
+    )
+
+    stmt = select(CentralBankRate).join(
+        latest_date_subq,
+        and_(
+            CentralBankRate.bank == latest_date_subq.c.bank,
+            CentralBankRate.effective_date == latest_date_subq.c.max_date,
+        ),
+    )
+    result = await session.execute(stmt)
+    rows = result.scalars().all()
+    return {row.bank: float(row.rate) for row in rows}
 
 
 # ── NewsEvents ────────────────────────────────────────────────────────────────
