@@ -492,15 +492,42 @@ def _compute_summary(
     }
 
     # By regime — CAL2-02: exclude end_of_data trades
+    # TASK-V7-12: extended per-regime metrics — WR, PF, avg R:R
     by_regime: dict[str, dict] = {}
     for t in metric_trades:
         regime_key = getattr(t, "regime", None) or "UNKNOWN"
         if regime_key not in by_regime:
-            by_regime[regime_key] = {"trades": 0, "wins": 0, "pnl_usd": 0.0}
+            by_regime[regime_key] = {
+                "trades": 0,
+                "wins": 0,
+                "pnl_usd": 0.0,
+                "gross_win": 0.0,
+                "gross_loss": 0.0,
+            }
         by_regime[regime_key]["trades"] += 1
+        trade_pnl = float(t.pnl_usd or 0)
         if t.result == "win":
             by_regime[regime_key]["wins"] += 1
-        by_regime[regime_key]["pnl_usd"] += float(t.pnl_usd or 0)
+            by_regime[regime_key]["gross_win"] += trade_pnl
+        else:
+            by_regime[regime_key]["gross_loss"] += abs(trade_pnl)
+        by_regime[regime_key]["pnl_usd"] += trade_pnl
+
+    # TASK-V7-12: compute derived per-regime metrics, remove raw accumulators
+    for rk, rd in by_regime.items():
+        t_count = rd["trades"]
+        rd["win_rate_pct"] = round(rd["wins"] / t_count * 100, 2) if t_count > 0 else 0.0
+        gross_loss_r = rd.pop("gross_loss")
+        gross_win_r = rd.pop("gross_win")
+        rd["profit_factor"] = (
+            round(gross_win_r / gross_loss_r, 4) if gross_loss_r > 0 else None
+        )
+
+    # TASK-V7-12: note blocked regimes that have 0 trades (confirms filter works)
+    from src.config import BLOCKED_REGIMES
+    regimes_with_zero_trades: list[str] = [
+        r for r in BLOCKED_REGIMES if r not in by_regime
+    ]
 
     # CAL3-06: by_adjustment — breakdown of crypto trades with F&G and FR adjustments.
     # Groups trades into 4 buckets based on which adjustments were applied.
@@ -615,6 +642,8 @@ def _compute_summary(
         "by_weekday": by_weekday,
         "by_hour_utc": by_hour_utc,
         "by_regime": by_regime,
+        # TASK-V7-12: blocked regimes with 0 trades confirms regime filter is working
+        "regimes_with_zero_trades": regimes_with_zero_trades,
         "sl_hit_count": sl_hit_count,
         "tp_hit_count": tp_hit_count,
         "mae_exit_count": mae_exit_count,
@@ -911,6 +940,9 @@ def _precompute_ta_scores(
     return scores
 
 
+_SMA200_MIN_BARS = 200  # minimum bars required for a valid SMA200 reading
+
+
 def _precompute_regimes(
     adx_array: np.ndarray,
     atr_array: np.ndarray,
@@ -923,7 +955,12 @@ def _precompute_regimes(
     Uses rolling ATR percentile (window=252) to classify volatility regimes.
     Maps raw regime names to the same keys used by REGIME_RR_MAP / ATR_SL_MULTIPLIER_MAP.
 
-    Returns list of length n with regime strings.
+    TASK-V7-12: Logs a warning when fewer than 200 bars are available so that
+    callers know that SMA200-based regime classification will fall back to
+    "RANGING" (ADX-only path) for those candles.
+
+    Returns list of length n with regime strings.  Every element is guaranteed
+    to be a non-empty string — never None or "UNKNOWN".
     """
     from src.analysis.regime_detector import classify_regime_at_point
 
@@ -937,6 +974,13 @@ def _precompute_regimes(
         "RANGING": "RANGING",
         "VOLATILE": "VOLATILE",
     }
+
+    if n < _SMA200_MIN_BARS:
+        logger.warning(
+            "[V7-12] Only %d candles available — SMA200 requires %d+. "
+            "Regime will be ADX-only for all bars (no trend direction from SMA200).",
+            n, _SMA200_MIN_BARS,
+        )
 
     # Pre-compute rolling ATR percentile using pandas rolling apply
     atr_series = pd.Series(atr_array)
@@ -1042,8 +1086,10 @@ class BacktestEngine:
         await self.db.commit()
 
         try:
-            trades, filter_stats = await self._simulate(params)
+            trades, filter_stats, data_quality = await self._simulate(params)
             summary = _compute_summary(trades, params.account_size, filter_stats=filter_stats)
+            # V7-17: attach data quality report to summary
+            summary["data_quality"] = data_quality
 
             # V6 TASK-V6-13: Walk-forward validation — run IS and OOS separately
             if params.enable_walk_forward:
@@ -1067,8 +1113,8 @@ class BacktestEngine:
                     "enable_walk_forward": False,
                 })
 
-                is_trades, is_filter_stats = await self._simulate(is_params)
-                oos_trades, oos_filter_stats = await self._simulate(oos_params)
+                is_trades, is_filter_stats, _is_dq = await self._simulate(is_params)
+                oos_trades, oos_filter_stats, _oos_dq = await self._simulate(oos_params)
 
                 is_summary = _compute_summary(is_trades, params.account_size, filter_stats=is_filter_stats)
                 oos_summary = _compute_summary(oos_trades, params.account_size, filter_stats=oos_filter_stats)
@@ -1142,12 +1188,157 @@ class BacktestEngine:
 
         return run_id
 
+    @staticmethod
+    def _check_data_quality(
+        symbol: str,
+        df: pd.DataFrame,
+        timeframe: str,
+        d1_rows: Optional[list] = None,
+    ) -> dict[str, Any]:
+        """Run pre-backtest data quality checks for one instrument.
+
+        Checks performed:
+        - Candle count vs expected (H1: ~17 candles/trading day)
+        - Gap detection: intervals > 2x normal expected interval
+        - OHLC integrity: high >= max(open, close), low <= min(open, close)
+        - Duplicate timestamps
+        - Volume availability (% candles with volume > 0)
+        - D1 data availability (needed for MA200 filter)
+
+        Returns a dict with quality metrics. Never raises — any exception
+        is caught and surfaced as a warning field.
+        """
+        # Expected candle intervals in minutes per timeframe
+        _TF_INTERVAL_MINUTES: dict[str, int] = {
+            "M1": 1, "M5": 5, "M15": 15,
+            "H1": 60, "H4": 240, "D1": 1440,
+        }
+        # Expected tradeable candles per calendar day (H1 forex ~17/day, crypto ~24/day)
+        _TF_CANDLES_PER_DAY: dict[str, float] = {
+            "M1": 1020, "M5": 204, "M15": 68,
+            "H1": 17, "H4": 5, "D1": 1,
+        }
+
+        result: dict[str, Any] = {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "candle_count": 0,
+            "expected_candles": 0,
+            "candle_coverage_pct": 0.0,
+            "gap_count": 0,
+            "ohlc_violation_count": 0,
+            "duplicate_ts_count": 0,
+            "volume_nonzero_pct": 0.0,
+            "d1_rows_available": d1_rows is not None and len(d1_rows) > 0,
+            "d1_rows_count": len(d1_rows) if d1_rows is not None else 0,
+            "warnings": [],
+        }
+
+        if df.empty:
+            result["warnings"].append("empty_dataframe")
+            logger.warning("[V7-17] %s: empty DataFrame — skipping quality checks", symbol)
+            return result
+
+        try:
+            n = len(df)
+            result["candle_count"] = n
+
+            # ── Expected candle count ────────────────────────────────────────
+            tf_interval = _TF_INTERVAL_MINUTES.get(timeframe, 60)
+            candles_per_day = _TF_CANDLES_PER_DAY.get(timeframe, 17)
+            idx = df.index
+            if len(idx) >= 2:
+                span_days = (idx[-1] - idx[0]).total_seconds() / 86400
+                # Use calendar days * expected density for rough estimate
+                expected = max(1, int(span_days * candles_per_day))
+            else:
+                expected = 1
+            result["expected_candles"] = expected
+            result["candle_coverage_pct"] = round(n / expected * 100, 1) if expected > 0 else 0.0
+
+            if result["candle_coverage_pct"] < 50.0:
+                result["warnings"].append("low_coverage")
+                logger.warning(
+                    "[V7-17] %s %s: coverage %.1f%% (got %d, expected ~%d)",
+                    symbol, timeframe, result["candle_coverage_pct"], n, expected,
+                )
+
+            # ── Gap detection ────────────────────────────────────────────────
+            if len(idx) >= 2:
+                normal_interval_sec = tf_interval * 60
+                # Convert index to UTC-aware timestamps for diff
+                ts_series = pd.Series(idx)
+                diffs = ts_series.diff().dropna()
+                gap_threshold_sec = normal_interval_sec * 2
+                gaps = diffs[diffs.apply(lambda d: d.total_seconds()) > gap_threshold_sec]
+                gap_count = int(len(gaps))
+                result["gap_count"] = gap_count
+                if gap_count > 0:
+                    result["warnings"].append(f"gaps_{gap_count}")
+                    logger.warning(
+                        "[V7-17] %s %s: %d gap(s) detected (> 2x normal interval of %dm)",
+                        symbol, timeframe, gap_count, tf_interval,
+                    )
+
+            # ── OHLC integrity ───────────────────────────────────────────────
+            violations = (
+                (df["high"] < df[["open", "close"]].max(axis=1))
+                | (df["low"] > df[["open", "close"]].min(axis=1))
+            )
+            violation_count = int(violations.sum())
+            result["ohlc_violation_count"] = violation_count
+            if violation_count > 0:
+                result["warnings"].append(f"ohlc_violations_{violation_count}")
+                logger.warning(
+                    "[V7-17] %s %s: %d OHLC integrity violation(s) (high<max(O,C) or low>min(O,C))",
+                    symbol, timeframe, violation_count,
+                )
+
+            # ── Duplicate timestamps ─────────────────────────────────────────
+            dup_count = int(df.index.duplicated().sum())
+            result["duplicate_ts_count"] = dup_count
+            if dup_count > 0:
+                result["warnings"].append(f"duplicate_timestamps_{dup_count}")
+                logger.warning(
+                    "[V7-17] %s %s: %d duplicate timestamp(s) detected",
+                    symbol, timeframe, dup_count,
+                )
+
+            # ── Volume availability ──────────────────────────────────────────
+            if "volume" in df.columns:
+                nonzero = int((df["volume"] > 0).sum())
+                vol_pct = round(nonzero / n * 100, 1) if n > 0 else 0.0
+                result["volume_nonzero_pct"] = vol_pct
+                if vol_pct == 0.0:
+                    result["warnings"].append("volume_all_zero")
+                    logger.warning(
+                        "[V7-17] %s %s: volume is zero for all candles "
+                        "(volume-based filter will degrade)",
+                        symbol, timeframe,
+                    )
+
+            # ── D1 data check ────────────────────────────────────────────────
+            if d1_rows is not None and len(d1_rows) < 200:
+                result["warnings"].append(
+                    f"d1_insufficient_{len(d1_rows)}_rows_need_200"
+                )
+                logger.warning(
+                    "[V7-17] %s: only %d D1 rows (need 200 for MA200 filter)",
+                    symbol, len(d1_rows),
+                )
+
+        except Exception as exc:
+            result["warnings"].append(f"check_error:{exc!s}")
+            logger.warning("[V7-17] %s: quality check error: %s", symbol, exc)
+
+        return result
+
     async def _simulate(
         self,
         params: BacktestParams,
         run_id: Optional[str] = None,
-    ) -> tuple[list[BacktestTradeResult], dict]:
-        """Core simulation loop. Returns (trades, aggregated_filter_stats).
+    ) -> tuple[list[BacktestTradeResult], dict, dict]:
+        """Core simulation loop. Returns (trades, aggregated_filter_stats, data_quality).
 
         If run_id is provided, updates _backtest_progress[run_id] (0–100)
         after each symbol completes so callers can poll progress.
@@ -1155,6 +1346,8 @@ class BacktestEngine:
         trades: list[BacktestTradeResult] = []
         # V6 TASK-V6-10: aggregate filter stats across all symbols
         agg_filter_stats: dict[str, int] = {}
+        # V7-17: per-symbol data quality reports
+        data_quality: dict[str, Any] = {}
 
         start_dt = datetime.datetime.fromisoformat(params.start_date).replace(
             tzinfo=datetime.timezone.utc
@@ -1290,6 +1483,16 @@ class BacktestEngine:
                     _backtest_progress[run_id] = round((sym_idx + 1) / total_symbols * 100, 1)
                 continue
 
+            # V7-17: Run data quality check before simulation (warn-only, never blocks)
+            _dq_df = _to_ohlcv_df(price_rows)
+            _dq_report = self._check_data_quality(
+                symbol=symbol,
+                df=_dq_df,
+                timeframe=params.timeframe,
+                d1_rows=d1_data_cache.get(symbol) if params.apply_d1_trend_filter else None,
+            )
+            data_quality[symbol] = _dq_report
+
             # progress_cb: called from the worker thread after every N candles
             sym_base_pct = sym_idx / total_symbols * 100
             sym_share = 100.0 / total_symbols
@@ -1321,7 +1524,7 @@ class BacktestEngine:
                 _backtest_progress[run_id] = round((sym_idx + 1) / total_symbols * 100, 1)
                 logger.info("[SIM-22] %s done — progress %.1f%%", symbol, _backtest_progress[run_id])
 
-        return trades, agg_filter_stats
+        return trades, agg_filter_stats, data_quality
 
     def _simulate_symbol(
         self,
@@ -1511,7 +1714,9 @@ class BacktestEngine:
             # Use index i-1 (last completed candle visible before current candle)
             idx = i - 1
             ta_score_i = float(ta_scores_precomp[idx]) if not math.isnan(ta_scores_precomp[idx]) else None
-            regime_i = regimes_precomp[idx] if regimes_precomp else "DEFAULT"
+            # TASK-V7-12: guarantee non-None regime — "DEFAULT" when precomputation
+            # array is empty or the value at this index is somehow falsy.
+            regime_i = (regimes_precomp[idx] if regimes_precomp else None) or "DEFAULT"
             atr_i = _nan_to_none(ta_arrays["atr"][idx]) if "atr" in ta_arrays else None
 
             if ta_score_i is None:

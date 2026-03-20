@@ -11,6 +11,7 @@ from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
+import pandas as pd
 import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -1798,3 +1799,359 @@ class TestBackfillFearGreed:
         assert FEAR_GREED_INDICATOR_NAME == "FEAR_GREED"
         assert FEAR_GREED_COUNTRY == "GLOBAL"
         assert FEAR_GREED_SOURCE == "alternative.me"
+
+
+# ── TASK-V7-17: Data integrity verification for backtest ──────────────────────
+
+
+def _make_ohlcv_df(
+    n: int = 100,
+    start: Optional[datetime.datetime] = None,
+    interval_minutes: int = 60,
+    high_as_close: bool = False,
+    low_as_open: bool = False,
+    duplicate_last: bool = False,
+    gap_after_index: Optional[int] = None,
+    gap_multiplier: float = 3.0,
+    volume_value: float = 1000.0,
+) -> pd.DataFrame:
+    """Build a synthetic OHLCV DataFrame for quality-check tests."""
+
+    if start is None:
+        start = datetime.datetime(2024, 1, 1, 0, 0, 0, tzinfo=datetime.timezone.utc)
+
+    timestamps = []
+    current = start
+    for i in range(n):
+        if gap_after_index is not None and i == gap_after_index + 1:
+            current = timestamps[-1] + datetime.timedelta(
+                minutes=interval_minutes * gap_multiplier
+            )
+        timestamps.append(current)
+        current += datetime.timedelta(minutes=interval_minutes)
+
+    if duplicate_last:
+        timestamps[-1] = timestamps[-2]
+
+    opens = [1.1000 + i * 0.0001 for i in range(n)]
+    closes = [o + 0.0002 for o in opens]
+    highs = [max(o, c) + 0.0005 for o, c in zip(opens, closes)]
+    lows = [min(o, c) - 0.0005 for o, c in zip(opens, closes)]
+
+    # Intentional OHLC violation: set high < close for all rows if requested
+    if high_as_close:
+        highs = [c - 0.0001 for c in closes]  # high < close → violation
+
+    # Intentional OHLC violation: set low > open for all rows if requested
+    if low_as_open:
+        lows = [o + 0.0001 for o in opens]  # low > open → violation
+
+    volumes = [volume_value] * n
+
+    df = pd.DataFrame(
+        {
+            "open": opens,
+            "high": highs,
+            "low": lows,
+            "close": closes,
+            "volume": volumes,
+        },
+        index=pd.DatetimeIndex(timestamps, name="timestamp"),
+    )
+    return df
+
+
+class TestV717DataQualityValidOHLC:
+    """Valid OHLC data should pass all checks with no violations."""
+
+    def test_v7_17_valid_data_no_warnings(self) -> None:
+        """Clean data produces zero violations across all checks."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        df = _make_ohlcv_df(n=200, interval_minutes=60)
+        result = BacktestEngine._check_data_quality("EURUSD=X", df, "H1")
+
+        assert result["ohlc_violation_count"] == 0
+        assert result["duplicate_ts_count"] == 0
+        assert result["gap_count"] == 0
+        assert result["volume_nonzero_pct"] == 100.0
+        assert result["candle_count"] == 200
+
+    def test_v7_17_valid_data_returns_symbol_and_timeframe(self) -> None:
+        """Result dict must contain symbol and timeframe fields."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        df = _make_ohlcv_df(n=50)
+        result = BacktestEngine._check_data_quality("GBPUSD=X", df, "H4")
+
+        assert result["symbol"] == "GBPUSD=X"
+        assert result["timeframe"] == "H4"
+
+    def test_v7_17_valid_data_no_ohlc_violations_warning(self) -> None:
+        """No OHLC violation warning in clean data."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        df = _make_ohlcv_df(n=100)
+        result = BacktestEngine._check_data_quality("EURUSD=X", df, "H1")
+
+        ohlc_warns = [w for w in result["warnings"] if "ohlc_violations" in w]
+        assert not ohlc_warns, f"Unexpected OHLC warnings: {ohlc_warns}"
+
+    def test_v7_17_result_has_all_expected_keys(self) -> None:
+        """Result dict must contain all documented keys."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        df = _make_ohlcv_df(n=60)
+        result = BacktestEngine._check_data_quality("BTC/USDT", df, "H1")
+
+        expected_keys = {
+            "symbol", "timeframe", "candle_count", "expected_candles",
+            "candle_coverage_pct", "gap_count", "ohlc_violation_count",
+            "duplicate_ts_count", "volume_nonzero_pct",
+            "d1_rows_available", "d1_rows_count", "warnings",
+        }
+        assert expected_keys.issubset(result.keys()), (
+            f"Missing keys: {expected_keys - set(result.keys())}"
+        )
+
+
+class TestV717OHLCViolation:
+    """OHLC integrity violations must be detected and flagged."""
+
+    def test_v7_17_high_below_close_detected(self) -> None:
+        """When high < close, violation must be counted."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        df = _make_ohlcv_df(n=10, high_as_close=True)
+        result = BacktestEngine._check_data_quality("EURUSD=X", df, "H1")
+
+        assert result["ohlc_violation_count"] > 0
+
+    def test_v7_17_ohlc_violation_in_warnings(self) -> None:
+        """OHLC violation must produce a warning entry."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        df = _make_ohlcv_df(n=10, high_as_close=True)
+        result = BacktestEngine._check_data_quality("EURUSD=X", df, "H1")
+
+        ohlc_warns = [w for w in result["warnings"] if "ohlc_violations" in w]
+        assert ohlc_warns, "Expected ohlc_violations warning"
+
+    def test_v7_17_low_above_open_detected(self) -> None:
+        """When low > open, violation must be counted."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        df = _make_ohlcv_df(n=5, low_as_open=True)
+        result = BacktestEngine._check_data_quality("USDJPY=X", df, "H4")
+
+        assert result["ohlc_violation_count"] > 0
+
+    def test_v7_17_violation_count_matches_bad_rows(self) -> None:
+        """Violation count equals number of rows with OHLC errors."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        df = _make_ohlcv_df(n=20, high_as_close=True)
+        result = BacktestEngine._check_data_quality("EURUSD=X", df, "H1")
+
+        # All rows have high < close, so all 20 must be flagged
+        assert result["ohlc_violation_count"] == 20
+
+
+class TestV717DuplicateTimestamps:
+    """Duplicate timestamps must be detected."""
+
+    def test_v7_17_duplicate_timestamps_detected(self) -> None:
+        """DataFrame with duplicate last timestamp must report dup count > 0."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        df = _make_ohlcv_df(n=50, duplicate_last=True)
+        result = BacktestEngine._check_data_quality("EURUSD=X", df, "H1")
+
+        assert result["duplicate_ts_count"] > 0
+
+    def test_v7_17_duplicate_in_warnings(self) -> None:
+        """Duplicate timestamps must produce a warning entry."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        df = _make_ohlcv_df(n=50, duplicate_last=True)
+        result = BacktestEngine._check_data_quality("EURUSD=X", df, "H1")
+
+        dup_warns = [w for w in result["warnings"] if "duplicate_timestamps" in w]
+        assert dup_warns, "Expected duplicate_timestamps warning"
+
+    def test_v7_17_no_duplicates_in_clean_data(self) -> None:
+        """Clean data must have zero duplicates."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        df = _make_ohlcv_df(n=50)
+        result = BacktestEngine._check_data_quality("EURUSD=X", df, "H1")
+
+        assert result["duplicate_ts_count"] == 0
+
+
+class TestV717GapDetection:
+    """Gaps larger than 2x normal interval must be detected."""
+
+    def test_v7_17_gap_detected(self) -> None:
+        """A 3x interval gap must be counted."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        df = _make_ohlcv_df(n=50, interval_minutes=60, gap_after_index=25, gap_multiplier=3.0)
+        result = BacktestEngine._check_data_quality("EURUSD=X", df, "H1")
+
+        assert result["gap_count"] >= 1
+
+    def test_v7_17_gap_count_correct(self) -> None:
+        """Two separate gaps must both be detected."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        # Build manually: 3 segments with 2 gaps
+        base = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+        seg1 = [base + datetime.timedelta(hours=i) for i in range(10)]
+        seg2 = [seg1[-1] + datetime.timedelta(hours=5) + datetime.timedelta(hours=i) for i in range(10)]
+        seg3 = [seg2[-1] + datetime.timedelta(hours=5) + datetime.timedelta(hours=i) for i in range(10)]
+        all_ts = seg1 + seg2 + seg3
+
+        df = pd.DataFrame(
+            {
+                "open": [1.1] * 30,
+                "high": [1.105] * 30,
+                "low": [1.095] * 30,
+                "close": [1.102] * 30,
+                "volume": [500.0] * 30,
+            },
+            index=pd.DatetimeIndex(all_ts, name="timestamp"),
+        )
+        result = BacktestEngine._check_data_quality("EURUSD=X", df, "H1")
+
+        assert result["gap_count"] == 2
+
+    def test_v7_17_gap_in_warnings(self) -> None:
+        """Gap must produce a warning entry."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        df = _make_ohlcv_df(n=50, interval_minutes=60, gap_after_index=20, gap_multiplier=3.0)
+        result = BacktestEngine._check_data_quality("EURUSD=X", df, "H1")
+
+        gap_warns = [w for w in result["warnings"] if w.startswith("gaps_")]
+        assert gap_warns, "Expected gaps_N warning"
+
+    def test_v7_17_small_gap_not_detected(self) -> None:
+        """A gap of exactly 1x interval (no gap) must not be flagged."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        # Normal 1x interval — should produce 0 gaps
+        df = _make_ohlcv_df(n=50, interval_minutes=60, gap_multiplier=1.0)
+        result = BacktestEngine._check_data_quality("EURUSD=X", df, "H1")
+
+        assert result["gap_count"] == 0
+
+
+class TestV717VolumeAvailability:
+    """Volume availability reporting."""
+
+    def test_v7_17_zero_volume_reported_correctly(self) -> None:
+        """All-zero volume must be reported as volume_nonzero_pct = 0."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        df = _make_ohlcv_df(n=100, volume_value=0.0)
+        result = BacktestEngine._check_data_quality("EURUSD=X", df, "H1")
+
+        assert result["volume_nonzero_pct"] == 0.0
+
+    def test_v7_17_zero_volume_in_warnings(self) -> None:
+        """All-zero volume must produce a volume_all_zero warning."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        df = _make_ohlcv_df(n=100, volume_value=0.0)
+        result = BacktestEngine._check_data_quality("EURUSD=X", df, "H1")
+
+        assert "volume_all_zero" in result["warnings"]
+
+    def test_v7_17_full_volume_gives_100pct(self) -> None:
+        """All candles with positive volume → volume_nonzero_pct = 100."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        df = _make_ohlcv_df(n=50, volume_value=500.0)
+        result = BacktestEngine._check_data_quality("EURUSD=X", df, "H1")
+
+        assert result["volume_nonzero_pct"] == 100.0
+
+    def test_v7_17_partial_volume_computed_correctly(self) -> None:
+        """50% zero volume → volume_nonzero_pct = 50.0."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        base = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+        ts = [base + datetime.timedelta(hours=i) for i in range(20)]
+        vols = [1000.0 if i % 2 == 0 else 0.0 for i in range(20)]
+
+        df = pd.DataFrame(
+            {
+                "open": [1.1] * 20,
+                "high": [1.105] * 20,
+                "low": [1.095] * 20,
+                "close": [1.102] * 20,
+                "volume": vols,
+            },
+            index=pd.DatetimeIndex(ts, name="timestamp"),
+        )
+        result = BacktestEngine._check_data_quality("EURUSD=X", df, "H1")
+
+        assert result["volume_nonzero_pct"] == 50.0
+
+    def test_v7_17_zero_volume_does_not_block_check(self) -> None:
+        """Zero-volume data must still complete all checks without exception."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        df = _make_ohlcv_df(n=50, volume_value=0.0)
+        result = BacktestEngine._check_data_quality("EURUSD=X", df, "H1")
+
+        # Other checks must still have values
+        assert result["candle_count"] == 50
+        assert "check_error" not in str(result["warnings"])
+
+
+class TestV717D1DataAvailability:
+    """D1 data availability check."""
+
+    def test_v7_17_d1_rows_none_reports_unavailable(self) -> None:
+        """d1_rows=None → d1_rows_available=False, d1_rows_count=0."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        df = _make_ohlcv_df(n=100)
+        result = BacktestEngine._check_data_quality("EURUSD=X", df, "H1", d1_rows=None)
+
+        assert result["d1_rows_available"] is False
+        assert result["d1_rows_count"] == 0
+
+    def test_v7_17_d1_rows_200_no_warning(self) -> None:
+        """d1_rows with 200+ rows → no d1_insufficient warning."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        df = _make_ohlcv_df(n=100)
+        fake_d1 = [object()] * 200
+        result = BacktestEngine._check_data_quality("EURUSD=X", df, "H1", d1_rows=fake_d1)
+
+        d1_warns = [w for w in result["warnings"] if "d1_insufficient" in w]
+        assert not d1_warns, f"Unexpected d1 warning: {d1_warns}"
+
+    def test_v7_17_d1_rows_insufficient_produces_warning(self) -> None:
+        """d1_rows with < 200 rows → d1_insufficient warning."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        df = _make_ohlcv_df(n=100)
+        fake_d1 = [object()] * 50
+        result = BacktestEngine._check_data_quality("EURUSD=X", df, "H1", d1_rows=fake_d1)
+
+        d1_warns = [w for w in result["warnings"] if "d1_insufficient" in w]
+        assert d1_warns, "Expected d1_insufficient warning"
+        assert result["d1_rows_count"] == 50
+
+    def test_v7_17_d1_rows_empty_list_reports_unavailable(self) -> None:
+        """Empty d1_rows list → d1_rows_available=False."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        df = _make_ohlcv_df(n=100)
+        result = BacktestEngine._check_data_quality("EURUSD=X", df, "H1", d1_rows=[])
+
+        assert result["d1_rows_available"] is False
