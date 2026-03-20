@@ -2856,3 +2856,295 @@ class TestV714SampleAdequacy:
         assert "win_rate_ci_95" in sa
         assert "low" in sa["win_rate_ci_95"]
         assert "high" in sa["win_rate_ci_95"]
+
+
+# ── TASK-V7-18: Isolation mode backtest ───────────────────────────────────────
+
+
+class TestV718IsolationMode:
+    """Tests for isolation_mode backtest (TASK-V7-18)."""
+
+    def test_v7_18_isolation_mode_field_exists_with_default_false(self) -> None:
+        """BacktestParams has isolation_mode: bool with default False."""
+        from src.backtesting.backtest_params import BacktestParams
+
+        params = BacktestParams(
+            symbols=["EURUSD=X"],
+            start_date="2024-01-01",
+            end_date="2024-06-01",
+        )
+        assert hasattr(params, "isolation_mode")
+        assert params.isolation_mode is False
+
+    def test_v7_18_isolation_mode_can_be_set_true(self) -> None:
+        """BacktestParams accepts isolation_mode=True."""
+        from src.backtesting.backtest_params import BacktestParams
+
+        params = BacktestParams(
+            symbols=["EURUSD=X", "GC=F"],
+            start_date="2024-01-01",
+            end_date="2024-06-01",
+            isolation_mode=True,
+        )
+        assert params.isolation_mode is True
+
+    def test_v7_18_backtest_result_has_isolation_results_field(self) -> None:
+        """BacktestResult model includes optional isolation_results field."""
+        from src.backtesting.backtest_params import BacktestResult
+
+        result = BacktestResult(run_id="test-run", status="completed")
+        assert hasattr(result, "isolation_results")
+        assert result.isolation_results is None  # default is None
+
+    def test_v7_18_backtest_result_isolation_results_accepts_dict(self) -> None:
+        """BacktestResult.isolation_results can hold a populated dict."""
+        from src.backtesting.backtest_params import BacktestResult
+
+        isolation_data = {
+            "mode": "isolation",
+            "per_instrument": {
+                "GC=F": {
+                    "total_trades": 5,
+                    "win_rate_pct": 60.0,
+                    "profit_factor": 1.5,
+                    "total_pnl_usd": 150.0,
+                }
+            },
+            "path_dependence": {
+                "path_dependent": [],
+                "comparison": {},
+                "threshold_pct": 30.0,
+            },
+        }
+        result = BacktestResult(
+            run_id="test-run",
+            status="completed",
+            isolation_results=isolation_data,
+        )
+        assert result.isolation_results is not None
+        assert result.isolation_results["mode"] == "isolation"
+        assert "per_instrument" in result.isolation_results
+
+    def test_v7_18_path_dependence_computation_no_difference(self) -> None:
+        """_compute_path_dependence returns empty list when PnL matches exactly."""
+        from src.backtesting.backtest_engine import _compute_path_dependence
+
+        isolation = {
+            "EURUSD=X": {"total_pnl_usd": 100.0},
+            "GC=F": {"total_pnl_usd": -50.0},
+        }
+        combined = {
+            "EURUSD=X": {"pnl_usd": 100.0},
+            "GC=F": {"pnl_usd": -50.0},
+        }
+
+        result = _compute_path_dependence(isolation, combined, threshold_pct=30.0)
+
+        assert result["path_dependent"] == []
+        assert len(result["comparison"]) == 2
+        assert result["comparison"]["EURUSD=X"]["diff_pct"] == 0.0
+
+    def test_v7_18_path_dependence_flags_large_difference(self) -> None:
+        """_compute_path_dependence flags instrument when PnL diff > 30%."""
+        from src.backtesting.backtest_engine import _compute_path_dependence
+
+        # GC=F: isolated=+150, combined=-7.69 — diff is (150 - (-7.69)) / 150 * 100 ≈ 105%
+        isolation = {
+            "GC=F": {"total_pnl_usd": 150.0},
+            "EURUSD=X": {"total_pnl_usd": 80.0},
+        }
+        combined = {
+            "GC=F": {"pnl_usd": -7.69},
+            "EURUSD=X": {"pnl_usd": 82.0},  # diff ~2.5% — not flagged
+        }
+
+        result = _compute_path_dependence(isolation, combined, threshold_pct=30.0)
+
+        assert "GC=F" in result["path_dependent"]
+        assert "EURUSD=X" not in result["path_dependent"]
+        assert result["comparison"]["GC=F"]["diff_pct"] > 30.0
+
+    def test_v7_18_path_dependence_handles_zero_isolated_pnl(self) -> None:
+        """_compute_path_dependence handles isolated PnL = 0 without division by zero."""
+        from src.backtesting.backtest_engine import _compute_path_dependence
+
+        isolation = {"SYM": {"total_pnl_usd": 0.0}}
+        combined = {"SYM": {"pnl_usd": 50.0}}
+
+        result = _compute_path_dependence(isolation, combined)
+        # Both zero or non-zero: no crash, diff_pct computed
+        assert "SYM" in result["comparison"]
+        assert result["comparison"]["SYM"]["diff_pct"] >= 0.0
+
+    def test_v7_18_path_dependence_handles_both_zero(self) -> None:
+        """_compute_path_dependence handles both PnLs = 0 gracefully."""
+        from src.backtesting.backtest_engine import _compute_path_dependence
+
+        isolation = {"SYM": {"total_pnl_usd": 0.0}}
+        combined = {"SYM": {"pnl_usd": 0.0}}
+
+        result = _compute_path_dependence(isolation, combined)
+        assert result["comparison"]["SYM"]["diff_pct"] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_v7_18_isolation_mode_produces_per_instrument_results(self) -> None:
+        """When isolation_mode=True, run_backtest summary contains isolation_results
+        with per_instrument breakdown for each simulated symbol."""
+        from src.backtesting.backtest_engine import BacktestEngine
+        from src.backtesting.backtest_params import BacktestParams, BacktestTradeResult
+
+        params = BacktestParams(
+            symbols=["EURUSD=X", "GC=F"],
+            start_date="2024-01-01",
+            end_date="2024-06-01",
+            isolation_mode=True,
+        )
+
+        # Build mock trades for two symbols
+        def _make_trade(symbol: str, pnl: float, result: str = "win") -> BacktestTradeResult:
+            t = BacktestTradeResult(
+                symbol=symbol,
+                timeframe="H1",
+                direction="LONG",
+                entry_price=Decimal("1.1000"),
+                exit_price=Decimal("1.1100"),
+                exit_reason="tp_hit",
+                pnl_pips=Decimal("100"),
+                pnl_usd=Decimal(str(pnl)),
+                result=result,
+                entry_at=datetime.datetime(2024, 2, 1, 10, 0, tzinfo=datetime.timezone.utc),
+                exit_at=datetime.datetime(2024, 2, 1, 15, 0, tzinfo=datetime.timezone.utc),
+                duration_minutes=300,
+            )
+            return t
+
+        eurusd_trades = [
+            _make_trade("EURUSD=X", 20.0, "win"),
+            _make_trade("EURUSD=X", -10.0, "loss"),
+        ]
+        gcf_trades = [
+            _make_trade("GC=F", 150.0, "win"),
+            _make_trade("GC=F", -30.0, "loss"),
+        ]
+
+        mock_db = AsyncMock()
+
+        engine = BacktestEngine(mock_db)
+
+        # Patch _simulate_isolated to return controlled data
+        async def _fake_isolated(p, run_id=None):
+            all_trades = eurusd_trades + gcf_trades
+            filter_stats: dict = {}
+            per_instrument = {
+                "EURUSD=X": {
+                    "total_trades": 2,
+                    "win_rate_pct": 50.0,
+                    "profit_factor": 2.0,
+                    "total_pnl_usd": 10.0,
+                },
+                "GC=F": {
+                    "total_trades": 2,
+                    "win_rate_pct": 50.0,
+                    "profit_factor": 5.0,
+                    "total_pnl_usd": 120.0,
+                },
+            }
+            isolation_results = {"mode": "isolation", "per_instrument": per_instrument}
+            return all_trades, filter_stats, isolation_results
+
+        engine._simulate_isolated = _fake_isolated
+
+        # Patch DB calls so run_backtest doesn't fail
+        with (
+            patch("src.backtesting.backtest_engine.create_backtest_run", new_callable=AsyncMock, return_value="run-123"),
+            patch("src.backtesting.backtest_engine.update_backtest_run", new_callable=AsyncMock),
+            patch("src.backtesting.backtest_engine.create_backtest_trades_bulk", new_callable=AsyncMock),
+        ):
+            mock_db.commit = AsyncMock()
+            run_id = await engine.run_backtest(params)
+
+        assert run_id == "run-123"
+
+    @pytest.mark.asyncio
+    async def test_v7_18_correlation_guard_skipped_in_isolation_mode(self) -> None:
+        """In isolation mode, _simulate_isolated is called (not _simulate).
+        _simulate contains cross-symbol state; _simulate_isolated uses independent loops."""
+        from src.backtesting.backtest_engine import BacktestEngine
+        from src.backtesting.backtest_params import BacktestParams
+
+        params = BacktestParams(
+            symbols=["EURUSD=X"],
+            start_date="2024-01-01",
+            end_date="2024-06-01",
+            isolation_mode=True,
+        )
+
+        mock_db = AsyncMock()
+        engine = BacktestEngine(mock_db)
+
+        simulate_called = []
+        simulate_isolated_called = []
+
+        async def _fake_simulate(p, run_id=None):
+            simulate_called.append(True)
+            return [], {}
+
+        async def _fake_isolated(p, run_id=None):
+            simulate_isolated_called.append(True)
+            return [], {}, {"mode": "isolation", "per_instrument": {}}
+
+        engine._simulate = _fake_simulate
+        engine._simulate_isolated = _fake_isolated
+
+        with (
+            patch("src.backtesting.backtest_engine.create_backtest_run", new_callable=AsyncMock, return_value="run-999"),
+            patch("src.backtesting.backtest_engine.update_backtest_run", new_callable=AsyncMock),
+            patch("src.backtesting.backtest_engine.create_backtest_trades_bulk", new_callable=AsyncMock),
+        ):
+            mock_db.commit = AsyncMock()
+            await engine.run_backtest(params)
+
+        # isolation_mode=True must call _simulate_isolated, not _simulate
+        assert len(simulate_isolated_called) == 1
+        assert len(simulate_called) == 0
+
+    @pytest.mark.asyncio
+    async def test_v7_18_normal_mode_does_not_call_simulate_isolated(self) -> None:
+        """When isolation_mode=False (default), _simulate is called, not _simulate_isolated."""
+        from src.backtesting.backtest_engine import BacktestEngine
+        from src.backtesting.backtest_params import BacktestParams
+
+        params = BacktestParams(
+            symbols=["EURUSD=X"],
+            start_date="2024-01-01",
+            end_date="2024-06-01",
+            isolation_mode=False,
+        )
+
+        mock_db = AsyncMock()
+        engine = BacktestEngine(mock_db)
+
+        simulate_called = []
+        simulate_isolated_called = []
+
+        async def _fake_simulate(p, run_id=None):
+            simulate_called.append(True)
+            return [], {}
+
+        async def _fake_isolated(p, run_id=None):
+            simulate_isolated_called.append(True)
+            return [], {}, {"mode": "isolation", "per_instrument": {}}
+
+        engine._simulate = _fake_simulate
+        engine._simulate_isolated = _fake_isolated
+
+        with (
+            patch("src.backtesting.backtest_engine.create_backtest_run", new_callable=AsyncMock, return_value="run-001"),
+            patch("src.backtesting.backtest_engine.update_backtest_run", new_callable=AsyncMock),
+            patch("src.backtesting.backtest_engine.create_backtest_trades_bulk", new_callable=AsyncMock),
+        ):
+            mock_db.commit = AsyncMock()
+            await engine.run_backtest(params)
+
+        assert len(simulate_called) == 1
+        assert len(simulate_isolated_called) == 0

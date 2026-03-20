@@ -931,6 +931,63 @@ def _compute_summary(
     return result
 
 
+def _compute_path_dependence(
+    isolation_per_symbol: dict[str, dict],
+    combined_by_symbol: dict[str, dict],
+    threshold_pct: float = 30.0,
+) -> dict[str, Any]:
+    """TASK-V7-18: Compare per-symbol PnL between isolation mode and combined mode.
+
+    A symbol is flagged as "path-dependent" when the absolute PnL difference
+    exceeds threshold_pct (default 30%) of the isolation PnL.
+
+    Returns a dict with:
+      - path_dependent: list[str] — symbols with PnL diff > threshold_pct
+      - comparison: dict[symbol] -> {isolated_pnl, combined_pnl, diff_pct}
+    """
+    path_dependent: list[str] = []
+    comparison: dict[str, dict] = {}
+
+    all_symbols = set(isolation_per_symbol.keys()) | set(combined_by_symbol.keys())
+    for symbol in all_symbols:
+        isolated_pnl = (isolation_per_symbol.get(symbol) or {}).get("total_pnl_usd", 0.0)
+        combined_pnl = (combined_by_symbol.get(symbol) or {}).get("pnl_usd", 0.0)
+
+        if isolated_pnl is None:
+            isolated_pnl = 0.0
+        if combined_pnl is None:
+            combined_pnl = 0.0
+
+        isolated_pnl = float(isolated_pnl)
+        combined_pnl = float(combined_pnl)
+
+        if abs(isolated_pnl) > 0:
+            diff_pct = abs(isolated_pnl - combined_pnl) / abs(isolated_pnl) * 100
+        elif abs(combined_pnl) > 0:
+            diff_pct = 100.0  # isolated is zero, combined is not — maximum difference
+        else:
+            diff_pct = 0.0
+
+        comparison[symbol] = {
+            "isolated_pnl": round(isolated_pnl, 4),
+            "combined_pnl": round(combined_pnl, 4),
+            "diff_pct": round(diff_pct, 2),
+        }
+
+        if diff_pct > threshold_pct:
+            path_dependent.append(symbol)
+            logger.info(
+                "[V7-18] Path-dependent instrument: %s — isolated=%.4f combined=%.4f diff=%.1f%%",
+                symbol, isolated_pnl, combined_pnl, diff_pct,
+            )
+
+    return {
+        "path_dependent": sorted(path_dependent),
+        "comparison": comparison,
+        "threshold_pct": threshold_pct,
+    }
+
+
 def _nan_to_none(val: float) -> Optional[float]:
     """Convert NaN to None, keep valid floats."""
     if val is None:
@@ -1313,10 +1370,29 @@ class BacktestEngine:
         await self.db.commit()
 
         try:
-            trades, filter_stats, data_quality = await self._simulate(params)
-            summary = _compute_summary(trades, params.account_size, filter_stats=filter_stats)
-            # V7-17: attach data quality report to summary
-            summary["data_quality"] = data_quality
+            # TASK-V7-18: Isolation mode runs each symbol independently
+            if params.isolation_mode:
+                trades, filter_stats, isolation_results = await self._simulate_isolated(
+                    params, run_id=run_id
+                )
+                summary = _compute_summary(trades, params.account_size, filter_stats=filter_stats)
+                path_dep = _compute_path_dependence(
+                    isolation_per_symbol=isolation_results.get("per_instrument", {}),
+                    combined_by_symbol=summary.get("by_symbol", {}),
+                )
+                isolation_results["path_dependence"] = path_dep
+                summary["isolation_results"] = isolation_results
+                logger.info(
+                    "[V7-18] Path-dependent instruments: %s",
+                    path_dep.get("path_dependent", []),
+                )
+                # V7-17: data_quality not available in isolation mode
+                summary["data_quality"] = {}
+            else:
+                trades, filter_stats, data_quality = await self._simulate(params)
+                summary = _compute_summary(trades, params.account_size, filter_stats=filter_stats)
+                # V7-17: attach data quality report to summary
+                summary["data_quality"] = data_quality
 
             # V6 TASK-V6-13: Walk-forward validation — run IS and OOS separately
             if params.enable_walk_forward:
@@ -1752,6 +1828,168 @@ class BacktestEngine:
                 logger.info("[SIM-22] %s done — progress %.1f%%", symbol, _backtest_progress[run_id])
 
         return trades, agg_filter_stats, data_quality
+
+    async def _simulate_isolated(
+        self,
+        params: BacktestParams,
+        run_id: Optional[str] = None,
+    ) -> tuple[list[BacktestTradeResult], dict, dict[str, Any]]:
+        """TASK-V7-18: Isolation mode simulation.
+
+        Runs each symbol in a completely independent loop with no shared state:
+        - No correlation guard between symbols
+        - No position cooldowns shared across instruments
+        - Each symbol gets full capital allocation (position_pct unaffected by others)
+
+        Returns (all_trades, aggregated_filter_stats, isolation_results) where
+        isolation_results contains per-instrument summaries and path-dependence flags.
+        """
+        # Collect all trades (combined) and per-symbol data for comparison
+        all_trades: list[BacktestTradeResult] = []
+        agg_filter_stats: dict[str, int] = {}
+        per_symbol_summaries: dict[str, Any] = {}
+
+        start_dt = datetime.datetime.fromisoformat(params.start_date).replace(
+            tzinfo=datetime.timezone.utc
+        )
+        end_dt = datetime.datetime.fromisoformat(params.end_date).replace(
+            hour=23, minute=59, second=59, tzinfo=datetime.timezone.utc
+        )
+
+        # Pre-load shared data (economic events, D1 cache, DXY RSI)
+        # reuse the same helpers as _simulate to avoid duplication
+        economic_events: list = []
+        try:
+            from src.database.crud import get_economic_events_in_range
+            economic_events = await get_economic_events_in_range(self.db, start_dt, end_dt)
+        except Exception as exc:
+            logger.warning("[V7-18] Could not load economic events: %s", exc)
+
+        from src.config import BACKTEST_INSTRUMENT_WHITELIST
+        if BACKTEST_INSTRUMENT_WHITELIST:
+            symbols_to_run = [s for s in params.symbols if s in BACKTEST_INSTRUMENT_WHITELIST]
+        else:
+            symbols_to_run = params.symbols
+
+        _D1_WARMUP_DAYS = 300
+        d1_data_cache: dict[str, list] = {}
+        if params.apply_d1_trend_filter:
+            d1_start = start_dt - datetime.timedelta(days=_D1_WARMUP_DAYS)
+            for symbol in symbols_to_run:
+                try:
+                    instr = await get_instrument_by_symbol(self.db, symbol)
+                    if instr is not None:
+                        d1_rows = await get_price_data(
+                            self.db, instr.id, "D1",
+                            from_dt=d1_start, to_dt=end_dt, limit=10_000,
+                        )
+                        d1_data_cache[symbol] = d1_rows
+                except Exception as exc:
+                    logger.warning("[V7-18] Could not load D1 data for %s: %s", symbol, exc)
+
+        dxy_rsi_by_ts: dict[datetime.datetime, float] = {}
+        _DXY_SYMBOLS = ["DX-Y.NYB", "DXY", "DX=F"]
+        dxy_start = start_dt - datetime.timedelta(days=30)
+        for _dxy_sym in _DXY_SYMBOLS:
+            try:
+                dxy_instrument = await get_instrument_by_symbol(self.db, _dxy_sym)
+                if dxy_instrument is not None:
+                    dxy_rows = await get_price_data(
+                        self.db, dxy_instrument.id, "H1",
+                        from_dt=dxy_start, to_dt=end_dt, limit=100_000,
+                    )
+                    if len(dxy_rows) >= 14:
+                        dxy_rsi_by_ts = _compute_dxy_rsi(dxy_rows)
+                    break
+            except Exception as exc:
+                logger.warning("[V7-18] Could not load DXY data for %s: %s", _dxy_sym, exc)
+
+        total_symbols = len(symbols_to_run)
+        if run_id:
+            _backtest_progress[run_id] = 0.0
+
+        # Run each symbol in complete isolation — no shared open_positions state
+        for sym_idx, symbol in enumerate(symbols_to_run):
+            instrument = await get_instrument_by_symbol(self.db, symbol)
+            if instrument is None:
+                logger.warning("[V7-18] Instrument %s not found — skipping", symbol)
+                if run_id:
+                    _backtest_progress[run_id] = round((sym_idx + 1) / total_symbols * 100, 1)
+                continue
+
+            market_type: str = instrument.market or "forex"
+
+            price_rows = await get_price_data(
+                self.db,
+                instrument.id,
+                params.timeframe,
+                from_dt=start_dt,
+                to_dt=end_dt,
+                limit=100_000,
+            )
+
+            if len(price_rows) < _MIN_BARS_HISTORY + 2:
+                logger.warning(
+                    "[V7-18] %s: only %d candles — need at least %d, skipping",
+                    symbol, len(price_rows), _MIN_BARS_HISTORY + 2,
+                )
+                if run_id:
+                    _backtest_progress[run_id] = round((sym_idx + 1) / total_symbols * 100, 1)
+                continue
+
+            sym_base_pct = sym_idx / total_symbols * 100
+            sym_share = 100.0 / total_symbols
+
+            def _progress_cb(candle_pct: float) -> None:
+                if run_id:
+                    _backtest_progress[run_id] = round(
+                        sym_base_pct + candle_pct * sym_share / 100, 1
+                    )
+
+            # Each symbol runs independently — no shared state passed between runs
+            symbol_trades, symbol_filter_stats = await asyncio.to_thread(
+                self._simulate_symbol,
+                symbol=symbol,
+                market_type=market_type,
+                timeframe=params.timeframe,
+                price_rows=price_rows,
+                account_size=params.account_size,
+                apply_slippage=params.apply_slippage,
+                progress_cb=_progress_cb,
+                economic_events=economic_events,
+                params=params,
+                d1_rows_all=d1_data_cache.get(symbol, []),
+                dxy_rsi_by_ts=dxy_rsi_by_ts,
+            )
+
+            all_trades.extend(symbol_trades)
+            for k, v in symbol_filter_stats.items():
+                agg_filter_stats[k] = agg_filter_stats.get(k, 0) + v
+
+            # Compute isolated per-symbol summary for comparison
+            sym_summary = _compute_summary(symbol_trades, params.account_size)
+            per_symbol_summaries[symbol] = {
+                "total_trades": sym_summary["total_trades"],
+                "win_rate_pct": sym_summary["win_rate_pct"],
+                "profit_factor": sym_summary["profit_factor"],
+                "total_pnl_usd": sym_summary["total_pnl_usd"],
+            }
+
+            if run_id:
+                _backtest_progress[run_id] = round((sym_idx + 1) / total_symbols * 100, 1)
+                logger.info("[V7-18] %s isolated done — progress %.1f%%", symbol, _backtest_progress[run_id])
+
+        isolation_results: dict[str, Any] = {
+            "mode": "isolation",
+            "per_instrument": per_symbol_summaries,
+        }
+
+        logger.info(
+            "[V7-18] Isolation mode complete: %d symbols, %d total trades",
+            total_symbols, len(all_trades),
+        )
+
+        return all_trades, agg_filter_stats, isolation_results
 
     def _simulate_symbol(
         self,
