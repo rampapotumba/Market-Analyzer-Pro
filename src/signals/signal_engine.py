@@ -445,7 +445,7 @@ class SignalEngine:
                 return None
 
         # 3. Fetch macro and news data
-        macro_records = await get_macro_data(db, limit=200)
+        macro_records = await get_macro_data(db, limit=500)
         news_records = await get_news_events(db, limit=30)
 
         # Economic calendar blocking — check for HIGH-impact events in next 4 hours

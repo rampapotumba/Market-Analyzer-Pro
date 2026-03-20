@@ -31,6 +31,10 @@ FRED_SERIES = {
     "INDPRO": {"name": "Industrial Production Index", "country": "US"},
     "RETAILSMNSA": {"name": "Retail Sales", "country": "US"},
     "HOUST": {"name": "Housing Starts", "country": "US"},
+    "DFF": {"name": "Daily Federal Funds Rate", "country": "US"},
+    "T10Y2Y": {"name": "10-Year minus 2-Year Treasury Yield Spread", "country": "US"},
+    "DTWEXBGS": {"name": "Trade Weighted US Dollar Index (Broad)", "country": "US"},
+    "UMCSENT": {"name": "University of Michigan Consumer Sentiment", "country": "US"},
 }
 
 
@@ -44,7 +48,7 @@ class FREDCollector(BaseCollector):
     async def _fetch_series(
         self,
         series_id: str,
-        limit: int = 12,
+        limit: int = 60,
     ) -> list[dict[str, Any]]:
         if not self.api_key:
             return []
