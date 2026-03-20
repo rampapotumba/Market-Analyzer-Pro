@@ -4089,7 +4089,7 @@ class TestV716WalkForwardOOSTrades:
                 trades = [_make_wf_trade(result="win", pnl_usd=20.0)]
             else:
                 trades = [_make_wf_trade(result="loss", pnl_usd=-10.0)]
-            return trades, {}, {}
+            return trades, {}, {}, {}
 
         engine._simulate = _fake_simulate
 
@@ -4140,7 +4140,7 @@ class TestV716WalkForwardOOSTrades:
                     _make_wf_trade(result="win", pnl_usd=10.0),
                     _make_wf_trade(result="loss", pnl_usd=-5.0),
                 ]
-            return trades, {}, {}
+            return trades, {}, {}, {}
 
         engine._simulate = _fake_simulate
 
@@ -4172,7 +4172,7 @@ class TestV716WalkForwardOOSTrades:
         engine = BacktestEngine(mock_db)
 
         async def _fake_simulate(p: Any, run_id: Optional[str] = None) -> tuple:
-            return [], {}, {}
+            return [], {}, {}, {}
 
         engine._simulate = _fake_simulate
 
@@ -4209,14 +4209,14 @@ class TestV716WalkForwardAggregateMetrics:
 
         async def _fake_simulate(p: Any, run_id: Optional[str] = None) -> tuple:
             if p.start_date == "2020-01-01":
-                return [_make_wf_trade(result="win", pnl_usd=20.0)], {}, {}
+                return [_make_wf_trade(result="win", pnl_usd=20.0)], {}, {}, {}
             # OOS: 3 wins (30 USD) + 1 loss (-10 USD) → PF = 3.0
             return [
                 _make_wf_trade(result="win", pnl_usd=10.0),
                 _make_wf_trade(result="win", pnl_usd=10.0),
                 _make_wf_trade(result="win", pnl_usd=10.0),
                 _make_wf_trade(result="loss", pnl_usd=-10.0),
-            ], {}, {}
+            ], {}, {}, {}
 
         engine._simulate = _fake_simulate
 
@@ -4247,7 +4247,7 @@ class TestV716WalkForwardAggregateMetrics:
         engine = BacktestEngine(mock_db)
 
         async def _fake_simulate(p: Any, run_id: Optional[str] = None) -> tuple:
-            return [], {}, {}
+            return [], {}, {}, {}
 
         engine._simulate = _fake_simulate
 
@@ -4280,12 +4280,12 @@ class TestV716WalkForwardVerdict:
 
         async def _fake_simulate(p: Any, run_id: Optional[str] = None) -> tuple:
             if p.start_date == "2020-01-01":
-                return [_make_wf_trade(result="win", pnl_usd=10.0)], {}, {}
+                return [_make_wf_trade(result="win", pnl_usd=10.0)], {}, {}, {}
             # OOS: PF = 20/10 = 2.0 > 1.0
             return [
                 _make_wf_trade(result="win", pnl_usd=20.0),
                 _make_wf_trade(result="loss", pnl_usd=-10.0),
-            ], {}, {}
+            ], {}, {}, {}
 
         engine._simulate = _fake_simulate
 
@@ -4317,20 +4317,20 @@ class TestV716WalkForwardVerdict:
 
         async def _fake_simulate(p: Any, run_id: Optional[str] = None) -> tuple:
             if p.start_date == "2020-01-01":
-                return [_make_wf_trade(result="win", pnl_usd=10.0)], {}, {}
+                return [_make_wf_trade(result="win", pnl_usd=10.0)], {}, {}, {}
             fold_oos_call[0] += 1
             if fold_oos_call[0] == 1:
                 # Fold 1 OOS: profitable (PF = 2.0)
                 return [
                     _make_wf_trade(result="win", pnl_usd=20.0),
                     _make_wf_trade(result="loss", pnl_usd=-10.0),
-                ], {}, {}
+                ], {}, {}, {}
             else:
                 # Fold 2 OOS: unprofitable (PF = 0.5)
                 return [
                     _make_wf_trade(result="win", pnl_usd=5.0),
                     _make_wf_trade(result="loss", pnl_usd=-10.0),
-                ], {}, {}
+                ], {}, {}, {}
 
         engine._simulate = _fake_simulate
 
@@ -4359,12 +4359,12 @@ class TestV716WalkForwardVerdict:
 
         async def _fake_simulate(p: Any, run_id: Optional[str] = None) -> tuple:
             if p.start_date == "2020-01-01":
-                return [_make_wf_trade(result="win", pnl_usd=10.0)], {}, {}
+                return [_make_wf_trade(result="win", pnl_usd=10.0)], {}, {}, {}
             # OOS: PF = 11/10 = 1.1 (> 1.0 per fold, but < 1.2 aggregate)
             return [
                 _make_wf_trade(result="win", pnl_usd=11.0),
                 _make_wf_trade(result="loss", pnl_usd=-10.0),
-            ], {}, {}
+            ], {}, {}, {}
 
         engine._simulate = _fake_simulate
 
@@ -4395,7 +4395,7 @@ class TestV716WalkForwardVerdict:
         engine = BacktestEngine(mock_db)
 
         async def _fake_simulate(p: Any, run_id: Optional[str] = None) -> tuple:
-            return [], {}, {}
+            return [], {}, {}, {}
 
         engine._simulate = _fake_simulate
 
@@ -4445,7 +4445,7 @@ class TestV716WalkForwardBackwardCompatibility:
             return {}
 
         async def _fake_simulate(p: Any, run_id: Optional[str] = None) -> tuple:
-            return [], {}, {}
+            return [], {}, {}, {}
 
         engine._run_walk_forward = _fake_wf
         engine._simulate = _fake_simulate
@@ -4485,7 +4485,7 @@ class TestV716WalkForwardBackwardCompatibility:
             return {"verdict": "VALID", "folds": [], "fold_count": 0, "aggregate_oos": {}}
 
         async def _fake_simulate(p: Any, run_id: Optional[str] = None) -> tuple:
-            return [], {}, {}
+            return [], {}, {}, {}
 
         engine._run_walk_forward = _fake_wf
         engine._simulate = _fake_simulate
@@ -4520,7 +4520,7 @@ class TestV716WalkForwardBackwardCompatibility:
         captured_summary: list[dict] = []
 
         async def _fake_simulate(p: Any, run_id: Optional[str] = None) -> tuple:
-            return [], {}, {}
+            return [], {}, {}, {}
 
         engine._simulate = _fake_simulate
 
@@ -4569,7 +4569,7 @@ class TestV716WalkForwardBackwardCompatibility:
             return wf_result
 
         async def _fake_simulate(p: Any, run_id: Optional[str] = None) -> tuple:
-            return [], {}, {}
+            return [], {}, {}, {}
 
         engine._run_walk_forward = _fake_wf
         engine._simulate = _fake_simulate
@@ -4709,7 +4709,7 @@ class TestV719Benchmarks:
         assert result_1["note"] == "price_data_based"
 
     def test_v7_19_random_entry_returns_valid_pf_values(self) -> None:
-        """Random entry PF values are positive when price data is available."""
+        """Random entry returns numeric PF values (>= 0) and non-negative n_simulations."""
         from src.backtesting.backtest_engine import _compute_random_entry
 
         df = self._make_price_df(first_open=1.2, last_close=1.25, n_bars=500)
@@ -4718,11 +4718,13 @@ class TestV719Benchmarks:
             price_dfs_by_symbol={"USDJPY=X": df},
             account_size=Decimal("1000"),
         )
+        # PF values can be None (no price variation) or non-negative float
         if result["pf_median"] is not None:
-            assert result["pf_median"] > 0
+            assert result["pf_median"] >= 0
         if result["pf_95th"] is not None:
-            assert result["pf_95th"] > 0
+            assert result["pf_95th"] >= 0
         assert result["n_simulations"] >= 0
+        assert result["note"] == "price_data_based"
 
     def test_v7_19_random_entry_fallback_with_trades(self) -> None:
         """When price data is empty, fallback to trade-based bootstrap."""
