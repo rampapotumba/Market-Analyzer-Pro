@@ -36,7 +36,11 @@ from src.config import INSTRUMENT_OVERRIDES
 from src.database.crud import (
     create_backtest_run,
     create_backtest_trades_bulk,
+    get_central_bank_rates_as_of,
+    get_fear_greed_in_range,
+    get_geo_events_in_range,
     get_instrument_by_symbol,
+    get_macro_data_in_range,
     get_price_data,
     update_backtest_run,
 )
@@ -70,6 +74,12 @@ _MIN_BARS_HISTORY = 50
 # Weight used for TA when fa/sentiment/geo = 0.0
 # Mirrors DEFAULT_TA_WEIGHT in settings (0.45 default)
 _TA_WEIGHT = 0.45
+
+# TASK-V7-11: Weights for FA/Sentiment/Geo when use_fundamental_data=True.
+# Mirrors SCORE_COMPONENT_WEIGHTS in config.py.
+_FA_WEIGHT = 0.25
+_SENTIMENT_WEIGHT = 0.20
+_GEO_WEIGHT = 0.10
 
 # Market type → pip size for P&L calculation
 _PIP_SIZE: dict[str, Decimal] = {
@@ -1329,6 +1339,152 @@ def _to_utc(ts: datetime.datetime) -> datetime.datetime:
     return ts.astimezone(datetime.timezone.utc)
 
 
+def _build_fa_score_at(
+    macro_rows: list,
+    candle_ts: datetime.datetime,
+    instrument: Any,
+    central_bank_rates: dict[str, float],
+) -> float:
+    """TASK-V7-11: Compute FA score from macro rows available strictly before candle_ts.
+
+    Uses bisect to find the insertion point so only rows with
+    release_date < candle_ts are considered (no lookahead).
+
+    Returns 0.0 if no macro data is available (graceful degradation).
+    """
+    from src.analysis.fa_engine import FAEngine
+
+    if not macro_rows:
+        return 0.0
+
+    # macro_rows are sorted by release_date ASC (guaranteed by get_macro_data_in_range)
+    # Find the index of the first row whose release_date >= candle_ts
+    # All rows at indices [0..cutoff-1] have release_date < candle_ts
+    candle_ts_utc = _to_utc(candle_ts)
+    release_dates = [_to_utc(r.release_date) for r in macro_rows if r.release_date is not None]
+    if not release_dates:
+        return 0.0
+
+    cutoff = bisect.bisect_left(release_dates, candle_ts_utc)
+    visible_rows = macro_rows[:cutoff]
+
+    if not visible_rows:
+        return 0.0
+
+    # FAEngine expects rows sorted desc by release_date (latest first) to build
+    # _latest and _previous maps correctly
+    visible_sorted_desc = list(reversed(visible_rows))
+
+    try:
+        fa_engine = FAEngine(
+            instrument=instrument,
+            macro_data=visible_sorted_desc,
+            news_data=[],
+            central_bank_rates=central_bank_rates,
+        )
+        return fa_engine.calculate_fa_score()
+    except Exception as exc:
+        logger.warning("[V7-11] FA score computation failed: %s", exc)
+        return 0.0
+
+
+def _build_sentiment_score_at(
+    fg_rows: list,
+    candle_ts: datetime.datetime,
+) -> float:
+    """TASK-V7-11: Compute sentiment score from fear_greed data available before candle_ts.
+
+    Finds the most recent FEAR_GREED row with timestamp < candle_ts (no lookahead).
+    Maps the fear_greed_index (0–100) to a sentiment score in [-100, +100]:
+      - Extreme Fear (<=20): bullish sentiment (+40..+100)
+      - Fear (20–45): mild bullish (+0..+40)
+      - Neutral (45–55): 0
+      - Greed (55–80): mild bearish (-40..0)
+      - Extreme Greed (>=80): bearish sentiment (-40..-100)
+
+    Returns 0.0 if no fear_greed data is available (graceful degradation).
+    """
+    if not fg_rows:
+        return 0.0
+
+    candle_ts_utc = _to_utc(candle_ts)
+    fg_timestamps = [_to_utc(r.timestamp) for r in fg_rows]
+    idx = bisect.bisect_left(fg_timestamps, candle_ts_utc) - 1
+    if idx < 0:
+        return 0.0
+
+    fg_row = fg_rows[idx]
+    fg_index = fg_row.fear_greed_index
+    if fg_index is None:
+        return 0.0
+
+    fg_val = float(fg_index)
+    # Map 0–100 to sentiment score in [-100, +100]
+    # Inverted: low F&G (fear) = bullish, high F&G (greed) = bearish
+    # Linear: score = (50 - fg_val) * 2  → range [-100, +100]
+    score = (50.0 - fg_val) * 2.0
+    return max(-100.0, min(100.0, score))
+
+
+def _build_geo_score_at(
+    geo_rows: list,
+    candle_ts: datetime.datetime,
+    symbol: str,
+) -> float:
+    """TASK-V7-11: Compute geo score from ACLED events available before candle_ts.
+
+    Finds events with event_date < candle_ts for countries related to the symbol.
+    Aggregates severity_score over the last 30 days to produce a geo risk score.
+
+    Positive score = stable geopolitical environment (bullish).
+    Negative score = high geopolitical risk (bearish).
+
+    Returns 0.0 if no geo data is available (graceful degradation).
+    """
+    if not geo_rows:
+        return 0.0
+
+    # Map symbol to relevant countries (reuse GeoEngineV2 mapping)
+    try:
+        from src.analysis.geo_engine_v2 import _symbol_to_countries
+        countries = set(_symbol_to_countries(symbol))
+    except Exception:
+        return 0.0
+
+    if not countries:
+        return 0.0
+
+    candle_ts_utc = _to_utc(candle_ts)
+    lookback_start = candle_ts_utc - datetime.timedelta(days=30)
+
+    severity_sum = 0.0
+    event_count = 0
+
+    for row in geo_rows:
+        if row.event_date is None:
+            continue
+        row_ts = _to_utc(row.event_date)
+        if row_ts >= candle_ts_utc:
+            break  # rows are sorted ASC; stop when we hit future events
+        if row_ts < lookback_start:
+            continue  # too old — only last 30 days
+        if row.country not in countries:
+            continue
+
+        sev = float(row.severity_score) if row.severity_score is not None else 0.5
+        severity_sum += sev
+        event_count += 1
+
+    if event_count == 0:
+        return 0.0
+
+    # Higher severity aggregate = more risk = negative score
+    # avg_severity in [0, 1] → scale to [-50, 0]
+    avg_severity = severity_sum / event_count
+    score = -avg_severity * 50.0
+    return max(-50.0, min(0.0, score))
+
+
 def _compute_dxy_rsi(dxy_rows: list) -> dict:
     """CAL3-01: Compute RSI(14) over DXY H1 price rows using Wilder smoothing.
 
@@ -1466,6 +1622,167 @@ class BacktestEngine:
             await self.db.commit()
 
         return run_id
+
+    async def _run_walk_forward(self, params: BacktestParams) -> dict[str, Any]:
+        """TASK-V7-16: Multi-fold anchored expanding window walk-forward validation.
+
+        Fold structure (anchored expanding window):
+          Fold 1: IS [start_date .. start + is_months],       OOS [IS_end .. IS_end + oos_months]
+          Fold 2: IS [start_date .. start + is_months*2],     OOS [IS_end .. IS_end + oos_months]
+          ...
+          Fold N: IS [start_date .. IS_end_N],                OOS [IS_end_N .. end_date or IS_end_N + oos_months]
+
+        A new fold is added as long as OOS window start < params.end_date.
+
+        Returns a dict placed in summary["walk_forward"] with:
+          - folds: list of per-fold metrics (IS + OOS)
+          - aggregate_oos: metrics computed over all OOS trades combined
+          - verdict: "VALID" / "INVALID" / "INSUFFICIENT_DATA"
+            VALID requires: ALL folds OOS PF > 1.0 AND aggregate OOS PF > 1.2
+        """
+        from dateutil.relativedelta import relativedelta
+
+        global_start = datetime.datetime.fromisoformat(params.start_date)
+        global_end = datetime.datetime.fromisoformat(params.end_date)
+
+        # ── Build fold windows ────────────────────────────────────────────────
+        folds_windows: list[tuple[str, str, str, str]] = []  # (is_start, is_end, oos_start, oos_end)
+        fold_num = 1
+        while True:
+            is_end = global_start + relativedelta(months=params.in_sample_months * fold_num)
+            oos_start = is_end
+            oos_end = oos_start + relativedelta(months=params.out_of_sample_months)
+
+            # OOS window must begin before global_end
+            if oos_start >= global_end:
+                break
+
+            # Clamp OOS end to global_end
+            effective_oos_end = min(oos_end, global_end)
+
+            folds_windows.append((
+                params.start_date,
+                is_end.date().isoformat(),
+                oos_start.date().isoformat(),
+                effective_oos_end.date().isoformat(),
+            ))
+            fold_num += 1
+
+            # Stop once OOS end reaches or exceeds global_end
+            if oos_end >= global_end:
+                break
+
+        if not folds_windows:
+            logger.warning(
+                "[V7-16] Walk-forward: no valid folds generated for range %s – %s "
+                "(is_months=%d, oos_months=%d)",
+                params.start_date, params.end_date,
+                params.in_sample_months, params.out_of_sample_months,
+            )
+            return {
+                "folds": [],
+                "aggregate_oos": {"total_trades": 0, "profit_factor": None},
+                "verdict": "INSUFFICIENT_DATA",
+                "fold_count": 0,
+            }
+
+        # ── Run each fold ─────────────────────────────────────────────────────
+        fold_results: list[dict[str, Any]] = []
+        all_oos_trades: list[BacktestTradeResult] = []
+
+        for fold_idx, (is_start, is_end, oos_start, oos_end) in enumerate(folds_windows, start=1):
+            logger.info(
+                "[V7-16] Walk-forward fold %d/%d: IS %s–%s  OOS %s–%s",
+                fold_idx, len(folds_windows), is_start, is_end, oos_start, oos_end,
+            )
+
+            is_params = params.model_copy(update={
+                "start_date": is_start,
+                "end_date": is_end,
+                "enable_walk_forward": False,
+            })
+            oos_params = params.model_copy(update={
+                "start_date": oos_start,
+                "end_date": oos_end,
+                "enable_walk_forward": False,
+            })
+
+            is_trades, is_fs, _is_dq = await self._simulate(is_params)
+            oos_trades, oos_fs, _oos_dq = await self._simulate(oos_params)
+
+            is_summary = _compute_summary(is_trades, params.account_size, filter_stats=is_fs)
+            oos_summary = _compute_summary(oos_trades, params.account_size, filter_stats=oos_fs)
+
+            is_pf = is_summary.get("profit_factor")
+            oos_pf = oos_summary.get("profit_factor")
+
+            fold_results.append({
+                "fold": fold_idx,
+                "is_period": f"{is_start} – {is_end}",
+                "oos_period": f"{oos_start} – {oos_end}",
+                "in_sample": {
+                    "total_trades": is_summary["total_trades"],
+                    "win_rate_pct": is_summary.get("win_rate_pct", 0.0),
+                    "profit_factor": float(is_pf) if is_pf is not None else None,
+                    "total_pnl_usd": is_summary.get("total_pnl_usd", 0.0),
+                },
+                "out_of_sample": {
+                    "total_trades": oos_summary["total_trades"],
+                    "win_rate_pct": oos_summary.get("win_rate_pct", 0.0),
+                    "profit_factor": float(oos_pf) if oos_pf is not None else None,
+                    "total_pnl_usd": oos_summary.get("total_pnl_usd", 0.0),
+                },
+            })
+
+            all_oos_trades.extend(oos_trades)
+
+        # ── Aggregate OOS metrics across all folds ────────────────────────────
+        agg_summary = _compute_summary(all_oos_trades, params.account_size)
+        agg_pf = agg_summary.get("profit_factor")
+
+        # ── Verdict ───────────────────────────────────────────────────────────
+        # VALID requires:
+        #   1. All folds OOS PF > 1.0 (no fold is unprofitable)
+        #   2. Aggregate OOS PF > 1.2
+        _WF_FOLD_MIN_PF = 1.0
+        _WF_AGG_MIN_PF = 1.2
+
+        oos_pfs = [r["out_of_sample"]["profit_factor"] for r in fold_results]
+        all_folds_profitable = all(
+            pf is not None and pf > _WF_FOLD_MIN_PF
+            for pf in oos_pfs
+        )
+        agg_pf_ok = agg_pf is not None and float(agg_pf) > _WF_AGG_MIN_PF
+
+        if not fold_results:
+            verdict = "INSUFFICIENT_DATA"
+        elif all_folds_profitable and agg_pf_ok:
+            verdict = "VALID"
+        else:
+            verdict = "INVALID"
+
+        logger.info(
+            "[V7-16] Walk-forward complete: %d folds, agg OOS trades=%d, agg PF=%s, verdict=%s",
+            len(fold_results), len(all_oos_trades),
+            round(float(agg_pf), 4) if agg_pf is not None else None,
+            verdict,
+        )
+
+        return {
+            "folds": fold_results,
+            "fold_count": len(fold_results),
+            "aggregate_oos": {
+                "total_trades": agg_summary["total_trades"],
+                "win_rate_pct": agg_summary.get("win_rate_pct", 0.0),
+                "profit_factor": float(agg_pf) if agg_pf is not None else None,
+                "total_pnl_usd": agg_summary.get("total_pnl_usd", 0.0),
+            },
+            "verdict": verdict,
+            "verdict_criteria": {
+                "all_folds_pf_above_1_0": all_folds_profitable,
+                "aggregate_pf_above_1_2": agg_pf_ok,
+            },
+        }
 
     @staticmethod
     def _check_data_quality(
@@ -1730,6 +2047,48 @@ class BacktestEngine:
                 _DXY_SYMBOLS,
             )
 
+        # TASK-V7-11: Pre-load historical FA/Sentiment/Geo data for the entire backtest period.
+        # Only loaded when use_fundamental_data=True to keep backward compatibility.
+        # Extra warmup before start_dt ensures rates/macro data are available from day 1.
+        macro_rows_all: list = []
+        fg_rows_all: list = []
+        geo_rows_all: list = []
+        _FA_WARMUP_DAYS = 365  # 1 year of macro data before start for rate differential context
+        if params.use_fundamental_data:
+            fa_start = start_dt - datetime.timedelta(days=_FA_WARMUP_DAYS)
+            try:
+                macro_rows_all = list(
+                    await get_macro_data_in_range(self.db, fa_start, end_dt)
+                )
+                logger.info(
+                    "[V7-11] Loaded %d macro rows for FA score computation",
+                    len(macro_rows_all),
+                )
+            except Exception as exc:
+                logger.warning("[V7-11] Could not load macro data: %s — FA will be 0.0", exc)
+
+            try:
+                fg_rows_all = list(
+                    await get_fear_greed_in_range(self.db, fa_start, end_dt)
+                )
+                logger.info(
+                    "[V7-11] Loaded %d fear_greed rows for sentiment score computation",
+                    len(fg_rows_all),
+                )
+            except Exception as exc:
+                logger.warning("[V7-11] Could not load fear_greed data: %s — sentiment will be 0.0", exc)
+
+            try:
+                geo_rows_all = list(
+                    await get_geo_events_in_range(self.db, fa_start, end_dt)
+                )
+                logger.info(
+                    "[V7-11] Loaded %d geo events for geo score computation",
+                    len(geo_rows_all),
+                )
+            except Exception as exc:
+                logger.warning("[V7-11] Could not load geo events: %s — geo will be 0.0", exc)
+
         total_symbols = len(symbols_to_run)
         if run_id:
             _backtest_progress[run_id] = 0.0
@@ -1743,6 +2102,19 @@ class BacktestEngine:
                 continue
 
             market_type: str = instrument.market or "forex"
+
+            # TASK-V7-11: Load central bank rates as of end_dt once per symbol.
+            # This is a lightweight query (one row per bank) — acceptable per-symbol cost.
+            # When use_fundamental_data=False, pass empty dict (backward compatible).
+            central_bank_rates: dict[str, float] = {}
+            if params.use_fundamental_data:
+                try:
+                    central_bank_rates = await get_central_bank_rates_as_of(self.db, end_dt)
+                except Exception as exc:
+                    logger.warning(
+                        "[V7-11] Could not load central bank rates for %s: %s",
+                        symbol, exc,
+                    )
 
             price_rows = await get_price_data(
                 self.db,
@@ -1793,6 +2165,12 @@ class BacktestEngine:
                 params=params,
                 d1_rows_all=d1_data_cache.get(symbol, []),
                 dxy_rsi_by_ts=dxy_rsi_by_ts,
+                # TASK-V7-11: historical FA data (empty lists/dicts when not enabled)
+                macro_rows_all=macro_rows_all,
+                central_bank_rates=central_bank_rates,
+                fg_rows_all=fg_rows_all,
+                geo_rows_all=geo_rows_all,
+                instrument_obj=instrument if params.use_fundamental_data else None,
             )
             trades.extend(symbol_trades)
             # V6 TASK-V6-10: accumulate filter stats across symbols
@@ -1980,6 +2358,12 @@ class BacktestEngine:
         params: Optional[BacktestParams] = None,
         d1_rows_all: Optional[list] = None,
         dxy_rsi_by_ts: Optional[dict] = None,
+        # TASK-V7-11: historical FA/Sentiment/Geo data (all optional for backward compat)
+        macro_rows_all: Optional[list] = None,
+        central_bank_rates: Optional[dict[str, float]] = None,
+        fg_rows_all: Optional[list] = None,
+        geo_rows_all: Optional[list] = None,
+        instrument_obj: Optional[Any] = None,
     ) -> tuple[list[BacktestTradeResult], dict]:
         """Simulate one symbol over all its candles. Returns closed trades.
 
@@ -1988,7 +2372,23 @@ class BacktestEngine:
 
         All signal-level filtering is handled by SignalFilterPipeline.run_all().
         _generate_signal() only computes the raw signal (TA, composite, regime, ATR).
+
+        TASK-V7-11: When macro_rows_all/fg_rows_all/geo_rows_all are provided (non-empty),
+        FA/Sentiment/Geo scores are computed and incorporated into the composite score.
         """
+        # TASK-V7-11: Flag for whether to use fundamental data for this symbol.
+        # Requires non-None instrument_obj (needed by FAEngine constructor).
+        _use_fd = (
+            instrument_obj is not None
+            and (
+                (macro_rows_all is not None and len(macro_rows_all) > 0)
+                or (fg_rows_all is not None and len(fg_rows_all) > 0)
+            )
+        )
+        _macro_rows: list = macro_rows_all or []
+        _fg_rows: list = fg_rows_all or []
+        _geo_rows: list = geo_rows_all or []
+        _cb_rates: dict[str, float] = central_bank_rates or {}
         # Build filter pipeline from BacktestParams (SIM-42/SIM-43)
         pipeline = SignalFilterPipeline(
             apply_score_filter=True,  # always on
@@ -2210,6 +2610,30 @@ class BacktestEngine:
             if signal is None:
                 continue
 
+            # TASK-V7-11: Recompute composite score using historical FA/Sentiment/Geo data.
+            # Only when fundamental data is available; otherwise keep legacy TA-only score.
+            # No lookahead: all score helpers use bisect with strictly < candle_ts.
+            if _use_fd:
+                candle_ts_for_fd = _to_utc(candle_ts) if candle_ts.tzinfo is None else candle_ts
+                fa_score_i = _build_fa_score_at(
+                    _macro_rows, candle_ts_for_fd, instrument_obj, _cb_rates
+                )
+                sentiment_score_i = _build_sentiment_score_at(_fg_rows, candle_ts_for_fd)
+                geo_score_i = _build_geo_score_at(_geo_rows, candle_ts_for_fd, symbol)
+                composite_full = (
+                    _TA_WEIGHT * ta_score_i
+                    + _FA_WEIGHT * fa_score_i
+                    + _SENTIMENT_WEIGHT * sentiment_score_i
+                    + _GEO_WEIGHT * geo_score_i
+                )
+                signal = dict(signal)
+                signal["composite_score"] = Decimal(str(round(composite_full, 4)))
+                signal["direction"] = "LONG" if composite_full > 0 else "SHORT"
+                logger.debug(
+                    "[V7-11] %s composite recomputed: ta=%.2f fa=%.2f sent=%.2f geo=%.2f → %.4f",
+                    symbol, ta_score_i, fa_score_i, sentiment_score_i, geo_score_i, composite_full,
+                )
+
             # ── OPT-01: O(log m) D1 slice via bisect (replaces O(m) list comprehension) ──
             # D1 timestamps are pre-sorted in the pre-loop phase above.
             # bisect_right returns insertion point AFTER candle_ts, so [0:idx] gives
@@ -2218,6 +2642,9 @@ class BacktestEngine:
             d1_rows_for_filter = _d1_all[max(0, _d1_idx - 200):_d1_idx]
 
             # ── Run unified filter pipeline (SIM-42) ─────────────────────────
+            # TASK-V7-11: when fundamental data is used, available_weight = 1.0
+            # (all four components contribute); otherwise keep legacy _TA_WEIGHT.
+            _avail_weight = 1.0 if _use_fd else _TA_WEIGHT
             filter_context = {
                 "composite_score": float(signal["composite_score"]),
                 "market_type": market_type,
@@ -2236,8 +2663,10 @@ class BacktestEngine:
                 # when DXY and symbol timestamps don't align to the same second.
                 # idx = i-1 (previous candle) consistent with all other TA indicators.
                 "dxy_rsi": dxy_rsi_at_idx[idx],
-                # V6 TASK-V6-02: only TA available in backtest → proportional scaling
-                "available_weight": _TA_WEIGHT,
+                # V6 TASK-V6-02: proportional threshold scaling.
+                # With fundamental data: all weights active = 1.0.
+                # Without: only TA available = _TA_WEIGHT (0.45).
+                "available_weight": _avail_weight,
             }
             passed, reason = pipeline.run_all(filter_context)
             if not passed:

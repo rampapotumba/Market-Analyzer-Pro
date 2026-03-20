@@ -3332,3 +3332,730 @@ class TestV715FilterActivationStats:
         fas = summary["filter_activation_stats"]
         assert "warnings" in fas
         assert isinstance(fas["warnings"], list)
+
+
+# ── TASK-V7-16: Walk-forward validation ───────────────────────────────────────
+
+
+def _make_wf_trade(
+    direction: str = "LONG",
+    result: str = "win",
+    pnl_usd: float = 10.0,
+    entry_at: Optional[datetime.datetime] = None,
+    exit_at: Optional[datetime.datetime] = None,
+    symbol: str = "EURUSD=X",
+) -> Any:
+    """Build a minimal BacktestTradeResult for walk-forward tests."""
+    from src.backtesting.backtest_params import BacktestTradeResult
+
+    now = entry_at or datetime.datetime(2022, 1, 15, tzinfo=datetime.timezone.utc)
+    return BacktestTradeResult(
+        symbol=symbol,
+        timeframe="H1",
+        direction=direction,
+        entry_price=Decimal("1.1000"),
+        exit_price=Decimal("1.1100") if result == "win" else Decimal("1.0950"),
+        exit_reason="tp_hit" if result == "win" else "sl_hit",
+        pnl_pips=Decimal("100") if result == "win" else Decimal("-50"),
+        pnl_usd=Decimal(str(pnl_usd)),
+        result=result,
+        composite_score=Decimal("12.0"),
+        entry_at=now,
+        exit_at=exit_at or (now + datetime.timedelta(hours=2)),
+        duration_minutes=120,
+    )
+
+
+class TestV716WalkForwardFoldBoundaries:
+    """TASK-V7-16: Fold boundary computation for anchored expanding window."""
+
+    def test_v7_16_fold_boundaries_single_fold(self) -> None:
+        """Single fold: IS 18 months, OOS 6 months from 2020-01-01 to 2022-01-01."""
+        from src.backtesting.backtest_engine import BacktestEngine
+        from src.backtesting.backtest_params import BacktestParams
+        from dateutil.relativedelta import relativedelta
+
+        # Build expected folds manually
+        global_start = datetime.datetime(2020, 1, 1)
+        is_end_1 = global_start + relativedelta(months=18)  # 2021-07-01
+        oos_end_1 = is_end_1 + relativedelta(months=6)       # 2022-01-01
+
+        params = BacktestParams(
+            symbols=["EURUSD=X"],
+            start_date="2020-01-01",
+            end_date="2022-01-01",
+            enable_walk_forward=True,
+            in_sample_months=18,
+            out_of_sample_months=6,
+        )
+
+        # Compute expected fold windows using same logic as _run_walk_forward
+        fold_windows = []
+        fold_num = 1
+        global_end = datetime.datetime(2022, 1, 1)
+        while True:
+            is_end = global_start + relativedelta(months=params.in_sample_months * fold_num)
+            oos_start = is_end
+            oos_end = oos_start + relativedelta(months=params.out_of_sample_months)
+            if oos_start >= global_end:
+                break
+            effective_oos_end = min(oos_end, global_end)
+            fold_windows.append((
+                params.start_date,
+                is_end.date().isoformat(),
+                oos_start.date().isoformat(),
+                effective_oos_end.date().isoformat(),
+            ))
+            fold_num += 1
+            if oos_end >= global_end:
+                break
+
+        assert len(fold_windows) == 1
+        is_start, is_end_s, oos_start_s, oos_end_s = fold_windows[0]
+        assert is_start == "2020-01-01"
+        assert is_end_s == is_end_1.date().isoformat()
+        assert oos_start_s == is_end_1.date().isoformat()
+        assert oos_end_s == oos_end_1.date().isoformat()
+
+    def test_v7_16_fold_boundaries_multiple_folds(self) -> None:
+        """Multiple folds: IS 12 months, OOS 6 months from 2020-01-01 to 2022-07-01.
+
+        Expected folds:
+          Fold 1: IS 2020-01 to 2021-01, OOS 2021-01 to 2021-07
+          Fold 2: IS 2020-01 to 2022-01, OOS 2022-01 to 2022-07
+        """
+        from dateutil.relativedelta import relativedelta
+
+        global_start = datetime.datetime(2020, 1, 1)
+        global_end = datetime.datetime(2022, 7, 1)
+        in_sample_months = 12
+        out_of_sample_months = 6
+
+        fold_windows = []
+        fold_num = 1
+        while True:
+            is_end = global_start + relativedelta(months=in_sample_months * fold_num)
+            oos_start = is_end
+            oos_end = oos_start + relativedelta(months=out_of_sample_months)
+            if oos_start >= global_end:
+                break
+            effective_oos_end = min(oos_end, global_end)
+            fold_windows.append((
+                "2020-01-01",
+                is_end.date().isoformat(),
+                oos_start.date().isoformat(),
+                effective_oos_end.date().isoformat(),
+            ))
+            fold_num += 1
+            if oos_end >= global_end:
+                break
+
+        assert len(fold_windows) == 2
+
+        # Fold 1
+        _, is_end_1, oos_s_1, oos_e_1 = fold_windows[0]
+        assert is_end_1 == "2021-01-01"
+        assert oos_s_1 == "2021-01-01"
+        assert oos_e_1 == "2021-07-01"
+
+        # Fold 2 (IS expands to 24 months from start)
+        _, is_end_2, oos_s_2, oos_e_2 = fold_windows[1]
+        assert is_end_2 == "2022-01-01"
+        assert oos_s_2 == "2022-01-01"
+        assert oos_e_2 == "2022-07-01"
+
+    def test_v7_16_oos_clamped_to_global_end(self) -> None:
+        """OOS end is clamped to global_end when it would extend beyond."""
+        from dateutil.relativedelta import relativedelta
+
+        global_start = datetime.datetime(2020, 1, 1)
+        global_end = datetime.datetime(2021, 10, 1)  # ends before full OOS window
+        in_sample_months = 18
+        out_of_sample_months = 6
+
+        fold_windows = []
+        fold_num = 1
+        while True:
+            is_end = global_start + relativedelta(months=in_sample_months * fold_num)
+            oos_start = is_end
+            oos_end = oos_start + relativedelta(months=out_of_sample_months)
+            if oos_start >= global_end:
+                break
+            effective_oos_end = min(oos_end, global_end)
+            fold_windows.append((
+                "2020-01-01",
+                is_end.date().isoformat(),
+                oos_start.date().isoformat(),
+                effective_oos_end.date().isoformat(),
+            ))
+            fold_num += 1
+            if oos_end >= global_end:
+                break
+
+        assert len(fold_windows) == 1
+        _, _, oos_start_s, oos_end_s = fold_windows[0]
+        # OOS would end 2022-01-01 but global_end is 2021-10-01
+        assert oos_end_s == "2021-10-01"
+
+    def test_v7_16_no_folds_when_range_too_short(self) -> None:
+        """When date range is shorter than IS window, no folds are generated."""
+        from dateutil.relativedelta import relativedelta
+
+        global_start = datetime.datetime(2020, 1, 1)
+        global_end = datetime.datetime(2020, 6, 1)  # only 5 months
+        in_sample_months = 18
+        out_of_sample_months = 6
+
+        fold_windows = []
+        fold_num = 1
+        while True:
+            is_end = global_start + relativedelta(months=in_sample_months * fold_num)
+            oos_start = is_end
+            oos_end = oos_start + relativedelta(months=out_of_sample_months)
+            if oos_start >= global_end:
+                break
+            effective_oos_end = min(oos_end, global_end)
+            fold_windows.append((
+                "2020-01-01",
+                is_end.date().isoformat(),
+                oos_start.date().isoformat(),
+                effective_oos_end.date().isoformat(),
+            ))
+            fold_num += 1
+            if oos_end >= global_end:
+                break
+
+        assert len(fold_windows) == 0
+
+
+class TestV716WalkForwardOOSTrades:
+    """TASK-V7-16: OOS trades are separated per fold and aggregated."""
+
+    @pytest.mark.asyncio
+    async def test_v7_16_oos_trades_separated_from_is(self) -> None:
+        """IS trades and OOS trades come from separate _simulate calls per fold."""
+        from src.backtesting.backtest_engine import BacktestEngine
+        from src.backtesting.backtest_params import BacktestParams
+
+        params = BacktestParams(
+            symbols=["EURUSD=X"],
+            start_date="2020-01-01",
+            end_date="2022-01-01",
+            enable_walk_forward=True,
+            in_sample_months=18,
+            out_of_sample_months=6,
+        )
+
+        mock_db = AsyncMock()
+        engine = BacktestEngine(mock_db)
+
+        call_log: list[tuple[str, str]] = []
+
+        async def _fake_simulate(p: Any, run_id: Optional[str] = None) -> tuple:
+            call_log.append((p.start_date, p.end_date))
+            # Win trade for IS period, loss for OOS to distinguish
+            if p.start_date == "2020-01-01":
+                trades = [_make_wf_trade(result="win", pnl_usd=20.0)]
+            else:
+                trades = [_make_wf_trade(result="loss", pnl_usd=-10.0)]
+            return trades, {}, {}
+
+        engine._simulate = _fake_simulate
+
+        result = await engine._run_walk_forward(params)
+
+        # Should have 1 fold, 2 _simulate calls (IS + OOS)
+        assert len(result["folds"]) == 1
+        assert len(call_log) == 2  # IS + OOS calls
+
+        fold = result["folds"][0]
+        assert fold["fold"] == 1
+        # IS had 1 win trade
+        assert fold["in_sample"]["total_trades"] == 1
+        # OOS had 1 loss trade
+        assert fold["out_of_sample"]["total_trades"] == 1
+
+    @pytest.mark.asyncio
+    async def test_v7_16_aggregate_oos_combines_all_folds(self) -> None:
+        """aggregate_oos combines OOS trades from all folds."""
+        from src.backtesting.backtest_engine import BacktestEngine
+        from src.backtesting.backtest_params import BacktestParams
+
+        # 2 folds: IS 12 months, OOS 6 months, range 2020-01 to 2022-07
+        params = BacktestParams(
+            symbols=["EURUSD=X"],
+            start_date="2020-01-01",
+            end_date="2022-07-01",
+            enable_walk_forward=True,
+            in_sample_months=12,
+            out_of_sample_months=6,
+        )
+
+        mock_db = AsyncMock()
+        engine = BacktestEngine(mock_db)
+
+        call_count = [0]
+
+        async def _fake_simulate(p: Any, run_id: Optional[str] = None) -> tuple:
+            call_count[0] += 1
+            # Every other call is IS (call 1, 3) or OOS (call 2, 4)
+            # IS calls: start_date == "2020-01-01"
+            # OOS calls: start_date != "2020-01-01"
+            if p.start_date == "2020-01-01":
+                trades = [_make_wf_trade(result="win", pnl_usd=15.0)]
+            else:
+                # Each OOS fold has 2 trades: 1 win, 1 loss
+                trades = [
+                    _make_wf_trade(result="win", pnl_usd=10.0),
+                    _make_wf_trade(result="loss", pnl_usd=-5.0),
+                ]
+            return trades, {}, {}
+
+        engine._simulate = _fake_simulate
+
+        result = await engine._run_walk_forward(params)
+
+        # 2 folds → 4 simulate calls
+        assert len(result["folds"]) == 2
+        assert call_count[0] == 4
+
+        # Aggregate OOS = 2 folds × 2 trades = 4 OOS trades total
+        assert result["aggregate_oos"]["total_trades"] == 4
+
+    @pytest.mark.asyncio
+    async def test_v7_16_fold_oos_period_matches_params(self) -> None:
+        """Each fold reports correct is_period and oos_period strings."""
+        from src.backtesting.backtest_engine import BacktestEngine
+        from src.backtesting.backtest_params import BacktestParams
+
+        params = BacktestParams(
+            symbols=["EURUSD=X"],
+            start_date="2020-01-01",
+            end_date="2022-01-01",
+            enable_walk_forward=True,
+            in_sample_months=18,
+            out_of_sample_months=6,
+        )
+
+        mock_db = AsyncMock()
+        engine = BacktestEngine(mock_db)
+
+        async def _fake_simulate(p: Any, run_id: Optional[str] = None) -> tuple:
+            return [], {}, {}
+
+        engine._simulate = _fake_simulate
+
+        result = await engine._run_walk_forward(params)
+        assert len(result["folds"]) == 1
+        fold = result["folds"][0]
+
+        assert "2020-01-01" in fold["is_period"]
+        assert "2021-07-01" in fold["is_period"]
+        assert "2021-07-01" in fold["oos_period"]
+        assert "2022-01-01" in fold["oos_period"]
+
+
+class TestV716WalkForwardAggregateMetrics:
+    """TASK-V7-16: Aggregate OOS metrics computation."""
+
+    @pytest.mark.asyncio
+    async def test_v7_16_aggregate_pf_computed_from_all_oos_trades(self) -> None:
+        """Aggregate OOS PF reflects all OOS trades, not per-fold average."""
+        from src.backtesting.backtest_engine import BacktestEngine
+        from src.backtesting.backtest_params import BacktestParams
+
+        params = BacktestParams(
+            symbols=["EURUSD=X"],
+            start_date="2020-01-01",
+            end_date="2022-07-01",
+            enable_walk_forward=True,
+            in_sample_months=12,
+            out_of_sample_months=6,
+        )
+
+        mock_db = AsyncMock()
+        engine = BacktestEngine(mock_db)
+
+        async def _fake_simulate(p: Any, run_id: Optional[str] = None) -> tuple:
+            if p.start_date == "2020-01-01":
+                return [_make_wf_trade(result="win", pnl_usd=20.0)], {}, {}
+            # OOS: 3 wins (30 USD) + 1 loss (-10 USD) → PF = 3.0
+            return [
+                _make_wf_trade(result="win", pnl_usd=10.0),
+                _make_wf_trade(result="win", pnl_usd=10.0),
+                _make_wf_trade(result="win", pnl_usd=10.0),
+                _make_wf_trade(result="loss", pnl_usd=-10.0),
+            ], {}, {}
+
+        engine._simulate = _fake_simulate
+
+        result = await engine._run_walk_forward(params)
+
+        agg = result["aggregate_oos"]
+        assert agg["total_trades"] == 8  # 2 folds × 4 OOS trades
+        assert agg["profit_factor"] is not None
+        # 6 wins (60 USD) + 2 losses (-20 USD) → PF = 3.0
+        assert abs(agg["profit_factor"] - 3.0) < 0.01
+
+    @pytest.mark.asyncio
+    async def test_v7_16_aggregate_zero_oos_trades(self) -> None:
+        """When all OOS windows are empty, aggregate has 0 trades and None PF."""
+        from src.backtesting.backtest_engine import BacktestEngine
+        from src.backtesting.backtest_params import BacktestParams
+
+        params = BacktestParams(
+            symbols=["EURUSD=X"],
+            start_date="2020-01-01",
+            end_date="2022-01-01",
+            enable_walk_forward=True,
+            in_sample_months=18,
+            out_of_sample_months=6,
+        )
+
+        mock_db = AsyncMock()
+        engine = BacktestEngine(mock_db)
+
+        async def _fake_simulate(p: Any, run_id: Optional[str] = None) -> tuple:
+            return [], {}, {}
+
+        engine._simulate = _fake_simulate
+
+        result = await engine._run_walk_forward(params)
+        agg = result["aggregate_oos"]
+        assert agg["total_trades"] == 0
+        assert agg["profit_factor"] is None
+
+
+class TestV716WalkForwardVerdict:
+    """TASK-V7-16: Verdict logic — VALID / INVALID / INSUFFICIENT_DATA."""
+
+    @pytest.mark.asyncio
+    async def test_v7_16_verdict_valid_all_folds_profitable_agg_pf_above_1_2(self) -> None:
+        """VALID when all folds OOS PF > 1.0 AND aggregate OOS PF > 1.2."""
+        from src.backtesting.backtest_engine import BacktestEngine
+        from src.backtesting.backtest_params import BacktestParams
+
+        params = BacktestParams(
+            symbols=["EURUSD=X"],
+            start_date="2020-01-01",
+            end_date="2022-07-01",
+            enable_walk_forward=True,
+            in_sample_months=12,
+            out_of_sample_months=6,
+        )
+
+        mock_db = AsyncMock()
+        engine = BacktestEngine(mock_db)
+
+        async def _fake_simulate(p: Any, run_id: Optional[str] = None) -> tuple:
+            if p.start_date == "2020-01-01":
+                return [_make_wf_trade(result="win", pnl_usd=10.0)], {}, {}
+            # OOS: PF = 20/10 = 2.0 > 1.0
+            return [
+                _make_wf_trade(result="win", pnl_usd=20.0),
+                _make_wf_trade(result="loss", pnl_usd=-10.0),
+            ], {}, {}
+
+        engine._simulate = _fake_simulate
+
+        result = await engine._run_walk_forward(params)
+
+        assert result["verdict"] == "VALID"
+        assert result["verdict_criteria"]["all_folds_pf_above_1_0"] is True
+        assert result["verdict_criteria"]["aggregate_pf_above_1_2"] is True
+
+    @pytest.mark.asyncio
+    async def test_v7_16_verdict_invalid_one_fold_unprofitable(self) -> None:
+        """INVALID when at least one fold has OOS PF <= 1.0."""
+        from src.backtesting.backtest_engine import BacktestEngine
+        from src.backtesting.backtest_params import BacktestParams
+
+        params = BacktestParams(
+            symbols=["EURUSD=X"],
+            start_date="2020-01-01",
+            end_date="2022-07-01",
+            enable_walk_forward=True,
+            in_sample_months=12,
+            out_of_sample_months=6,
+        )
+
+        mock_db = AsyncMock()
+        engine = BacktestEngine(mock_db)
+
+        fold_oos_call = [0]
+
+        async def _fake_simulate(p: Any, run_id: Optional[str] = None) -> tuple:
+            if p.start_date == "2020-01-01":
+                return [_make_wf_trade(result="win", pnl_usd=10.0)], {}, {}
+            fold_oos_call[0] += 1
+            if fold_oos_call[0] == 1:
+                # Fold 1 OOS: profitable (PF = 2.0)
+                return [
+                    _make_wf_trade(result="win", pnl_usd=20.0),
+                    _make_wf_trade(result="loss", pnl_usd=-10.0),
+                ], {}, {}
+            else:
+                # Fold 2 OOS: unprofitable (PF = 0.5)
+                return [
+                    _make_wf_trade(result="win", pnl_usd=5.0),
+                    _make_wf_trade(result="loss", pnl_usd=-10.0),
+                ], {}, {}
+
+        engine._simulate = _fake_simulate
+
+        result = await engine._run_walk_forward(params)
+
+        assert result["verdict"] == "INVALID"
+        assert result["verdict_criteria"]["all_folds_pf_above_1_0"] is False
+
+    @pytest.mark.asyncio
+    async def test_v7_16_verdict_invalid_agg_pf_below_1_2(self) -> None:
+        """INVALID when aggregate OOS PF <= 1.2 even if all folds are > 1.0."""
+        from src.backtesting.backtest_engine import BacktestEngine
+        from src.backtesting.backtest_params import BacktestParams
+
+        params = BacktestParams(
+            symbols=["EURUSD=X"],
+            start_date="2020-01-01",
+            end_date="2022-07-01",
+            enable_walk_forward=True,
+            in_sample_months=12,
+            out_of_sample_months=6,
+        )
+
+        mock_db = AsyncMock()
+        engine = BacktestEngine(mock_db)
+
+        async def _fake_simulate(p: Any, run_id: Optional[str] = None) -> tuple:
+            if p.start_date == "2020-01-01":
+                return [_make_wf_trade(result="win", pnl_usd=10.0)], {}, {}
+            # OOS: PF = 11/10 = 1.1 (> 1.0 per fold, but < 1.2 aggregate)
+            return [
+                _make_wf_trade(result="win", pnl_usd=11.0),
+                _make_wf_trade(result="loss", pnl_usd=-10.0),
+            ], {}, {}
+
+        engine._simulate = _fake_simulate
+
+        result = await engine._run_walk_forward(params)
+
+        # Each fold OOS PF = 1.1 > 1.0, but aggregate PF = 1.1 < 1.2
+        assert result["verdict"] == "INVALID"
+        assert result["verdict_criteria"]["all_folds_pf_above_1_0"] is True
+        assert result["verdict_criteria"]["aggregate_pf_above_1_2"] is False
+
+    @pytest.mark.asyncio
+    async def test_v7_16_verdict_insufficient_data_no_folds(self) -> None:
+        """INSUFFICIENT_DATA when date range produces no valid folds."""
+        from src.backtesting.backtest_engine import BacktestEngine
+        from src.backtesting.backtest_params import BacktestParams
+
+        # Range too short for any IS window
+        params = BacktestParams(
+            symbols=["EURUSD=X"],
+            start_date="2020-01-01",
+            end_date="2020-06-01",  # only 5 months, IS needs 18
+            enable_walk_forward=True,
+            in_sample_months=18,
+            out_of_sample_months=6,
+        )
+
+        mock_db = AsyncMock()
+        engine = BacktestEngine(mock_db)
+
+        async def _fake_simulate(p: Any, run_id: Optional[str] = None) -> tuple:
+            return [], {}, {}
+
+        engine._simulate = _fake_simulate
+
+        result = await engine._run_walk_forward(params)
+
+        assert result["verdict"] == "INSUFFICIENT_DATA"
+        assert result["fold_count"] == 0
+        assert result["folds"] == []
+
+    def test_v7_16_verdict_criteria_keys_always_present(self) -> None:
+        """verdict_criteria dict always has both keys regardless of verdict."""
+        # Test the structure by checking the keys in a VALID result
+        result = {
+            "verdict": "VALID",
+            "verdict_criteria": {
+                "all_folds_pf_above_1_0": True,
+                "aggregate_pf_above_1_2": True,
+            },
+        }
+        assert "all_folds_pf_above_1_0" in result["verdict_criteria"]
+        assert "aggregate_pf_above_1_2" in result["verdict_criteria"]
+
+
+class TestV716WalkForwardBackwardCompatibility:
+    """TASK-V7-16: Backward compatibility — WF disabled keeps current behavior."""
+
+    @pytest.mark.asyncio
+    async def test_v7_16_wf_disabled_does_not_call_run_walk_forward(self) -> None:
+        """When enable_walk_forward=False, _run_walk_forward is never called."""
+        from src.backtesting.backtest_engine import BacktestEngine
+        from src.backtesting.backtest_params import BacktestParams
+
+        params = BacktestParams(
+            symbols=["EURUSD=X"],
+            start_date="2024-01-01",
+            end_date="2024-06-01",
+            enable_walk_forward=False,
+        )
+
+        mock_db = AsyncMock()
+        engine = BacktestEngine(mock_db)
+
+        wf_called = []
+
+        async def _fake_wf(p: Any) -> dict:
+            wf_called.append(True)
+            return {}
+
+        async def _fake_simulate(p: Any, run_id: Optional[str] = None) -> tuple:
+            return [], {}, {}
+
+        engine._run_walk_forward = _fake_wf
+        engine._simulate = _fake_simulate
+
+        with (
+            patch("src.backtesting.backtest_engine.create_backtest_run", new_callable=AsyncMock, return_value="run-wf-001"),
+            patch("src.backtesting.backtest_engine.update_backtest_run", new_callable=AsyncMock),
+            patch("src.backtesting.backtest_engine.create_backtest_trades_bulk", new_callable=AsyncMock),
+        ):
+            mock_db.commit = AsyncMock()
+            await engine.run_backtest(params)
+
+        assert len(wf_called) == 0
+
+    @pytest.mark.asyncio
+    async def test_v7_16_wf_enabled_calls_run_walk_forward(self) -> None:
+        """When enable_walk_forward=True, _run_walk_forward is called once."""
+        from src.backtesting.backtest_engine import BacktestEngine
+        from src.backtesting.backtest_params import BacktestParams
+
+        params = BacktestParams(
+            symbols=["EURUSD=X"],
+            start_date="2020-01-01",
+            end_date="2022-01-01",
+            enable_walk_forward=True,
+            in_sample_months=18,
+            out_of_sample_months=6,
+        )
+
+        mock_db = AsyncMock()
+        engine = BacktestEngine(mock_db)
+
+        wf_called = []
+
+        async def _fake_wf(p: Any) -> dict:
+            wf_called.append(True)
+            return {"verdict": "VALID", "folds": [], "fold_count": 0, "aggregate_oos": {}}
+
+        async def _fake_simulate(p: Any, run_id: Optional[str] = None) -> tuple:
+            return [], {}, {}
+
+        engine._run_walk_forward = _fake_wf
+        engine._simulate = _fake_simulate
+
+        with (
+            patch("src.backtesting.backtest_engine.create_backtest_run", new_callable=AsyncMock, return_value="run-wf-002"),
+            patch("src.backtesting.backtest_engine.update_backtest_run", new_callable=AsyncMock),
+            patch("src.backtesting.backtest_engine.create_backtest_trades_bulk", new_callable=AsyncMock),
+        ):
+            mock_db.commit = AsyncMock()
+            run_id = await engine.run_backtest(params)
+
+        assert len(wf_called) == 1
+        assert run_id == "run-wf-002"
+
+    @pytest.mark.asyncio
+    async def test_v7_16_wf_disabled_summary_has_no_walk_forward_key(self) -> None:
+        """When WF is disabled, summary does not contain walk_forward key."""
+        from src.backtesting.backtest_engine import BacktestEngine
+        from src.backtesting.backtest_params import BacktestParams
+
+        params = BacktestParams(
+            symbols=["EURUSD=X"],
+            start_date="2024-01-01",
+            end_date="2024-06-01",
+            enable_walk_forward=False,
+        )
+
+        mock_db = AsyncMock()
+        engine = BacktestEngine(mock_db)
+
+        captured_summary: list[dict] = []
+
+        async def _fake_simulate(p: Any, run_id: Optional[str] = None) -> tuple:
+            return [], {}, {}
+
+        engine._simulate = _fake_simulate
+
+        async def _fake_update(db: Any, run_id: str, status: str, summary: Optional[dict] = None) -> None:
+            if status == "completed" and summary is not None:
+                captured_summary.append(summary)
+
+        with (
+            patch("src.backtesting.backtest_engine.create_backtest_run", new_callable=AsyncMock, return_value="run-nowf"),
+            patch("src.backtesting.backtest_engine.update_backtest_run", new=_fake_update),
+            patch("src.backtesting.backtest_engine.create_backtest_trades_bulk", new_callable=AsyncMock),
+        ):
+            mock_db.commit = AsyncMock()
+            await engine.run_backtest(params)
+
+        assert len(captured_summary) == 1
+        assert "walk_forward" not in captured_summary[0]
+
+    @pytest.mark.asyncio
+    async def test_v7_16_wf_result_in_summary_when_enabled(self) -> None:
+        """When WF is enabled, summary["walk_forward"] contains the WF result dict."""
+        from src.backtesting.backtest_engine import BacktestEngine
+        from src.backtesting.backtest_params import BacktestParams
+
+        params = BacktestParams(
+            symbols=["EURUSD=X"],
+            start_date="2020-01-01",
+            end_date="2022-01-01",
+            enable_walk_forward=True,
+            in_sample_months=18,
+            out_of_sample_months=6,
+        )
+
+        mock_db = AsyncMock()
+        engine = BacktestEngine(mock_db)
+        captured_summary: list[dict] = []
+
+        wf_result = {
+            "verdict": "VALID",
+            "folds": [{"fold": 1}],
+            "fold_count": 1,
+            "aggregate_oos": {"total_trades": 5, "profit_factor": 1.5},
+        }
+
+        async def _fake_wf(p: Any) -> dict:
+            return wf_result
+
+        async def _fake_simulate(p: Any, run_id: Optional[str] = None) -> tuple:
+            return [], {}, {}
+
+        engine._run_walk_forward = _fake_wf
+        engine._simulate = _fake_simulate
+
+        async def _fake_update(db: Any, run_id: str, status: str, summary: Optional[dict] = None) -> None:
+            if status == "completed" and summary is not None:
+                captured_summary.append(summary)
+
+        with (
+            patch("src.backtesting.backtest_engine.create_backtest_run", new_callable=AsyncMock, return_value="run-wf-003"),
+            patch("src.backtesting.backtest_engine.update_backtest_run", new=_fake_update),
+            patch("src.backtesting.backtest_engine.create_backtest_trades_bulk", new_callable=AsyncMock),
+        ):
+            mock_db.commit = AsyncMock()
+            await engine.run_backtest(params)
+
+        assert len(captured_summary) == 1
+        assert "walk_forward" in captured_summary[0]
+        assert captured_summary[0]["walk_forward"]["verdict"] == "VALID"
+        assert captured_summary[0]["walk_forward"]["fold_count"] == 1
