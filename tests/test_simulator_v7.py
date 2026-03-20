@@ -11,6 +11,11 @@ from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import pytest_asyncio
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+from src.analysis.fa_engine import FAEngine, _PAIR_BANK_MAP, _RATE_DIFF_SCORE_MULTIPLIER
+from src.database.models import Base
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -38,6 +43,21 @@ def _make_social_row(
     )
     row.put_call_ratio = Decimal(str(put_call_ratio)) if put_call_ratio is not None else None
     return row
+
+
+def make_instrument(symbol: str, market: str = "forex") -> MagicMock:
+    inst = MagicMock()
+    inst.symbol = symbol
+    inst.market = market
+    return inst
+
+
+def make_macro(indicator: str, value: float, prev: float) -> MagicMock:
+    item = MagicMock()
+    item.indicator_name = indicator
+    item.value = Decimal(str(value))
+    item.previous_value = Decimal(str(prev))
+    return item
 
 
 # ── TASK-V7-01: get_latest_social_sentiment CRUD ──────────────────────────────
@@ -91,8 +111,6 @@ class TestV701CrudFunction:
 
         await get_latest_social_sentiment(mock_session, instrument_id=99)
 
-        # Verify execute was called with a statement (not checking exact SQL,
-        # just that the call happened with the right instrument_id via the session)
         assert mock_session.execute.call_count == 1
 
 
@@ -119,9 +137,6 @@ class TestV701SentimentEngineWiring:
         )
 
         score = engine.calculate_sync()
-
-        # With greed=75 (maps to +50), PCR=0.75 (maps to +83), social=+35 avg
-        # All positive — combined score must be > 0
         assert score > 0.0
 
     @pytest.mark.asyncio
@@ -137,7 +152,6 @@ class TestV701SentimentEngineWiring:
             put_call_ratio=None,
         )
 
-        # Should not raise, should return a float in valid range
         score = engine.calculate_sync()
         assert -100.0 <= score <= 100.0
 
@@ -154,7 +168,6 @@ class TestV701SentimentEngineWiring:
         )
 
         score = engine.calculate_sync()
-
         assert score == 0.0
 
     @pytest.mark.asyncio
@@ -162,7 +175,6 @@ class TestV701SentimentEngineWiring:
         """stocktwits_bullish_pct is correctly mapped to score via (pct - 50) * 2."""
         from src.analysis.sentiment_engine_v2 import SentimentEngineV2
 
-        # 75% bullish → (75 - 50) * 2 = +50
         engine = SentimentEngineV2(
             news_events=[],
             social_data={"stocktwits_score": (75.0 - 50.0) * 2.0},
@@ -186,7 +198,6 @@ class TestV701SentimentEngineWiring:
         )
 
         score = engine.calculate_sync()
-        # F&G=10 → (10-50)*2 = -80
         assert score < 0.0
 
     @pytest.mark.asyncio
@@ -198,7 +209,7 @@ class TestV701SentimentEngineWiring:
             news_events=[],
             social_data=None,
             fear_greed_index=None,
-            put_call_ratio=0.5,  # Very bullish — PCR <= 0.7 → +100
+            put_call_ratio=0.5,
         )
 
         score = engine.calculate_sync()
@@ -262,9 +273,7 @@ class TestV701SignalEngineIntegration:
         """When get_latest_social_sentiment returns None, parameters default to None."""
         from src.analysis.sentiment_engine_v2 import SentimentEngineV2
 
-        # Simulate what signal_engine does when social_row is None
         social_row = None
-
         fg_value: Optional[float] = None
         pcr_value: Optional[float] = None
         social_data: Optional[dict] = None
@@ -376,16 +385,12 @@ class TestV702FaEngineDeltaWithHistory:
         month_ago = datetime.datetime(2025, 2, 1, tzinfo=datetime.timezone.utc)
 
         macro_data = [
-            # FEDFUNDS: latest first (sorted DESC by release_date as returned by FRED)
             self._make_macro_record("FEDFUNDS", "5.33", now),
             self._make_macro_record("FEDFUNDS", "5.08", month_ago),
-            # CPIAUCSL
             self._make_macro_record("CPIAUCSL", "310.50", now),
             self._make_macro_record("CPIAUCSL", "309.80", month_ago),
-            # UNRATE
             self._make_macro_record("UNRATE", "3.9", now),
             self._make_macro_record("UNRATE", "4.1", month_ago),
-            # GDPC1
             self._make_macro_record("GDPC1", "22000.0", now),
             self._make_macro_record("GDPC1", "21800.0", month_ago),
         ]
@@ -393,13 +398,11 @@ class TestV702FaEngineDeltaWithHistory:
         instrument = self._make_instrument(market="forex", symbol="EURUSD=X")
         engine = FAEngine(instrument, macro_data, [])
 
-        # All deltas must be computable with 2 observations
         assert engine._delta("FEDFUNDS") is not None
         assert engine._delta("CPIAUCSL") is not None
         assert engine._delta("UNRATE") is not None
         assert engine._delta("GDPC1") is not None
 
-        # Verify actual delta values
         assert abs(engine._delta("FEDFUNDS") - (5.33 - 5.08)) < 1e-9  # type: ignore[operator]
         assert abs(engine._delta("UNRATE") - (3.9 - 4.1)) < 1e-9     # type: ignore[operator]
 
@@ -424,7 +427,6 @@ class TestV702FaEngineDeltaWithHistory:
         now = datetime.datetime(2025, 3, 1, tzinfo=datetime.timezone.utc)
         month_ago = datetime.datetime(2025, 2, 1, tzinfo=datetime.timezone.utc)
 
-        # Create meaningful delta: FEDFUNDS increased (USD stronger → forex bearish)
         macro_data = [
             self._make_macro_record("FEDFUNDS", "5.50", now),
             self._make_macro_record("FEDFUNDS", "5.00", month_ago),
@@ -434,7 +436,6 @@ class TestV702FaEngineDeltaWithHistory:
         engine = FAEngine(instrument, macro_data, [])
 
         score = engine.calculate_fa_score()
-        # FEDFUNDS increased by 0.5 → score -= 0.5 * 10 = -5 → non-zero
         assert score != 0.0, f"Expected non-zero FA score, got {score}"
 
 
@@ -471,3 +472,235 @@ class TestV702NewFredSeriesDefined:
         }
         missing = original_series - set(FRED_SERIES.keys())
         assert not missing, f"Original FRED series removed: {missing}"
+
+
+# ── TASK-V7-03: rate differential calculation ─────────────────────────────────
+
+
+class TestV7RateDifferential:
+    """Tests for _analyze_rate_differential() and its integration into calculate_fa_score()."""
+
+    def test_v7_03_rate_differential_calculation_eurusd(self):
+        """FED > ECB → USD stronger → EURUSD is bearish → negative contribution."""
+        inst = make_instrument("EURUSD=X", "forex")
+        rates = {"FED": 5.25, "ECB": 4.50}
+        engine = FAEngine(inst, [], [], central_bank_rates=rates)
+
+        score = engine._analyze_rate_differential()
+
+        assert score == pytest.approx(-7.5, abs=1e-9)
+
+    def test_v7_03_rate_differential_calculation_usdjpy(self):
+        """FED > BOJ → USD stronger → USDJPY is bullish → positive contribution."""
+        inst = make_instrument("USDJPY=X", "forex")
+        rates = {"FED": 5.25, "BOJ": 0.10}
+        engine = FAEngine(inst, [], [], central_bank_rates=rates)
+
+        score = engine._analyze_rate_differential()
+
+        assert score == pytest.approx(51.5, abs=1e-9)
+
+    def test_v7_03_rate_differential_ecb_higher_than_fed(self):
+        """ECB > FED → EUR stronger → EURUSD is bullish → positive contribution."""
+        inst = make_instrument("EURUSD=X", "forex")
+        rates = {"FED": 3.00, "ECB": 4.50}
+        engine = FAEngine(inst, [], [], central_bank_rates=rates)
+
+        score = engine._analyze_rate_differential()
+
+        assert score == pytest.approx(15.0, abs=1e-9)
+
+    def test_v7_03_fa_score_reflects_rate_differential(self):
+        """FA score for EURUSD with FED>ECB should be negative."""
+        inst = make_instrument("EURUSD=X", "forex")
+        rates = {"FED": 5.25, "ECB": 4.50}
+        engine = FAEngine(inst, [], [], central_bank_rates=rates)
+
+        fa_score = engine.calculate_fa_score()
+
+        assert fa_score == pytest.approx(-2.25, abs=1e-6)
+
+    def test_v7_03_fa_score_with_macro_and_rate_diff(self):
+        """FA score combines macro base_score (60%) and rate_diff (30%)."""
+        inst = make_instrument("EURUSD=X", "forex")
+        rates = {"FED": 5.25, "ECB": 4.50}
+        macro = [make_macro("FEDFUNDS", 5.5, 5.25)]
+        engine = FAEngine(inst, macro, [], central_bank_rates=rates)
+
+        fa_score = engine.calculate_fa_score()
+
+        assert fa_score < 0
+
+    def test_v7_03_no_rate_data_graceful(self):
+        """No rates passed → rate differential component = 0."""
+        inst = make_instrument("EURUSD=X", "forex")
+        macro = [make_macro("FEDFUNDS", 5.5, 5.25)]
+        engine = FAEngine(inst, macro, [], central_bank_rates=None)
+
+        fa_score = engine.calculate_fa_score()
+
+        assert isinstance(fa_score, float)
+        assert -100.0 <= fa_score <= 100.0
+
+    def test_v7_03_empty_rates_dict_graceful(self):
+        """Empty rates dict → rate differential = 0.0."""
+        inst = make_instrument("EURUSD=X", "forex")
+        engine = FAEngine(inst, [], [], central_bank_rates={})
+
+        score = engine._analyze_rate_differential()
+
+        assert score == 0.0
+
+    def test_v7_03_partial_rates_missing_one_bank(self):
+        """If one bank rate is missing, differential returns 0.0."""
+        inst = make_instrument("EURUSD=X", "forex")
+        rates = {"FED": 5.25}  # ECB missing
+        engine = FAEngine(inst, [], [], central_bank_rates=rates)
+
+        score = engine._analyze_rate_differential()
+
+        assert score == 0.0
+
+    def test_v7_03_crypto_no_rate_differential(self):
+        """Crypto instruments must not use rate differential."""
+        inst = make_instrument("BTC/USDT", "crypto")
+        rates = {"FED": 5.25, "ECB": 4.50}
+        engine = FAEngine(inst, [], [], central_bank_rates=rates)
+
+        score = engine._analyze_rate_differential()
+
+        assert score == 0.0
+
+    def test_v7_03_crypto_fa_score_unaffected_by_rates(self):
+        """Passing rates to FAEngine for a crypto instrument must not change the score."""
+        inst = make_instrument("BTC/USDT", "crypto")
+        rates = {"FED": 5.25, "ECB": 4.50}
+
+        score_without = FAEngine(inst, [], [], central_bank_rates=None).calculate_fa_score()
+        score_with = FAEngine(inst, [], [], central_bank_rates=rates).calculate_fa_score()
+
+        assert score_without == score_with
+
+    def test_v7_03_stock_instrument_no_rate_differential(self):
+        """Stock instruments are not in _PAIR_BANK_MAP → rate diff = 0."""
+        inst = make_instrument("AAPL", "stocks")
+        rates = {"FED": 5.25}
+        engine = FAEngine(inst, [], [], central_bank_rates=rates)
+
+        score = engine._analyze_rate_differential()
+
+        assert score == 0.0
+
+    def test_v7_03_pair_bank_map_covers_all_major_pairs(self):
+        """All 7 major forex pairs must be present in _PAIR_BANK_MAP."""
+        expected_pairs = {
+            "EURUSD=X", "GBPUSD=X", "USDJPY=X",
+            "AUDUSD=X", "USDCAD=X", "USDCHF=X", "NZDUSD=X",
+        }
+        assert expected_pairs == set(_PAIR_BANK_MAP.keys())
+
+    def test_v7_03_score_clamped_to_range(self):
+        """Even extreme rate differential must not push FA score outside [-100, +100]."""
+        inst = make_instrument("USDJPY=X", "forex")
+        rates = {"FED": 20.0, "BOJ": 0.0}
+        engine = FAEngine(inst, [], [], central_bank_rates=rates)
+
+        fa_score = engine.calculate_fa_score()
+
+        assert -100.0 <= fa_score <= 100.0
+
+
+# ── Local DB fixture (isolated per-test engine) ───────────────────────────────
+
+
+@pytest_asyncio.fixture
+async def v7_db() -> AsyncSession:
+    """Isolated SQLite session for v7 CRUD tests."""
+    import os
+    import tempfile
+    import uuid as _uuid
+
+    tmp_path = os.path.join(tempfile.gettempdir(), f"v7_test_{_uuid.uuid4().hex}.db")
+    db_url = f"sqlite+aiosqlite:///{tmp_path}"
+    engine = create_async_engine(db_url, echo=False)
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(lambda sync_conn: Base.metadata.create_all(sync_conn, checkfirst=True))
+
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with session_factory() as session:
+            yield session
+    finally:
+        await engine.dispose()
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+# ── TASK-V7-03: CRUD function ─────────────────────────────────────────────────
+
+
+class TestV7GetCentralBankRates:
+    """Tests for get_central_bank_rates() CRUD function."""
+
+    @pytest.mark.asyncio
+    async def test_v7_03_crud_returns_latest_rate_per_bank(self, v7_db: AsyncSession):
+        """get_central_bank_rates returns one rate per bank (the most recent)."""
+        import datetime
+
+        from src.database.crud import get_central_bank_rates
+        from src.database.models import CentralBankRate
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        older = now - datetime.timedelta(days=30)
+
+        fed_old = CentralBankRate(
+            bank="FED", currency="USD", rate=Decimal("5.00"),
+            effective_date=older, source="test",
+        )
+        fed_new = CentralBankRate(
+            bank="FED", currency="USD", rate=Decimal("5.25"),
+            effective_date=now, source="test",
+        )
+        ecb_row = CentralBankRate(
+            bank="ECB", currency="EUR", rate=Decimal("4.50"),
+            effective_date=now, source="test",
+        )
+        v7_db.add_all([fed_old, fed_new, ecb_row])
+        await v7_db.flush()
+
+        result = await get_central_bank_rates(v7_db)
+
+        assert isinstance(result, dict)
+        assert result["FED"] == pytest.approx(5.25)
+        assert result["ECB"] == pytest.approx(4.50)
+
+    @pytest.mark.asyncio
+    async def test_v7_03_crud_empty_table_returns_empty_dict(self, v7_db: AsyncSession):
+        """Empty table → empty dict (no exception)."""
+        from src.database.crud import get_central_bank_rates
+
+        result = await get_central_bank_rates(v7_db)
+
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_v7_03_crud_returns_float_values(self, v7_db: AsyncSession):
+        """Rate values must be native Python floats (not Decimal)."""
+        import datetime
+
+        from src.database.crud import get_central_bank_rates
+        from src.database.models import CentralBankRate
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        row = CentralBankRate(
+            bank="BOE", currency="GBP", rate=Decimal("5.25"),
+            effective_date=now, source="test",
+        )
+        v7_db.add(row)
+        await v7_db.flush()
+
+        result = await get_central_bank_rates(v7_db)
+
+        assert isinstance(result["BOE"], float)

@@ -6,6 +6,24 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
+# Maps forex pair symbol → (base_bank, quote_bank).
+# base_bank rate minus quote_bank rate gives the interest rate differential.
+# Positive differential → base currency has higher rates → bearish for pair
+# (e.g. FED > ECB means USD stronger than EUR → EURUSD bearish).
+_PAIR_BANK_MAP: dict[str, tuple[str, str]] = {
+    "EURUSD=X": ("FED", "ECB"),
+    "GBPUSD=X": ("FED", "BOE"),
+    "USDJPY=X": ("FED", "BOJ"),
+    "AUDUSD=X": ("FED", "RBA"),
+    "USDCAD=X": ("FED", "BOC"),
+    "USDCHF=X": ("FED", "SNB"),
+    "NZDUSD=X": ("FED", "RBNZ"),
+}
+
+# Multiplier to scale rate differential percentage points into score units.
+# 1 pp differential → 10 score points.
+_RATE_DIFF_SCORE_MULTIPLIER = 10.0
+
 
 class FAEngine:
     """
@@ -22,9 +40,11 @@ class FAEngine:
         instrument: Any,
         macro_data: list[Any],
         news_data: list[Any],
+        central_bank_rates: Optional[dict[str, float]] = None,
     ) -> None:
         self.instrument = instrument
         self.news_data = news_data
+        self.central_bank_rates: dict[str, float] = central_bank_rates or {}
         # Build latest + previous maps from sorted records (desc by release_date)
         # so the FAEngine can compute deltas even when previous_value is NULL in DB
         self.macro_data = macro_data
@@ -137,6 +157,62 @@ class FAEngine:
         logger.warning("[SIM-17] fa_score returned fallback 0.0: crypto FA not yet implemented")
         return 0.0
 
+    def _analyze_rate_differential(self) -> float:
+        """Compute interest rate differential score for forex pairs (TASK-V7-03).
+
+        Looks up the two central banks for the instrument symbol in _PAIR_BANK_MAP,
+        calculates differential = base_rate - quote_rate, and scales by
+        _RATE_DIFF_SCORE_MULTIPLIER.
+
+        Semantics for pairs where USD is the quote (EURUSD, GBPUSD, AUDUSD, NZDUSD):
+          FED rate > foreign rate → USD stronger → pair is bearish → negative score
+          FED rate < foreign rate → USD weaker  → pair is bullish → positive score
+
+        Semantics for pairs where USD is the base (USDJPY, USDCAD, USDCHF):
+          FED rate > foreign rate → USD stronger → pair is bullish → positive score
+          (same formula: base_rate - quote_rate, which here equals FED - foreign)
+
+        Returns 0.0 if:
+          - instrument symbol not in _PAIR_BANK_MAP
+          - central_bank_rates is empty or missing one of the two banks
+        """
+        symbol = self.instrument.symbol if hasattr(self.instrument, "symbol") else ""
+        banks = _PAIR_BANK_MAP.get(symbol)
+        if banks is None:
+            return 0.0
+
+        base_bank, quote_bank = banks
+        base_rate = self.central_bank_rates.get(base_bank)
+        quote_rate = self.central_bank_rates.get(quote_bank)
+
+        if base_rate is None or quote_rate is None:
+            logger.warning(
+                "[V7-03] Rate differential unavailable for %s: "
+                "missing rate for %s or %s",
+                symbol,
+                base_bank,
+                quote_bank,
+            )
+            return 0.0
+
+        differential = base_rate - quote_rate
+
+        # For pairs where USD is the quote (EUR/USD, GBP/USD, AUD/USD, NZD/USD):
+        # higher FED rate → stronger USD → pair goes DOWN → bearish → negate the score
+        _usd_as_quote = {"EURUSD=X", "GBPUSD=X", "AUDUSD=X", "NZDUSD=X"}
+        if symbol in _usd_as_quote:
+            score = -differential * _RATE_DIFF_SCORE_MULTIPLIER
+        else:
+            # USD is base (USD/JPY, USD/CAD, USD/CHF):
+            # higher FED rate → stronger USD → pair goes UP → bullish → positive score
+            score = differential * _RATE_DIFF_SCORE_MULTIPLIER
+
+        logger.debug(
+            "[V7-03] Rate differential for %s: %s=%.2f %s=%.2f diff=%.2f score=%.1f",
+            symbol, base_bank, base_rate, quote_bank, quote_rate, differential, score,
+        )
+        return float(score)
+
     def _news_sentiment_adjustment(self) -> float:
         """Additional adjustment from news sentiment."""
         if not self.news_data:
@@ -167,17 +243,23 @@ class FAEngine:
 
         if market == "forex":
             base_score = self._analyze_forex_fundamentals()
+            rate_diff_score = self._analyze_rate_differential()
+            news_adj = self._news_sentiment_adjustment()
+            # TASK-V7-03: rate differential is the dominant fundamental driver for forex
+            final_score = base_score * 0.6 + rate_diff_score * 0.3 + news_adj * 0.1
         elif market == "stocks":
             base_score = self._analyze_stock_fundamentals()
+            news_adj = self._news_sentiment_adjustment()
+            final_score = base_score * 0.8 + news_adj * 0.2
         elif market == "crypto":
             base_score = self._analyze_crypto_fundamentals()
+            news_adj = self._news_sentiment_adjustment()
+            final_score = base_score * 0.8 + news_adj * 0.2
         else:
             logger.warning("[SIM-17] fa_score returned fallback 0.0: unknown market type %r", market)
             base_score = 0.0
-
-        # Apply news adjustment (small weight)
-        news_adj = self._news_sentiment_adjustment()
-        final_score = base_score * 0.8 + news_adj * 0.2
+            news_adj = self._news_sentiment_adjustment()
+            final_score = base_score * 0.8 + news_adj * 0.2
 
         # SIM-41: COT data adjustment (forex only — COT non-commercials net positions)
         try:

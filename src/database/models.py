@@ -539,7 +539,7 @@ class BacktestTrade(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     run_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("backtest_runs.id", ondelete="CASCADE"), nullable=False, index=True
+        String(36), ForeignKey("backtest_runs.id", ondelete="CASCADE"), nullable=False
     )
     symbol: Mapped[str] = mapped_column(String(32), nullable=False)
     timeframe: Mapped[str] = mapped_column(String(8), nullable=False)

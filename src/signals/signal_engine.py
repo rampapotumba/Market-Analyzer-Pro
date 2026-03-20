@@ -23,6 +23,7 @@ from src.database.crud import (
     cancel_open_signals,
     create_signal,
     get_all_instruments,
+    get_central_bank_rates,
     get_instrument_by_symbol,
     get_latest_signal_for_instrument,
     get_latest_social_sentiment,
@@ -482,7 +483,16 @@ class SignalEngine:
                     f"(onchain={fa_components['onchain']:.1f}, cycle={fa_components['cycle']:.1f})"
                 )
             else:
-                fa_engine = FAEngine(instrument, macro_records, news_records)
+                # TASK-V7-03: fetch central bank rates and wire into FAEngine for
+                # interest rate differential computation (forex pairs only).
+                cb_rates: dict[str, float] = {}
+                if instrument.market == "forex":
+                    try:
+                        cb_rates = await get_central_bank_rates(db)
+                    except Exception as cb_exc:
+                        logger.warning("[V7-03] Failed to fetch central bank rates: %s", cb_exc)
+
+                fa_engine = FAEngine(instrument, macro_records, news_records, central_bank_rates=cb_rates)
                 fa_score = fa_engine.calculate_fa_score()
         except Exception as exc:
             logger.warning(f"[SIM-17] fa_score returned fallback 0.0: {exc}")
