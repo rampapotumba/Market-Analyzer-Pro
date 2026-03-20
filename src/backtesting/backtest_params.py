@@ -53,6 +53,10 @@ class BacktestParams(BaseModel):
     # composite = ta_weight * ta_score only.
     use_fundamental_data: bool = False
 
+    # TASK-V7-20: Pluggable strategy name.  Must be a key in STRATEGY_REGISTRY.
+    # Default "composite" produces identical results to pre-V7-20 engine.
+    strategy: str = "composite"
+
     @field_validator("timeframe")
     @classmethod
     def normalize_timeframe(cls, v: str) -> str:

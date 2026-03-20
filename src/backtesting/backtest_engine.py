@@ -1845,17 +1845,52 @@ class BacktestEngine:
     """Candle-by-candle backtest engine (SIM-22).
 
     Isolation guarantee: NEVER writes to signal_results or virtual_portfolio.
+
+    TASK-V7-20: accepts an optional BaseStrategy instance.  When None, the
+    default CompositeScoreStrategy is used, which produces identical results
+    to the pre-V7-20 engine (full backward compatibility).
     """
 
-    def __init__(self, db: AsyncSession) -> None:
+    def __init__(self, db: AsyncSession, strategy: Optional["BaseStrategy"] = None) -> None:
+        from src.backtesting.strategies import STRATEGY_REGISTRY
+        from src.backtesting.strategies.base import BaseStrategy as _BaseStrategy
+
         self.db = db
         self._rm = RiskManagerV2()
+
+        if strategy is None:
+            self._strategy = STRATEGY_REGISTRY["composite"]()
+        elif isinstance(strategy, _BaseStrategy):
+            self._strategy = strategy
+        else:
+            raise TypeError(
+                f"strategy must be a BaseStrategy instance, got {type(strategy)}"
+            )
 
     async def run_backtest(self, params: BacktestParams) -> str:
         """
         Run a full backtest. Creates a run record, simulates candle-by-candle,
         persists results, and returns the run_id (UUID string).
+
+        TASK-V7-20: if params.strategy differs from the engine's current strategy,
+        the strategy is resolved from STRATEGY_REGISTRY and applied for this run.
         """
+        # TASK-V7-20: Allow per-run strategy override via params.strategy.
+        # When the engine was constructed with a custom strategy instance,
+        # params.strategy is ignored (explicit construction takes precedence).
+        from src.backtesting.strategies import STRATEGY_REGISTRY
+        from src.backtesting.strategies.composite_score import CompositeScoreStrategy
+
+        if isinstance(self._strategy, CompositeScoreStrategy):
+            # Default strategy — may be overridden by params.strategy
+            strategy_name = params.strategy or "composite"
+            if strategy_name not in STRATEGY_REGISTRY:
+                raise ValueError(
+                    f"Unknown strategy '{strategy_name}'. "
+                    f"Available: {list(STRATEGY_REGISTRY.keys())}"
+                )
+            self._strategy = STRATEGY_REGISTRY[strategy_name]()
+
         run_id = await create_backtest_run(self.db, params.model_dump(mode="json"))
         await update_backtest_run(self.db, run_id, "running")
         await self.db.commit()
@@ -2954,18 +2989,24 @@ class BacktestEngine:
                 "avg_volume_20": None,  # pipeline check_volume uses df; set via context
             }
 
-            signal = self._generate_signal_fast(
-                ta_score=ta_score_i,
-                atr_value=atr_i,
-                regime=regime_i,
-                ta_indicators_at_i=ta_indicators_i,
-                symbol=symbol,
-                market_type=market_type,
-                timeframe=timeframe,
-                df_slice=full_df.iloc[:i],  # O(1) view — for S/R computation only
-                candle_idx=i,
-                sr_cache=_sr_cache,
-            )
+            # TASK-V7-20: delegate to pluggable strategy.
+            # CompositeScoreStrategy calls back into _generate_signal_fast(),
+            # so results are identical to the pre-V7-20 engine.
+            _entry_context = {
+                "_engine": self,
+                "ta_score": ta_score_i,
+                "atr_value": atr_i,
+                "regime": regime_i,
+                "ta_indicators": ta_indicators_i,
+                "symbol": symbol,
+                "market_type": market_type,
+                "timeframe": timeframe,
+                "df": full_df.iloc[:i],  # O(1) view — for S/R computation only
+                "candle_idx": i,
+                "sr_cache": _sr_cache,
+                "candle_ts": candle_ts,
+            }
+            signal = self._strategy.check_entry(_entry_context)
             if signal is None:
                 continue
 

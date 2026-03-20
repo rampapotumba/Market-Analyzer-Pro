@@ -4914,3 +4914,298 @@ class TestV719Benchmarks:
         ret = bh["per_symbol"]["EURUSD=X"]["return_pct"]
         # first_open=1.1, last_close=1.155 -> ~5% return
         assert abs(ret - 5.0) < 0.1
+
+
+# ── TASK-V7-20: Pluggable strategy interface ──────────────────────────────────
+
+
+class TestV720BaseStrategy:
+    """BaseStrategy is abstract and cannot be instantiated directly."""
+
+    def test_v7_20_base_strategy_is_abstract(self) -> None:
+        """BaseStrategy cannot be instantiated — it has abstract methods."""
+        from src.backtesting.strategies.base import BaseStrategy
+
+        with pytest.raises(TypeError):
+            BaseStrategy()  # type: ignore[abstract]
+
+    def test_v7_20_base_strategy_has_check_entry(self) -> None:
+        """BaseStrategy declares check_entry as an abstract method."""
+        import inspect
+
+        from src.backtesting.strategies.base import BaseStrategy
+
+        assert hasattr(BaseStrategy, "check_entry")
+        assert inspect.isabstract(BaseStrategy)
+
+    def test_v7_20_base_strategy_has_name(self) -> None:
+        """BaseStrategy declares name as an abstract method."""
+        from src.backtesting.strategies.base import BaseStrategy
+
+        assert "name" in {m for m in dir(BaseStrategy)}
+        assert "check_entry" in BaseStrategy.__abstractmethods__
+        assert "name" in BaseStrategy.__abstractmethods__
+
+
+class TestV720CompositeScoreStrategy:
+    """CompositeScoreStrategy correctly implements BaseStrategy interface."""
+
+    def test_v7_20_composite_strategy_instantiates(self) -> None:
+        """CompositeScoreStrategy can be instantiated."""
+        from src.backtesting.strategies.composite_score import CompositeScoreStrategy
+
+        s = CompositeScoreStrategy()
+        assert s is not None
+
+    def test_v7_20_composite_strategy_name(self) -> None:
+        """CompositeScoreStrategy.name() returns 'composite'."""
+        from src.backtesting.strategies.composite_score import CompositeScoreStrategy
+
+        assert CompositeScoreStrategy().name() == "composite"
+
+    def test_v7_20_composite_strategy_is_base_strategy(self) -> None:
+        """CompositeScoreStrategy is a subclass of BaseStrategy."""
+        from src.backtesting.strategies.base import BaseStrategy
+        from src.backtesting.strategies.composite_score import CompositeScoreStrategy
+
+        assert issubclass(CompositeScoreStrategy, BaseStrategy)
+        assert isinstance(CompositeScoreStrategy(), BaseStrategy)
+
+    def test_v7_20_composite_strategy_check_entry_returns_none_without_engine(self) -> None:
+        """check_entry returns None and logs error when _engine is missing from context."""
+        from src.backtesting.strategies.composite_score import CompositeScoreStrategy
+
+        s = CompositeScoreStrategy()
+        result = s.check_entry({
+            "ta_score": 5.0,
+            "atr_value": 0.001,
+            "regime": "TREND_BULL",
+            "ta_indicators": {},
+            "symbol": "EURUSD=X",
+            "market_type": "forex",
+            "timeframe": "H1",
+        })
+        assert result is None
+
+    def test_v7_20_composite_strategy_check_entry_delegates_to_engine(self) -> None:
+        """check_entry calls _engine._generate_signal_fast with correct arguments."""
+        from unittest.mock import MagicMock
+
+        from src.backtesting.strategies.composite_score import CompositeScoreStrategy
+
+        mock_engine = MagicMock()
+        mock_signal = {
+            "direction": "LONG",
+            "composite_score": Decimal("4.5"),
+            "regime": "TREND_BULL",
+            "atr": Decimal("0.001"),
+            "position_pct": 2.0,
+            "ta_indicators": {},
+            "support_levels": [],
+            "resistance_levels": [],
+        }
+        mock_engine._generate_signal_fast.return_value = mock_signal
+
+        import pandas as pd
+        df = pd.DataFrame({"close": [1.1] * 60})
+
+        context = {
+            "_engine": mock_engine,
+            "ta_score": 5.0,
+            "atr_value": 0.001,
+            "regime": "TREND_BULL",
+            "ta_indicators": {"rsi": 55.0},
+            "symbol": "EURUSD=X",
+            "market_type": "forex",
+            "timeframe": "H1",
+            "df": df,
+            "candle_idx": 55,
+            "sr_cache": {},
+        }
+
+        s = CompositeScoreStrategy()
+        result = s.check_entry(context)
+
+        assert result == mock_signal
+        mock_engine._generate_signal_fast.assert_called_once_with(
+            ta_score=5.0,
+            atr_value=0.001,
+            regime="TREND_BULL",
+            ta_indicators_at_i={"rsi": 55.0},
+            symbol="EURUSD=X",
+            market_type="forex",
+            timeframe="H1",
+            df_slice=df,
+            candle_idx=55,
+            sr_cache={},
+        )
+
+
+class TestV720StrategyRegistry:
+    """STRATEGY_REGISTRY contains expected entries."""
+
+    def test_v7_20_registry_contains_composite(self) -> None:
+        """STRATEGY_REGISTRY has a 'composite' key."""
+        from src.backtesting.strategies import STRATEGY_REGISTRY
+
+        assert "composite" in STRATEGY_REGISTRY
+
+    def test_v7_20_registry_composite_is_class(self) -> None:
+        """STRATEGY_REGISTRY['composite'] is a class (not an instance)."""
+        from src.backtesting.strategies import STRATEGY_REGISTRY
+        from src.backtesting.strategies.base import BaseStrategy
+
+        cls = STRATEGY_REGISTRY["composite"]
+        assert isinstance(cls, type)
+        assert issubclass(cls, BaseStrategy)
+
+    def test_v7_20_registry_composite_instantiates(self) -> None:
+        """STRATEGY_REGISTRY['composite']() returns a usable strategy."""
+        from src.backtesting.strategies import STRATEGY_REGISTRY
+
+        s = STRATEGY_REGISTRY["composite"]()
+        assert s.name() == "composite"
+
+
+class TestV720BacktestParams:
+    """BacktestParams has the new strategy field."""
+
+    def test_v7_20_params_has_strategy_field(self) -> None:
+        """BacktestParams includes a 'strategy' field with default 'composite'."""
+        from src.backtesting.backtest_params import BacktestParams
+
+        params = BacktestParams(
+            symbols=["EURUSD=X"],
+            start_date="2024-01-01",
+            end_date="2024-06-01",
+        )
+        assert hasattr(params, "strategy")
+        assert params.strategy == "composite"
+
+    def test_v7_20_params_strategy_can_be_set(self) -> None:
+        """BacktestParams accepts custom strategy name."""
+        from src.backtesting.backtest_params import BacktestParams
+
+        params = BacktestParams(
+            symbols=["EURUSD=X"],
+            start_date="2024-01-01",
+            end_date="2024-06-01",
+            strategy="composite",
+        )
+        assert params.strategy == "composite"
+
+    def test_v7_20_params_serialization_includes_strategy(self) -> None:
+        """BacktestParams.model_dump() includes the strategy field."""
+        from src.backtesting.backtest_params import BacktestParams
+
+        params = BacktestParams(
+            symbols=["EURUSD=X"],
+            start_date="2024-01-01",
+            end_date="2024-06-01",
+        )
+        d = params.model_dump()
+        assert "strategy" in d
+        assert d["strategy"] == "composite"
+
+
+class TestV720BacktestEngineStrategy:
+    """BacktestEngine accepts strategy parameter and wires it correctly."""
+
+    def test_v7_20_engine_default_strategy_is_composite(self) -> None:
+        """BacktestEngine without strategy uses CompositeScoreStrategy by default."""
+        from unittest.mock import MagicMock
+
+        from src.backtesting.backtest_engine import BacktestEngine
+        from src.backtesting.strategies.composite_score import CompositeScoreStrategy
+
+        db = MagicMock()
+        engine = BacktestEngine(db=db)
+        assert isinstance(engine._strategy, CompositeScoreStrategy)
+
+    def test_v7_20_engine_accepts_custom_strategy(self) -> None:
+        """BacktestEngine accepts an explicit BaseStrategy instance."""
+        from unittest.mock import MagicMock
+
+        from src.backtesting.backtest_engine import BacktestEngine
+        from src.backtesting.strategies.base import BaseStrategy
+
+        class _DummyStrategy(BaseStrategy):
+            def name(self) -> str:
+                return "dummy"
+
+            def check_entry(self, context: dict) -> Optional[dict]:
+                return None
+
+        db = MagicMock()
+        engine = BacktestEngine(db=db, strategy=_DummyStrategy())
+        assert engine._strategy.name() == "dummy"
+
+    def test_v7_20_engine_rejects_non_strategy_object(self) -> None:
+        """BacktestEngine raises TypeError if strategy is not a BaseStrategy."""
+        from unittest.mock import MagicMock
+
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        db = MagicMock()
+        with pytest.raises(TypeError):
+            BacktestEngine(db=db, strategy="not_a_strategy")  # type: ignore[arg-type]
+
+    def test_v7_20_strategy_check_entry_called_in_simulate_symbol(self) -> None:
+        """_simulate_symbol calls strategy.check_entry() instead of direct _generate_signal_fast."""
+        from decimal import Decimal
+        from unittest.mock import MagicMock, patch
+
+        import pandas as pd
+
+        from src.backtesting.backtest_engine import BacktestEngine, _MIN_BARS_HISTORY
+        from src.backtesting.strategies.base import BaseStrategy
+
+        class _TrackingStrategy(BaseStrategy):
+            def __init__(self) -> None:
+                self.calls: list[dict] = []
+
+            def name(self) -> str:
+                return "tracking"
+
+            def check_entry(self, context: dict) -> Optional[dict]:
+                self.calls.append(context)
+                return None  # no entries — just track calls
+
+        db = MagicMock()
+        tracking = _TrackingStrategy()
+        engine = BacktestEngine(db=db, strategy=tracking)
+
+        # Build minimal price rows (need > _MIN_BARS_HISTORY + 2 candles)
+        import datetime
+        n_bars = _MIN_BARS_HISTORY + 10
+
+        def _row(i: int) -> MagicMock:
+            r = MagicMock()
+            r.timestamp = datetime.datetime(2024, 1, 1) + datetime.timedelta(hours=i)
+            r.open = 1.1 + i * 0.0001
+            r.high = r.open + 0.0005
+            r.low = r.open - 0.0005
+            r.close = r.open + 0.0002
+            r.volume = 1000.0
+            return r
+
+        price_rows = [_row(i) for i in range(n_bars)]
+
+        with patch.object(engine, "_check_exit", return_value=None):
+            trades, _ = engine._simulate_symbol(
+                symbol="EURUSD=X",
+                market_type="forex",
+                timeframe="H1",
+                price_rows=price_rows,
+                account_size=Decimal("1000"),
+                apply_slippage=True,
+            )
+
+        # Strategy must have been called at least once
+        assert len(tracking.calls) > 0
+        first_ctx = tracking.calls[0]
+        assert first_ctx["symbol"] == "EURUSD=X"
+        assert first_ctx["market_type"] == "forex"
+        assert first_ctx["timeframe"] == "H1"
+        assert "_engine" in first_ctx
+        assert first_ctx["_engine"] is engine
