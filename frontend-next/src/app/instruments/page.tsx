@@ -190,7 +190,7 @@ export default function TradingDashboard() {
   const loadCandles = useCallback(async () => {
     if (!selected) return;
     try {
-      const r = await fetch(`${API}/api/v2/prices/${encodeURIComponent(selected.symbol)}?timeframe=${timeframe}&limit=200`);
+      const r = await fetch(`${API}/api/v2/prices/${encodeURIComponent(selected.symbol)}?timeframe=${timeframe}&limit=2000`);
       if (r.ok) setCandles(await r.json());
     } catch {}
   }, [selected, timeframe]);

@@ -104,25 +104,40 @@ async def get_price_data(
     to_dt: Optional[datetime.datetime] = None,
     limit: int = 500,
 ) -> Sequence[PriceData]:
-    stmt = (
-        select(PriceData)
-        .where(
-            and_(
-                PriceData.instrument_id == instrument_id,
-                PriceData.timeframe == timeframe,
-            )
-        )
-        .order_by(PriceData.timestamp.desc())
-    )
+    conditions = [
+        PriceData.instrument_id == instrument_id,
+        PriceData.timeframe == timeframe,
+    ]
     if from_dt:
-        stmt = stmt.where(PriceData.timestamp >= from_dt)
+        conditions.append(PriceData.timestamp >= from_dt)
     if to_dt:
-        stmt = stmt.where(PriceData.timestamp <= to_dt)
-    stmt = stmt.limit(limit)
-    result = await session.execute(stmt)
-    rows = list(result.scalars().all())
-    rows.reverse()  # chronological order
-    return rows
+        conditions.append(PriceData.timestamp <= to_dt)
+
+    if from_dt:
+        # When a start date is specified, return rows in chronological order
+        # starting from that date (LIMIT applied after the date filter).
+        stmt = (
+            select(PriceData)
+            .where(and_(*conditions))
+            .order_by(PriceData.timestamp.asc())
+            .limit(limit)
+        )
+        result = await session.execute(stmt)
+        return list(result.scalars().all())
+    else:
+        # No start date: return the N most-recent candles, then reverse to
+        # chronological order (preserves existing behaviour for callers that
+        # rely on the latest N rows).
+        stmt = (
+            select(PriceData)
+            .where(and_(*conditions))
+            .order_by(PriceData.timestamp.desc())
+            .limit(limit)
+        )
+        result = await session.execute(stmt)
+        rows = list(result.scalars().all())
+        rows.reverse()
+        return rows
 
 
 # ── Signals ───────────────────────────────────────────────────────────────────

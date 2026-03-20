@@ -48,9 +48,11 @@ DXY_INSTRUMENT_SYMBOL = "DX-Y.NYB"
 DXY_TIMEFRAMES = ["H1", "D1"]
 
 BINANCE_FUNDING_URL = "https://fapi.binance.com/fapi/v1/fundingRate"
+# Maps Binance symbol → indicator_name stored in macro_data.
+# Must match names used in market_context_collector.py and correlation_engine.py.
 FUNDING_SYMBOLS = {
-    "BTCUSDT": "BTC/USDT",
-    "ETHUSDT": "ETH/USDT",
+    "BTCUSDT": "FUNDING_RATE_BTC",
+    "ETHUSDT": "FUNDING_RATE_ETH",
 }
 FUNDING_START_MS = int(
     datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc).timestamp() * 1000
@@ -293,8 +295,7 @@ async def load_funding_rates() -> None:
     all_fetched = 0
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        for binance_sym, our_sym in FUNDING_SYMBOLS.items():
-            indicator_name = f"FUNDING_RATE_{our_sym.replace('/', '_').replace('-', '_')}"
+        for binance_sym, indicator_name in FUNDING_SYMBOLS.items():
             records: list[dict[str, Any]] = []
 
             # Paginate through full 2024-2025 range
@@ -344,10 +345,10 @@ async def load_funding_rates() -> None:
                         async with db.begin():
                             stored = await upsert_macro_data(db, records)
                 except Exception as exc:
-                    logger.error("[Funding] DB error for %s: %s", our_sym, exc)
+                    logger.error("[Funding] DB error for %s: %s", indicator_name, exc)
 
             logger.info(
-                "[Funding] %s: fetched=%d stored=%d", our_sym, len(records), stored
+                "[Funding] %s: fetched=%d stored=%d", indicator_name, len(records), stored
             )
             all_fetched += len(records)
             all_stored += stored

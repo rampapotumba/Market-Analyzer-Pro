@@ -810,7 +810,7 @@ async def get_prices_v2(
     timeframe: str = "H1",
     date_from: Optional[datetime.datetime] = None,
     date_to: Optional[datetime.datetime] = None,
-    limit: int = Query(200, ge=1, le=2000),
+    limit: int = Query(200, ge=1, le=5000),
     db: AsyncSession = Depends(get_session),
 ):
     instrument = await get_instrument_by_symbol(db, symbol)
