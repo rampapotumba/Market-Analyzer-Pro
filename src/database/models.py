@@ -376,10 +376,16 @@ class SocialSentiment(Base):
     timestamp: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
-    source: Mapped[str] = mapped_column(String(32), nullable=False)  # reddit/stocktwits/fear_greed
-    score: Mapped[Decimal] = mapped_column(Numeric(8, 4), nullable=False)  # -100 to +100
+    source: Mapped[str] = mapped_column(String(32), nullable=False)  # reddit/stocktwits/fear_greed/combined
+    score: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))  # -100 to +100
     mention_count: Mapped[Optional[int]] = mapped_column(Integer)
     raw_data: Mapped[Optional[str]] = mapped_column(Text)  # JSON
+
+    # Extended fields written by SocialCollector (source="combined")
+    fear_greed_index: Mapped[Optional[Decimal]] = mapped_column(Numeric(6, 2))
+    reddit_score: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
+    stocktwits_bullish_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(6, 2))
+    put_call_ratio: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
 
     __table_args__ = (
         UniqueConstraint("instrument_id", "source", "timestamp", name="uix_social_sentiment"),

@@ -25,6 +25,7 @@ from src.database.models import (
     PriceData,
     Signal,
     SignalResult,
+    SocialSentiment,
     SystemEvent,
     VirtualAccount,
     VirtualPortfolio,
@@ -1032,3 +1033,27 @@ async def delete_backtest_run(session: AsyncSession, run_id: str) -> bool:
     await session.delete(run)
     await session.flush()
     return True
+
+
+# ── SocialSentiment ───────────────────────────────────────────────────────────
+
+
+async def get_latest_social_sentiment(
+    session: AsyncSession,
+    instrument_id: int,
+) -> Optional[SocialSentiment]:
+    """Return the most recent social_sentiment row for this instrument.
+
+    Queries rows with source='combined' (written by SocialCollector) ordered
+    by timestamp DESC, limit 1.  Returns None if no row exists.
+    """
+    result = await session.execute(
+        select(SocialSentiment)
+        .where(
+            SocialSentiment.instrument_id == instrument_id,
+            SocialSentiment.source == "combined",
+        )
+        .order_by(SocialSentiment.timestamp.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()

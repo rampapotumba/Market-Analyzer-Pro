@@ -25,6 +25,7 @@ from src.database.crud import (
     get_all_instruments,
     get_instrument_by_symbol,
     get_latest_signal_for_instrument,
+    get_latest_social_sentiment,
     get_macro_data,
     get_news_events,
     get_price_data,
@@ -490,7 +491,48 @@ class SignalEngine:
         # 5. Run Sentiment Engine V2 (FinBERT + multi-source, TextBlob fallback)
         sentiment_meta: Optional[dict] = None
         try:
-            sent_engine = SentimentEngineV2(news_events=news_records)
+            # Fetch social sentiment data (graceful degradation — None if absent)
+            social_row = None
+            try:
+                social_row = await get_latest_social_sentiment(db, instrument.id)
+            except Exception as social_exc:
+                logger.warning(
+                    f"[SignalEngine] Social sentiment fetch failed for {instrument.symbol}: {social_exc}"
+                )
+
+            fg_value: Optional[float] = None
+            pcr_value: Optional[float] = None
+            social_data: Optional[dict] = None
+
+            if social_row is not None:
+                if social_row.fear_greed_index is not None:
+                    fg_value = float(social_row.fear_greed_index)
+
+                if social_row.put_call_ratio is not None:
+                    pcr_value = float(social_row.put_call_ratio)
+
+                reddit = (
+                    float(social_row.reddit_score)
+                    if social_row.reddit_score is not None
+                    else None
+                )
+                stocktwits_score: Optional[float] = None
+                if social_row.stocktwits_bullish_pct is not None:
+                    stocktwits_score = (float(social_row.stocktwits_bullish_pct) - 50.0) * 2.0
+
+                if reddit is not None or stocktwits_score is not None:
+                    social_data = {}
+                    if reddit is not None:
+                        social_data["reddit_score"] = reddit
+                    if stocktwits_score is not None:
+                        social_data["stocktwits_score"] = stocktwits_score
+
+            sent_engine = SentimentEngineV2(
+                news_events=news_records,
+                social_data=social_data,
+                fear_greed_index=fg_value,
+                put_call_ratio=pcr_value,
+            )
             sentiment_score = await sent_engine.calculate()
             sentiment_meta = sent_engine.get_summary()
             logger.debug(
