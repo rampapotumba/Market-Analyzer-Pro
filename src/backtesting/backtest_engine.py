@@ -977,6 +977,9 @@ def _compute_summary(
         account_size=account_size,
     )
 
+    # TASK-V7-28: End-of-data sensitivity and transaction cost analysis
+    result["sensitivity"] = _compute_sensitivity(metric_trades, account_size)
+
     return result
 
 
@@ -1098,6 +1101,176 @@ def _compute_pf_from_trades(trades: list[BacktestTradeResult]) -> Optional[float
     if gross_loss > 0:
         return gross_win / gross_loss
     return None
+
+
+# ── TASK-V7-28: Sensitivity analysis constants ────────────────────────────────
+
+# PF change threshold (as fraction) above which strategy is flagged as period-sensitive.
+# 0.20 = 20% deviation from baseline PF triggers the flag.
+_SENSITIVITY_PERIOD_CHANGE_THRESHOLD = 0.20
+
+# "fragile" flag fires when PF drops below 1.0 at this slippage multiplier.
+_SENSITIVITY_FRAGILE_SLIPPAGE_MULTIPLIER = 2
+
+# Slippage overhead per trade expressed as a fraction of abs(pnl_usd).
+# Represents the bid-ask spread cost equivalent for one standard slip level.
+# 0.005 = 0.5% of trade PnL per 1x slippage level — a conservative but
+# realistic estimate for mixed forex/crypto/equity portfolios.
+_SENSITIVITY_SLIP_PCT_PER_LEVEL = 0.005
+
+# Cutoff windows for end-of-data sensitivity analysis (in days).
+_EOD_WINDOWS_DAYS = [7, 14, 30]
+
+
+def _pf_with_slippage(trades: list[BacktestTradeResult], extra_slip_levels: int) -> Optional[float]:
+    """Compute PF after applying additional slippage overhead.
+
+    For each trade the slippage cost is:
+        cost = abs(pnl_usd) * _SENSITIVITY_SLIP_PCT_PER_LEVEL * delta_levels
+
+    where delta_levels = extra_slip_levels - 1 (1x is the current baseline).
+
+    extra_slip_levels:
+        0  → optimistic (add back 1x cost to each trade)
+        1  → current baseline (trades unchanged)
+        2  → double slippage (subtract 1x cost from each trade)
+        3  → triple slippage (subtract 2x cost from each trade)
+    """
+    delta_levels = extra_slip_levels - 1
+
+    gross_win = 0.0
+    gross_loss = 0.0
+    for t in trades:
+        raw_pnl = float(t.pnl_usd or 0)
+        slip_cost = abs(raw_pnl) * _SENSITIVITY_SLIP_PCT_PER_LEVEL * delta_levels
+        # Positive delta: penalise trade (reduce wins, increase losses)
+        adjusted_pnl = raw_pnl - slip_cost
+        if adjusted_pnl > 0:
+            gross_win += adjusted_pnl
+        else:
+            gross_loss += abs(adjusted_pnl)
+
+    if gross_loss > 0:
+        return gross_win / gross_loss
+    return None
+
+
+def _compute_sensitivity(
+    trades: list[BacktestTradeResult],
+    account_size: Decimal,
+) -> dict[str, Any]:
+    """TASK-V7-28: End-of-data sensitivity and transaction cost analysis.
+
+    Returns a dict with two sub-keys:
+
+    end_of_data:
+        full_pf          — PF over all trades
+        excl_7d_pf       — PF excluding last 7 days
+        excl_14d_pf      — PF excluding last 14 days
+        excl_30d_pf      — PF excluding last 30 days
+        max_pf_deviation — largest relative deviation from full_pf (fractional)
+        period_sensitive — True when max_pf_deviation > 20%
+
+    slippage:
+        pf_0x    — PF with no slippage (optimistic)
+        pf_1x    — PF at current slippage (baseline)
+        pf_2x    — PF at double slippage
+        pf_3x    — PF at triple slippage
+        breakeven_at  — lowest multiplier (0/1/2/3) at which PF < 1.0, or None
+        fragile  — True when PF < 1.0 at 2x slippage
+    """
+    if not trades:
+        return {
+            "end_of_data": {
+                "full_pf": None,
+                "excl_7d_pf": None,
+                "excl_14d_pf": None,
+                "excl_30d_pf": None,
+                "max_pf_deviation": None,
+                "period_sensitive": False,
+            },
+            "slippage": {
+                "pf_0x": None,
+                "pf_1x": None,
+                "pf_2x": None,
+                "pf_3x": None,
+                "breakeven_at": None,
+                "fragile": False,
+            },
+        }
+
+    # Latest exit timestamp across all trades
+    exit_times = [t.exit_at for t in trades if t.exit_at is not None]
+    latest_exit = max(exit_times) if exit_times else None
+
+    # ── End-of-data sensitivity ───────────────────────────────────────────────
+    full_pf = _compute_pf_from_trades(trades)
+
+    excl_pf: dict[int, Optional[float]] = {}
+    for days in _EOD_WINDOWS_DAYS:
+        if latest_exit is None:
+            excl_pf[days] = full_pf
+        else:
+            cutoff = latest_exit - datetime.timedelta(days=days)
+            subset = [t for t in trades if t.exit_at is not None and t.exit_at <= cutoff]
+            excl_pf[days] = _compute_pf_from_trades(subset) if subset else None
+
+    # Maximum relative deviation of any windowed PF from full_pf
+    max_dev: Optional[float] = None
+    if full_pf is not None and full_pf > 0:
+        deviations: list[float] = [
+            abs(pf_val - full_pf) / full_pf
+            for pf_val in excl_pf.values()
+            if pf_val is not None
+        ]
+        if deviations:
+            max_dev = max(deviations)
+
+    period_sensitive = (
+        max_dev is not None and max_dev > _SENSITIVITY_PERIOD_CHANGE_THRESHOLD
+    )
+
+    # ── Slippage sensitivity ──────────────────────────────────────────────────
+    real_trades = [t for t in trades if t.exit_reason != "end_of_data"]
+
+    slip_pf: dict[int, Optional[float]] = {}
+    for mult in [0, 1, 2, 3]:
+        slip_pf[mult] = _pf_with_slippage(real_trades, mult)
+
+    # Lowest multiplier at which PF first drops below 1.0
+    breakeven_at: Optional[int] = None
+    for mult in [0, 1, 2, 3]:
+        pf_val = slip_pf[mult]
+        if pf_val is not None and pf_val < 1.0:
+            breakeven_at = mult
+            break
+
+    fragile = (
+        slip_pf[_SENSITIVITY_FRAGILE_SLIPPAGE_MULTIPLIER] is not None
+        and slip_pf[_SENSITIVITY_FRAGILE_SLIPPAGE_MULTIPLIER] < 1.0
+    )
+
+    def _round_pf(v: Optional[float]) -> Optional[float]:
+        return round(v, 4) if v is not None else None
+
+    return {
+        "end_of_data": {
+            "full_pf": _round_pf(full_pf),
+            "excl_7d_pf": _round_pf(excl_pf[7]),
+            "excl_14d_pf": _round_pf(excl_pf[14]),
+            "excl_30d_pf": _round_pf(excl_pf[30]),
+            "max_pf_deviation": round(max_dev, 4) if max_dev is not None else None,
+            "period_sensitive": period_sensitive,
+        },
+        "slippage": {
+            "pf_0x": _round_pf(slip_pf[0]),
+            "pf_1x": _round_pf(slip_pf[1]),
+            "pf_2x": _round_pf(slip_pf[2]),
+            "pf_3x": _round_pf(slip_pf[3]),
+            "breakeven_at": breakeven_at,
+            "fragile": fragile,
+        },
+    }
 
 
 def _compute_buy_and_hold(

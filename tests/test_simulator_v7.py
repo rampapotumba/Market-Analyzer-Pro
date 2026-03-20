@@ -7671,3 +7671,371 @@ class TestV726StrategyBacktestScript:
             assert name in STRATEGY_REGISTRY, (
                 f"Script strategy '{name}' not found in STRATEGY_REGISTRY"
             )
+
+
+# ── TASK-V7-28: Sensitivity analysis ──────────────────────────────────────────
+
+
+def _make_trade(
+    pnl_usd: float,
+    exit_at: datetime.datetime,
+    result: str = "win",
+    exit_reason: str = "tp_hit",
+) -> "Any":
+    """Create a minimal BacktestTradeResult mock for sensitivity tests."""
+    from src.backtesting.backtest_params import BacktestTradeResult
+
+    return BacktestTradeResult(
+        symbol="EURUSD=X",
+        timeframe="H1",
+        direction="LONG",
+        entry_price=Decimal("1.1000"),
+        exit_price=Decimal("1.1100") if pnl_usd >= 0 else Decimal("1.0900"),
+        exit_reason=exit_reason,
+        pnl_usd=Decimal(str(pnl_usd)),
+        result=result,
+        entry_at=exit_at - datetime.timedelta(hours=2),
+        exit_at=exit_at,
+    )
+
+
+class TestV728SensitivityAnalysis:
+    """TASK-V7-28: End-of-data sensitivity and transaction cost analysis."""
+
+    # ── Structure ─────────────────────────────────────────────────────────────
+
+    def test_v7_28_sensitivity_key_present_in_summary(self) -> None:
+        """_compute_summary must include a 'sensitivity' key."""
+        from src.backtesting.backtest_engine import _compute_summary
+        from src.backtesting.backtest_params import BacktestTradeResult
+
+        now = datetime.datetime(2024, 6, 1, 12, 0)
+        trades = [
+            _make_trade(10.0, now - datetime.timedelta(days=10)),
+            _make_trade(-5.0, now - datetime.timedelta(days=5), result="loss"),
+            _make_trade(10.0, now - datetime.timedelta(days=3)),
+        ]
+        summary = _compute_summary(trades, Decimal("1000"))
+        assert "sensitivity" in summary, "summary must contain 'sensitivity' key"
+
+    def test_v7_28_sensitivity_has_required_sub_keys(self) -> None:
+        """sensitivity dict must have both 'end_of_data' and 'slippage' sub-dicts."""
+        from src.backtesting.backtest_engine import _compute_sensitivity
+        from src.backtesting.backtest_params import BacktestTradeResult
+
+        now = datetime.datetime(2024, 6, 1, 12, 0)
+        trades = [
+            _make_trade(10.0, now - datetime.timedelta(days=10)),
+            _make_trade(-5.0, now - datetime.timedelta(days=5), result="loss"),
+        ]
+        result = _compute_sensitivity(trades, Decimal("1000"))
+        assert "end_of_data" in result
+        assert "slippage" in result
+
+    def test_v7_28_end_of_data_sub_keys(self) -> None:
+        """end_of_data must contain all required fields."""
+        from src.backtesting.backtest_engine import _compute_sensitivity
+
+        now = datetime.datetime(2024, 6, 1)
+        trades = [
+            _make_trade(10.0, now - datetime.timedelta(days=10)),
+            _make_trade(-5.0, now - datetime.timedelta(days=5), result="loss"),
+        ]
+        eod = _compute_sensitivity(trades, Decimal("1000"))["end_of_data"]
+        for key in ["full_pf", "excl_7d_pf", "excl_14d_pf", "excl_30d_pf",
+                    "max_pf_deviation", "period_sensitive"]:
+            assert key in eod, f"end_of_data missing key: {key}"
+
+    def test_v7_28_slippage_sub_keys(self) -> None:
+        """slippage must contain all required fields."""
+        from src.backtesting.backtest_engine import _compute_sensitivity
+
+        now = datetime.datetime(2024, 6, 1)
+        trades = [
+            _make_trade(10.0, now - datetime.timedelta(days=10)),
+            _make_trade(-5.0, now - datetime.timedelta(days=5), result="loss"),
+        ]
+        slip = _compute_sensitivity(trades, Decimal("1000"))["slippage"]
+        for key in ["pf_0x", "pf_1x", "pf_2x", "pf_3x", "breakeven_at", "fragile"]:
+            assert key in slip, f"slippage missing key: {key}"
+
+    # ── Zero trades ───────────────────────────────────────────────────────────
+
+    def test_v7_28_zero_trades_returns_defaults(self) -> None:
+        """Empty trade list must return safe defaults without errors."""
+        from src.backtesting.backtest_engine import _compute_sensitivity
+
+        result = _compute_sensitivity([], Decimal("1000"))
+        assert result["end_of_data"]["full_pf"] is None
+        assert result["end_of_data"]["period_sensitive"] is False
+        assert result["slippage"]["pf_1x"] is None
+        assert result["slippage"]["fragile"] is False
+        assert result["slippage"]["breakeven_at"] is None
+
+    # ── End-of-data sensitivity ───────────────────────────────────────────────
+
+    def test_v7_28_end_of_data_full_pf_matches_full_dataset(self) -> None:
+        """full_pf must equal PF computed over all non-end_of_data trades."""
+        from src.backtesting.backtest_engine import _compute_sensitivity, _compute_pf_from_trades
+
+        now = datetime.datetime(2024, 6, 1)
+        trades = [
+            _make_trade(20.0, now - datetime.timedelta(days=40)),
+            _make_trade(20.0, now - datetime.timedelta(days=30)),
+            _make_trade(-10.0, now - datetime.timedelta(days=20), result="loss"),
+            _make_trade(20.0, now - datetime.timedelta(days=10)),
+            _make_trade(-10.0, now - datetime.timedelta(days=5), result="loss"),
+        ]
+        result = _compute_sensitivity(trades, Decimal("1000"))
+        expected_pf = _compute_pf_from_trades(trades)
+        assert result["end_of_data"]["full_pf"] == round(expected_pf, 4)
+
+    def test_v7_28_excl_7d_excludes_recent_trades(self) -> None:
+        """excl_7d_pf must be computed from trades older than 7 days before latest exit."""
+        from src.backtesting.backtest_engine import _compute_sensitivity
+
+        now = datetime.datetime(2024, 6, 10)
+        # Only the trade at day -20 is outside the 7-day window
+        # The trades at day -5 and day -2 fall within 7 days of latest exit (day 0)
+        old_trade = _make_trade(10.0, now - datetime.timedelta(days=20))
+        recent_win = _make_trade(100.0, now - datetime.timedelta(days=5))
+        very_recent_loss = _make_trade(-50.0, now, result="loss", exit_reason="sl_hit")
+
+        result = _compute_sensitivity(
+            [old_trade, recent_win, very_recent_loss], Decimal("1000")
+        )
+        # excl_7d excludes trades within 7 days of the latest exit (day 0).
+        # Only old_trade (day -20) is included: no losses → PF = None (all wins).
+        assert result["end_of_data"]["excl_7d_pf"] is None  # no losses in subset
+
+    def test_v7_28_excl_windows_differ_when_last_trades_skewed(self) -> None:
+        """excl_7d/14d/30d PFs must differ when recent trades have a different win rate."""
+        from src.backtesting.backtest_engine import _compute_sensitivity
+
+        base = datetime.datetime(2024, 6, 1)
+        trades = [
+            # Old trades: balanced (PF ≈ 1.0)
+            _make_trade(10.0, base - datetime.timedelta(days=60)),
+            _make_trade(-10.0, base - datetime.timedelta(days=55), result="loss"),
+            _make_trade(10.0, base - datetime.timedelta(days=50)),
+            _make_trade(-10.0, base - datetime.timedelta(days=45), result="loss"),
+            # Recent trades (last 14 days): all wins, skew PF upward
+            _make_trade(30.0, base - datetime.timedelta(days=10)),
+            _make_trade(30.0, base - datetime.timedelta(days=5)),
+            _make_trade(30.0, base - datetime.timedelta(days=2)),
+        ]
+        result = _compute_sensitivity(trades, Decimal("1000"))
+        eod = result["end_of_data"]
+        # excl_30d removes all recent trades (days -10, -5, -2) → PF = 1.0
+        # full_pf > 1.0 because recent wins push it up
+        assert eod["full_pf"] is not None
+        assert eod["excl_30d_pf"] is not None
+        # After excluding 30 days, only old balanced trades remain → lower PF
+        assert eod["excl_30d_pf"] < eod["full_pf"]
+
+    def test_v7_28_period_sensitive_flag_triggers_above_20pct(self) -> None:
+        """period_sensitive must be True when max PF deviation exceeds 20%."""
+        from src.backtesting.backtest_engine import _compute_sensitivity
+
+        base = datetime.datetime(2024, 6, 1)
+        trades = [
+            # Ancient trades: mostly wins → high PF baseline before recent
+            _make_trade(20.0, base - datetime.timedelta(days=60)),
+            _make_trade(20.0, base - datetime.timedelta(days=55)),
+            _make_trade(20.0, base - datetime.timedelta(days=50)),
+            _make_trade(-10.0, base - datetime.timedelta(days=45), result="loss"),
+            # Last week: all big losses to create a large PF swing
+            _make_trade(-100.0, base - datetime.timedelta(days=3), result="loss"),
+            _make_trade(-100.0, base - datetime.timedelta(days=2), result="loss"),
+            _make_trade(-100.0, base - datetime.timedelta(days=1), result="loss"),
+        ]
+        result = _compute_sensitivity(trades, Decimal("1000"))
+        # Removing the last 7 days (big losses) should change PF by > 20%
+        assert result["end_of_data"]["period_sensitive"] is True
+
+    def test_v7_28_period_sensitive_flag_false_when_stable(self) -> None:
+        """period_sensitive must be False when PF is consistent across windows."""
+        from src.backtesting.backtest_engine import _compute_sensitivity
+
+        base = datetime.datetime(2024, 6, 1)
+        # Create uniform distribution of wins/losses spread across 60 days
+        trades = []
+        for i in range(30):
+            day_offset = 60 - i * 2
+            if i % 2 == 0:
+                trades.append(_make_trade(10.0, base - datetime.timedelta(days=day_offset)))
+            else:
+                trades.append(
+                    _make_trade(-5.0, base - datetime.timedelta(days=day_offset), result="loss")
+                )
+        result = _compute_sensitivity(trades, Decimal("1000"))
+        # With uniform distribution the PF across all windows should stay stable
+        assert result["end_of_data"]["period_sensitive"] is False
+
+    def test_v7_28_excl_30d_none_when_all_trades_recent(self) -> None:
+        """excl_30d_pf must be None when all trades fall within the last 30 days."""
+        from src.backtesting.backtest_engine import _compute_sensitivity
+
+        now = datetime.datetime(2024, 6, 1)
+        trades = [
+            _make_trade(10.0, now - datetime.timedelta(days=25)),
+            _make_trade(-5.0, now - datetime.timedelta(days=20), result="loss"),
+            _make_trade(10.0, now - datetime.timedelta(days=10)),
+        ]
+        result = _compute_sensitivity(trades, Decimal("1000"))
+        assert result["end_of_data"]["excl_30d_pf"] is None
+
+    # ── Slippage sensitivity ──────────────────────────────────────────────────
+
+    def test_v7_28_slippage_pf_0x_higher_than_1x(self) -> None:
+        """PF at 0x slippage (no cost) must be >= PF at 1x (baseline)."""
+        from src.backtesting.backtest_engine import _compute_sensitivity
+
+        now = datetime.datetime(2024, 6, 1)
+        trades = [
+            _make_trade(10.0, now - datetime.timedelta(days=5)),
+            _make_trade(-5.0, now - datetime.timedelta(days=3), result="loss"),
+        ]
+        slip = _compute_sensitivity(trades, Decimal("1000"))["slippage"]
+        assert slip["pf_0x"] >= slip["pf_1x"]
+
+    def test_v7_28_slippage_pf_decreases_with_higher_multiplier(self) -> None:
+        """PF at 3x must be <= PF at 2x, which must be <= PF at 1x."""
+        from src.backtesting.backtest_engine import _compute_sensitivity
+
+        now = datetime.datetime(2024, 6, 1)
+        trades = [
+            _make_trade(20.0, now - datetime.timedelta(days=10)),
+            _make_trade(20.0, now - datetime.timedelta(days=8)),
+            _make_trade(-10.0, now - datetime.timedelta(days=5), result="loss"),
+        ]
+        slip = _compute_sensitivity(trades, Decimal("1000"))["slippage"]
+        assert slip["pf_1x"] >= slip["pf_2x"]
+        assert slip["pf_2x"] >= slip["pf_3x"]
+
+    def test_v7_28_fragile_flag_true_when_pf_below_1_at_2x(self) -> None:
+        """fragile must be True when PF drops below 1.0 at 2x slippage.
+
+        At 2x slippage (delta_levels=1):
+            adjusted_win  = win * (1 - 0.005)  = win * 0.995
+            adjusted_loss = loss * (1 + 0.005) = loss * 1.005
+        PF_2x < 1.0 requires: win * 0.995 < loss * 1.005
+                           i.e. PF_1x < 1.005 / 0.995 ≈ 1.01005
+
+        win=100, loss=99.5 → PF_1x ≈ 1.005 which is inside the fragile band.
+        """
+        from src.backtesting.backtest_engine import _compute_sensitivity, _pf_with_slippage
+
+        now = datetime.datetime(2024, 6, 1)
+        trades = [
+            _make_trade(100.0, now - datetime.timedelta(days=10)),
+            _make_trade(-99.5, now - datetime.timedelta(days=5), result="loss"),
+        ]
+        # Sanity-check: 2x slippage should make PF drop below 1.0
+        real_trades = [t for t in trades if t.exit_reason != "end_of_data"]
+        pf_2x = _pf_with_slippage(real_trades, 2)
+        assert pf_2x is not None and pf_2x < 1.0, (
+            f"Expected PF < 1.0 at 2x slippage, got {pf_2x}"
+        )
+        result = _compute_sensitivity(trades, Decimal("1000"))
+        assert result["slippage"]["fragile"] is True
+
+    def test_v7_28_fragile_flag_false_for_robust_strategy(self) -> None:
+        """fragile must be False when PF stays above 1.0 even at 2x slippage."""
+        from src.backtesting.backtest_engine import _compute_sensitivity
+
+        now = datetime.datetime(2024, 6, 1)
+        # Strong strategy: wins are 3x the losses
+        trades = [
+            _make_trade(30.0, now - datetime.timedelta(days=10)),
+            _make_trade(30.0, now - datetime.timedelta(days=8)),
+            _make_trade(30.0, now - datetime.timedelta(days=6)),
+            _make_trade(-10.0, now - datetime.timedelta(days=4), result="loss"),
+        ]
+        result = _compute_sensitivity(trades, Decimal("1000"))
+        assert result["slippage"]["fragile"] is False
+
+    def test_v7_28_breakeven_at_reports_first_level_below_1(self) -> None:
+        """breakeven_at must be the lowest multiplier at which PF < 1.0.
+
+        win=100, loss=99.5 → PF_1x ≈ 1.005, PF_2x ≈ 0.995 < 1.0
+        So breakeven_at should be 2.
+        """
+        from src.backtesting.backtest_engine import _compute_sensitivity
+
+        now = datetime.datetime(2024, 6, 1)
+        trades = [
+            _make_trade(100.0, now - datetime.timedelta(days=10)),
+            _make_trade(-99.5, now - datetime.timedelta(days=5), result="loss"),
+        ]
+        result = _compute_sensitivity(trades, Decimal("1000"))
+        assert result["slippage"]["breakeven_at"] == 2
+
+    def test_v7_28_breakeven_at_none_for_robust_strategy(self) -> None:
+        """breakeven_at must be None when PF stays >= 1.0 at all slippage levels."""
+        from src.backtesting.backtest_engine import _compute_sensitivity
+
+        now = datetime.datetime(2024, 6, 1)
+        # Very strong strategy
+        trades = [
+            _make_trade(100.0, now - datetime.timedelta(days=10)),
+            _make_trade(100.0, now - datetime.timedelta(days=8)),
+            _make_trade(-10.0, now - datetime.timedelta(days=4), result="loss"),
+        ]
+        result = _compute_sensitivity(trades, Decimal("1000"))
+        assert result["slippage"]["breakeven_at"] is None
+
+    def test_v7_28_breakeven_at_zero_when_already_below_1_at_0x(self) -> None:
+        """breakeven_at must be 0 when even without slippage PF < 1.0 (losing strategy)."""
+        from src.backtesting.backtest_engine import _compute_sensitivity
+
+        now = datetime.datetime(2024, 6, 1)
+        # Clear losing strategy
+        trades = [
+            _make_trade(5.0, now - datetime.timedelta(days=10)),
+            _make_trade(-50.0, now - datetime.timedelta(days=5), result="loss"),
+        ]
+        result = _compute_sensitivity(trades, Decimal("1000"))
+        assert result["slippage"]["breakeven_at"] == 0
+
+    # ── All-wins scenario ─────────────────────────────────────────────────────
+
+    def test_v7_28_all_wins_pf_is_none(self) -> None:
+        """When all trades are wins, PF is undefined (None) — no division by zero."""
+        from src.backtesting.backtest_engine import _compute_sensitivity
+
+        now = datetime.datetime(2024, 6, 1)
+        trades = [
+            _make_trade(10.0, now - datetime.timedelta(days=10)),
+            _make_trade(20.0, now - datetime.timedelta(days=5)),
+            _make_trade(15.0, now - datetime.timedelta(days=2)),
+        ]
+        result = _compute_sensitivity(trades, Decimal("1000"))
+        # All-wins: gross_loss = 0 at all slippage levels near baseline
+        assert result["slippage"]["pf_1x"] is None
+        assert result["slippage"]["fragile"] is False
+        assert result["end_of_data"]["full_pf"] is None
+
+    # ── End-of-data trades are excluded from slippage analysis ────────────────
+
+    def test_v7_28_end_of_data_trades_excluded_from_slippage_pf(self) -> None:
+        """Trades with exit_reason='end_of_data' must not affect slippage PF."""
+        from src.backtesting.backtest_engine import _compute_sensitivity
+
+        now = datetime.datetime(2024, 6, 1)
+        real_win = _make_trade(20.0, now - datetime.timedelta(days=10))
+        real_loss = _make_trade(-10.0, now - datetime.timedelta(days=5), result="loss")
+        eod_trade = _make_trade(
+            -999.0, now - datetime.timedelta(days=1), result="loss",
+            exit_reason="end_of_data",
+        )
+        result_with_eod = _compute_sensitivity(
+            [real_win, real_loss, eod_trade], Decimal("1000")
+        )
+        result_without_eod = _compute_sensitivity(
+            [real_win, real_loss], Decimal("1000")
+        )
+        assert (
+            result_with_eod["slippage"]["pf_1x"]
+            == result_without_eod["slippage"]["pf_1x"]
+        )
