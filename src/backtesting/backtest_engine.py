@@ -53,13 +53,6 @@ _backtest_progress: dict[str, float] = {}
 # SIM-31: Allowed signal strengths (weak signals filtered out)
 ALLOWED_SIGNAL_STRENGTHS = {"BUY", "STRONG_BUY", "SELL", "STRONG_SELL"}
 
-# SIM-32: Weekday filter config
-WEEKDAY_FILTER = {
-    "monday_block_until_utc": 10,   # Mon 00:00–10:00 UTC blocked
-    "friday_block_from_utc": 18,    # Fri 18:00–23:59 UTC blocked
-    "crypto_exempt_monday": True,   # crypto exempt from Monday gap filter
-}
-
 
 def get_backtest_progress(run_id: str) -> Optional[float]:
     """Return progress percentage (0–100) for a running backtest, or None if not tracked."""
@@ -967,10 +960,19 @@ def _precompute_regimes(
     return regimes
 
 
+def _to_utc(ts: datetime.datetime) -> datetime.datetime:
+    """Normalize a datetime to UTC-aware, regardless of whether it is naive or aware."""
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=datetime.timezone.utc)
+    return ts.astimezone(datetime.timezone.utc)
+
+
 def _compute_dxy_rsi(dxy_rows: list) -> dict:
     """CAL3-01: Compute RSI(14) over DXY H1 price rows using Wilder smoothing.
 
-    Returns a dict mapping each candle's timestamp → RSI value.
+    Returns a dict mapping each candle's UTC-aware timestamp → RSI value.
+    All keys are normalized to UTC-aware datetimes so lookup works regardless of
+    whether the trading-symbol price rows carry tzinfo or not.
     Only includes timestamps where RSI is defined (from index 14 onward).
 
     Wilder smoothing: initial avg_gain/avg_loss = simple mean of first 14 changes,
@@ -980,7 +982,7 @@ def _compute_dxy_rsi(dxy_rows: list) -> dict:
         return {}
 
     closes = [float(r.close) for r in dxy_rows]
-    timestamps = [r.timestamp for r in dxy_rows]
+    timestamps = [_to_utc(r.timestamp) for r in dxy_rows]
     rsi_period = 14
     result: dict = {}
 
@@ -1499,9 +1501,11 @@ class BacktestEngine:
                 "candle_ts": candle_ts,
                 "d1_rows": d1_rows_for_filter,  # V6-06: populated from pre-loaded D1 cache
                 "economic_events": economic_events or [],
-                # CAL3-01: Look up DXY RSI for current candle timestamp.
-                # dxy_rsi_by_ts maps exact H1 timestamps; fallback to None (graceful degradation).
-                "dxy_rsi": (dxy_rsi_by_ts or {}).get(candle_ts),
+                # CAL3-01: Look up DXY RSI using the PREVIOUS candle's timestamp (idx = i-1),
+                # consistent with all other TA indicators that use idx to avoid lookahead.
+                # Both key and lookup are normalized to UTC-aware via _to_utc so that
+                # timezone-naive vs timezone-aware mismatches do not produce silent None.
+                "dxy_rsi": (dxy_rsi_by_ts or {}).get(_to_utc(price_rows[idx].timestamp)),
                 # V6 TASK-V6-02: only TA available in backtest → proportional scaling
                 "available_weight": _TA_WEIGHT,
             }

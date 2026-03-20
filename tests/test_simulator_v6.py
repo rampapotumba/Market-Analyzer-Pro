@@ -1245,7 +1245,7 @@ class TestV611TimeAndMaeExit:
             stop_loss=1.0900, take_profit=1.1200,
             timeframe="H1",
         )
-        # Candle low below SL AND we've held 24 candles (max for H1 after CAL-03) — SL should win
+        # Candle low below SL AND we've held 48 candles (max for H1 after CAL3-03) — SL should win
         candle = self._make_candle(high=1.1010, low=1.0880, close=1.0890)
         result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=24)
         assert result is not None
@@ -2781,18 +2781,6 @@ class TestCal209ConcentrationWarning:
 class TestCal301DxyRsiFilter:
     """CAL3-01: DXY RSI computed from price data and passed to filter pipeline."""
 
-    def _make_price_row(self, close: float, ts_offset_hours: int = 0) -> "MagicMock":
-        from unittest.mock import MagicMock
-        from decimal import Decimal
-
-        row = MagicMock()
-        row.close = Decimal(str(close))
-        row.timestamp = datetime.datetime(
-            2024, 1, 1, ts_offset_hours % 24, 0,
-            tzinfo=datetime.timezone.utc,
-        ) + datetime.timedelta(hours=ts_offset_hours // 24 * 24)
-        return row
-
     def _make_price_rows(self, n: int = 30) -> list:
         """Generate n price rows with incrementally rising prices."""
         rows = []
@@ -2898,6 +2886,68 @@ class TestCal301DxyRsiFilter:
         import inspect
         sig = inspect.signature(engine._simulate_symbol)
         assert "dxy_rsi_by_ts" in sig.parameters
+
+    def test_cal3_01_dxy_rsi_lookup_tz_aware_matches(self) -> None:
+        """_compute_dxy_rsi keys are UTC-aware; lookup with UTC-aware timestamp finds the value."""
+        from src.backtesting.backtest_engine import _compute_dxy_rsi
+
+        rows = self._make_price_rows(30)  # timestamps are UTC-aware
+        result = _compute_dxy_rsi(rows)
+        assert len(result) > 0
+
+        # All keys must be timezone-aware (UTC)
+        for ts_key in result:
+            assert ts_key.tzinfo is not None, f"Key must be UTC-aware, got naive: {ts_key}"
+            assert ts_key.tzinfo == datetime.timezone.utc or str(ts_key.tzinfo) == "UTC"
+
+    def test_cal3_01_dxy_rsi_lookup_naive_input_normalized(self) -> None:
+        """_compute_dxy_rsi with naive timestamps produces UTC-aware keys."""
+        from src.backtesting.backtest_engine import _compute_dxy_rsi
+        from decimal import Decimal as D
+
+        # Build rows with naive (no tzinfo) timestamps — simulates asyncpg without tz config
+        rows = []
+        for i in range(30):
+            r = MagicMock()
+            r.close = D(str(100.0 + i * 0.1))
+            r.timestamp = datetime.datetime(2024, 1, 1, 0, 0) + datetime.timedelta(hours=i)  # naive
+            rows.append(r)
+
+        result = _compute_dxy_rsi(rows)
+        assert len(result) > 0
+
+        # Keys must be UTC-aware even when input was naive
+        for ts_key in result:
+            assert ts_key.tzinfo is not None, f"Key must be UTC-aware, got naive: {ts_key}"
+
+        # Lookup by naive timestamp should fail to match (different type)
+        first_naive_ts = rows[14].timestamp  # naive
+        assert first_naive_ts not in result, (
+            "Naive timestamp should NOT match UTC-aware key — confirms normalization is needed"
+        )
+
+        # Lookup by UTC-aware timestamp must succeed
+        first_utc_ts = first_naive_ts.replace(tzinfo=datetime.timezone.utc)
+        assert first_utc_ts in result, (
+            "UTC-aware timestamp must match after normalization"
+        )
+
+    def test_cal3_01_dxy_rsi_mixed_tz_lookup_roundtrip(self) -> None:
+        """End-to-end: dict built from tz-aware rows, lookup via naive (normalized) key succeeds."""
+        from src.backtesting.backtest_engine import _compute_dxy_rsi, _to_utc
+        from decimal import Decimal as D
+
+        rows = self._make_price_rows(30)  # UTC-aware timestamps
+        result = _compute_dxy_rsi(rows)
+        assert len(result) > 0
+
+        # Simulate candle_ts arriving as naive (common asyncpg behavior without tz config)
+        # idx = i-1 means we look up price_rows[idx] — index 14 has the first RSI
+        naive_ts = datetime.datetime(2024, 1, 1, 14, 0)  # naive, same instant as rows[14]
+        normalized = _to_utc(naive_ts)
+        assert normalized in result, (
+            f"After _to_utc normalization the key must be found; available keys: {list(result.keys())[:3]}"
+        )
 
 
 # ── CAL3-02: Monday full block for forex ─────────────────────────────────────
