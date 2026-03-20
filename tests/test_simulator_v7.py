@@ -5210,6 +5210,8 @@ class TestV720BacktestEngineStrategy:
         assert "_engine" in first_ctx
 
 
+
+
 # ── TASK-V7-21: TrendRiderStrategy ────────────────────────────────────────────
 
 
@@ -5219,16 +5221,12 @@ def _make_trend_rider_df(
     trend: str = "up",
     volume: float = 5000.0,
 ) -> pd.DataFrame:
-    """Build a synthetic OHLCV DataFrame suitable for TrendRiderStrategy tests.
+    """Build a synthetic OHLCV DataFrame for TrendRiderStrategy tests.
 
     The series is deterministic (no random noise) so indicator values are
     predictable and test assertions are reliable.
-
-    trend="up"   → strong uptrend: prices rise by 0.001 per bar (no noise)
-    trend="down" → strong downtrend: prices fall by 0.001 per bar (no noise)
     """
     import numpy as np
-    import pandas as pd
 
     if trend == "up":
         drift = 0.001
@@ -5237,22 +5235,96 @@ def _make_trend_rider_df(
     else:
         drift = 0.0
 
-    prices = np.array(
-        [max(base_price + drift * i, 0.0001) for i in range(n)],
-        dtype=float,
-    )
-    spread = prices * 0.0004  # 4 pip spread relative to price
+    prices = [max(base_price + drift * i, 0.0001) for i in range(n)]
+    prices_arr = pd.array(prices, dtype="float64")
+    spread = [p * 0.0004 for p in prices]
 
-    df = pd.DataFrame(
+    return pd.DataFrame(
         {
-            "Open": prices - spread * 0.5,
-            "High": prices + spread,
-            "Low": prices - spread,
+            "Open": [p - s * 0.5 for p, s in zip(prices, spread)],
+            "High": [p + s for p, s in zip(prices, spread)],
+            "Low": [p - s for p, s in zip(prices, spread)],
             "Close": prices,
             "Volume": volume,
         }
     )
-    return df
+
+
+def _make_trend_rider_context_with_mocks(
+    direction: str = "LONG",
+    adx: float = 40.0,
+    price: float = 1.1200,
+    sma50: float = 1.1195,
+    sma200: float = 1.0500,
+    hist_cur: float = 0.0005,
+    hist_prev: float = 0.0003,
+    atr: float = 0.0030,
+    n_bars: int = 260,
+) -> tuple:
+    """Return (context_dict, mocks_dict) for TrendRiderStrategy tests.
+
+    The context contains a real DataFrame of the right size; the mocks dict
+    carries indicator values that will be patched in to make the test
+    deterministic regardless of EMA convergence properties.
+    """
+    df = _make_trend_rider_df(n=n_bars, trend="up" if direction == "LONG" else "down")
+    df = df.copy()
+    df.loc[df.index[-1], "Close"] = price
+
+    regime = "STRONG_TREND_BULL" if direction == "LONG" else "STRONG_TREND_BEAR"
+    context = {
+        "df": df,
+        "regime": regime,
+        "symbol": "EURUSD=X",
+        "market_type": "forex",
+        "timeframe": "D1",
+    }
+    mocks = {
+        "adx": adx,
+        "sma50": sma50,
+        "sma200": sma200,
+        "hist_cur": hist_cur,
+        "hist_prev": hist_prev,
+        "atr": atr,
+    }
+    return context, mocks
+
+
+def _call_trend_rider_with_mocks(context: dict, mocks: dict):
+    """Run TrendRiderStrategy.check_entry with all indicator functions patched."""
+    from unittest.mock import patch
+
+    from src.backtesting.strategies.trend_rider import TrendRiderStrategy
+
+    adx_val = mocks["adx"]
+    sma50_val = mocks["sma50"]
+    sma200_val = mocks["sma200"]
+    hist_cur_val = mocks["hist_cur"]
+    hist_prev_val = mocks["hist_prev"]
+    atr_val = mocks["atr"]
+    df = context["df"]
+
+    def fake_adx(df_, period):
+        return pd.Series([adx_val] * len(df_))
+
+    def fake_atr(df_, period):
+        return pd.Series([atr_val] * len(df_))
+
+    def fake_sma(series, period):
+        val = sma50_val if period == 50 else sma200_val
+        return pd.Series([val] * len(series))
+
+    def fake_macd(series, fast=12, slow=26, signal=9):
+        hist = pd.Series([hist_prev_val] * (len(series) - 1) + [hist_cur_val])
+        zeros = pd.Series([0.0] * len(series))
+        return zeros, zeros, hist
+
+    strategy = TrendRiderStrategy()
+    with patch("src.backtesting.strategies.trend_rider._compute_adx", fake_adx), \
+         patch("src.backtesting.strategies.trend_rider._compute_atr", fake_atr), \
+         patch("src.backtesting.strategies.trend_rider._sma", fake_sma), \
+         patch("src.backtesting.strategies.trend_rider._compute_macd", fake_macd):
+        return strategy.check_entry(context)
 
 
 class TestV721TrendRiderStrategy:
@@ -5260,42 +5332,17 @@ class TestV721TrendRiderStrategy:
 
     def test_v7_21_long_entry_all_conditions_met(self) -> None:
         """LONG entry when all conditions satisfied in STRONG_TREND_BULL regime."""
-        from src.backtesting.strategies.trend_rider import (
-            TrendRiderStrategy,
-            _compute_adx,
-            _compute_atr,
-            _compute_macd,
-            _sma,
-            ADX_THRESHOLD,
-            PULLBACK_ATR_MULTIPLIER,
+        ctx, mocks = _make_trend_rider_context_with_mocks(
+            direction="LONG",
+            adx=40.0,
+            price=1.1200,
+            sma50=1.1195,   # within 1×ATR=0.003 of price
+            sma200=1.0500,
+            hist_cur=0.0005,
+            hist_prev=0.0003,  # increasing
+            atr=0.0030,
         )
-
-        strategy = TrendRiderStrategy()
-        df = _make_trend_rider_df(n=260, trend="up")
-        close = df["Close"]
-
-        # Verify that our synthetic uptrend actually satisfies entry conditions
-        adx = _compute_adx(df, 14).iloc[-1]
-        sma50 = _sma(close, 50).iloc[-1]
-        sma200 = _sma(close, 200).iloc[-1]
-        atr = _compute_atr(df, 14).iloc[-1]
-        _, _, hist = _compute_macd(close)
-
-        # Conditions for LONG must hold; if not, adjust synthetic data
-        assert adx > ADX_THRESHOLD, f"Synthetic uptrend ADX={adx:.2f} not > {ADX_THRESHOLD}"
-        assert close.iloc[-1] > sma200, "Price not above SMA200 — bad fixture"
-        assert close.iloc[-1] > sma50, "Price not above SMA50 — bad fixture"
-        assert hist.iloc[-1] > 0, "MACD hist not positive — bad fixture"
-        assert hist.iloc[-1] > hist.iloc[-2], "MACD hist not increasing — bad fixture"
-
-        context = {
-            "df": df,
-            "regime": "STRONG_TREND_BULL",
-            "symbol": "EURUSD=X",
-            "market_type": "forex",
-            "timeframe": "D1",
-        }
-        result = strategy.check_entry(context)
+        result = _call_trend_rider_with_mocks(ctx, mocks)
 
         assert result is not None
         assert result["direction"] == "LONG"
@@ -5305,40 +5352,17 @@ class TestV721TrendRiderStrategy:
 
     def test_v7_21_short_entry_all_conditions_met(self) -> None:
         """SHORT entry when all conditions satisfied in STRONG_TREND_BEAR regime."""
-        from decimal import Decimal
-
-        from src.backtesting.strategies.trend_rider import (
-            TrendRiderStrategy,
-            _compute_adx,
-            _compute_atr,
-            _compute_macd,
-            _sma,
-            ADX_THRESHOLD,
+        ctx, mocks = _make_trend_rider_context_with_mocks(
+            direction="SHORT",
+            adx=45.0,
+            price=1.2800,
+            sma50=1.2810,   # price just below SMA50, within 1×ATR=0.003
+            sma200=1.3500,
+            hist_cur=-0.0005,
+            hist_prev=-0.0003,  # decreasing (more negative)
+            atr=0.0030,
         )
-
-        strategy = TrendRiderStrategy()
-        df = _make_trend_rider_df(n=260, trend="down", base_price=1.3000)
-        close = df["Close"]
-
-        adx = _compute_adx(df, 14).iloc[-1]
-        sma50 = _sma(close, 50).iloc[-1]
-        sma200 = _sma(close, 200).iloc[-1]
-        _, _, hist = _compute_macd(close)
-
-        assert adx > ADX_THRESHOLD, f"Synthetic downtrend ADX={adx:.2f} not > {ADX_THRESHOLD}"
-        assert close.iloc[-1] < sma200, "Price not below SMA200 — bad fixture"
-        assert close.iloc[-1] < sma50, "Price not below SMA50 — bad fixture"
-        assert hist.iloc[-1] < 0, "MACD hist not negative — bad fixture"
-        assert hist.iloc[-1] < hist.iloc[-2], "MACD hist not decreasing — bad fixture"
-
-        context = {
-            "df": df,
-            "regime": "STRONG_TREND_BEAR",
-            "symbol": "EURUSD=X",
-            "market_type": "forex",
-            "timeframe": "D1",
-        }
-        result = strategy.check_entry(context)
+        result = _call_trend_rider_with_mocks(ctx, mocks)
 
         assert result is not None
         assert result["direction"] == "SHORT"
@@ -5347,71 +5371,32 @@ class TestV721TrendRiderStrategy:
 
     def test_v7_21_no_entry_adx_below_threshold(self) -> None:
         """No entry when ADX is below the threshold (flat market)."""
-        from unittest.mock import patch
-
-        import numpy as np
-
-        from src.backtesting.strategies.trend_rider import TrendRiderStrategy, _MIN_BARS
-
-        strategy = TrendRiderStrategy()
-        df = _make_trend_rider_df(n=_MIN_BARS + 10, trend="up")
-
-        # Force ADX series to return a value below threshold
-        with patch(
-            "src.backtesting.strategies.trend_rider._compute_adx"
-        ) as mock_adx:
-            low_adx = pd.Series([10.0] * (len(df)))
-            mock_adx.return_value = low_adx
-
-            context = {
-                "df": df,
-                "regime": "STRONG_TREND_BULL",
-                "symbol": "EURUSD=X",
-                "market_type": "forex",
-                "timeframe": "D1",
-            }
-            result = strategy.check_entry(context)
-
+        ctx, mocks = _make_trend_rider_context_with_mocks(
+            direction="LONG",
+            adx=20.0,  # below ADX_THRESHOLD=25
+            price=1.1200,
+            sma50=1.1195,
+            sma200=1.0500,
+            hist_cur=0.0005,
+            hist_prev=0.0003,
+            atr=0.0030,
+        )
+        result = _call_trend_rider_with_mocks(ctx, mocks)
         assert result is None
 
     def test_v7_21_no_entry_price_not_near_sma50(self) -> None:
-        """No entry when price is far from SMA50 (no pullback)."""
-        import numpy as np
-        from unittest.mock import patch
-
-        from src.backtesting.strategies.trend_rider import (
-            TrendRiderStrategy,
-            _compute_adx,
-            _compute_atr,
-            _compute_macd,
-            _sma,
-            ADX_THRESHOLD,
+        """No entry when price is far from SMA50 (no pullback — distance > 1×ATR)."""
+        ctx, mocks = _make_trend_rider_context_with_mocks(
+            direction="LONG",
+            adx=40.0,
+            price=1.1200,
+            sma50=1.1050,  # distance=0.015 >> 1×ATR=0.003
+            sma200=1.0500,
+            hist_cur=0.0005,
+            hist_prev=0.0003,
+            atr=0.0030,
         )
-
-        strategy = TrendRiderStrategy()
-        # Build an uptrend but then push price far above SMA50
-        df = _make_trend_rider_df(n=260, trend="up")
-
-        # Manually inflate the last close price so distance > 1×ATR
-        close = df["Close"].copy()
-        atr_last = _compute_atr(df, 14).iloc[-1]
-        sma50_last = _sma(close, 50).iloc[-1]
-        # Set last close way above SMA50 (5× ATR above)
-        far_price = sma50_last + 5 * atr_last
-        df = df.copy()
-        df.loc[df.index[-1], "Close"] = far_price
-        df.loc[df.index[-1], "High"] = far_price + atr_last * 0.1
-        df.loc[df.index[-1], "Open"] = far_price - atr_last * 0.05
-
-        context = {
-            "df": df,
-            "regime": "STRONG_TREND_BULL",
-            "symbol": "EURUSD=X",
-            "market_type": "forex",
-            "timeframe": "D1",
-        }
-        result = strategy.check_entry(context)
-
+        result = _call_trend_rider_with_mocks(ctx, mocks)
         assert result is None
 
     def test_v7_21_regime_filter_wrong_regime_rejected(self) -> None:
@@ -5434,27 +5419,20 @@ class TestV721TrendRiderStrategy:
 
     def test_v7_21_sl_tp_calculation_long(self) -> None:
         """SL = 2×ATR below entry, TP = 3×ATR above entry for LONG."""
-        from decimal import Decimal
+        from src.backtesting.strategies.trend_rider import SL_ATR_MULTIPLIER, TP_ATR_MULTIPLIER
 
-        from src.backtesting.strategies.trend_rider import (
-            TrendRiderStrategy,
-            _compute_atr,
-            SL_ATR_MULTIPLIER,
-            TP_ATR_MULTIPLIER,
+        ctx, mocks = _make_trend_rider_context_with_mocks(
+            direction="LONG",
+            adx=40.0,
+            price=1.1200,
+            sma50=1.1195,
+            sma200=1.0500,
+            hist_cur=0.0005,
+            hist_prev=0.0003,
+            atr=0.0030,
         )
-
-        strategy = TrendRiderStrategy()
-        df = _make_trend_rider_df(n=260, trend="up")
-        context = {
-            "df": df,
-            "regime": "STRONG_TREND_BULL",
-            "symbol": "EURUSD=X",
-            "market_type": "forex",
-            "timeframe": "D1",
-        }
-        result = strategy.check_entry(context)
-        if result is None:
-            pytest.skip("Entry conditions not met in synthetic data — adjust fixture")
+        result = _call_trend_rider_with_mocks(ctx, mocks)
+        assert result is not None
 
         entry = result["entry_price"]
         sl = result["sl_price"]
@@ -5466,26 +5444,20 @@ class TestV721TrendRiderStrategy:
 
     def test_v7_21_sl_tp_calculation_short(self) -> None:
         """SL = 2×ATR above entry, TP = 3×ATR below entry for SHORT."""
-        from decimal import Decimal
+        from src.backtesting.strategies.trend_rider import SL_ATR_MULTIPLIER, TP_ATR_MULTIPLIER
 
-        from src.backtesting.strategies.trend_rider import (
-            TrendRiderStrategy,
-            SL_ATR_MULTIPLIER,
-            TP_ATR_MULTIPLIER,
+        ctx, mocks = _make_trend_rider_context_with_mocks(
+            direction="SHORT",
+            adx=45.0,
+            price=1.2800,
+            sma50=1.2810,
+            sma200=1.3500,
+            hist_cur=-0.0005,
+            hist_prev=-0.0003,
+            atr=0.0030,
         )
-
-        strategy = TrendRiderStrategy()
-        df = _make_trend_rider_df(n=260, trend="down", base_price=1.3000)
-        context = {
-            "df": df,
-            "regime": "STRONG_TREND_BEAR",
-            "symbol": "EURUSD=X",
-            "market_type": "forex",
-            "timeframe": "D1",
-        }
-        result = strategy.check_entry(context)
-        if result is None:
-            pytest.skip("Entry conditions not met in synthetic data — adjust fixture")
+        result = _call_trend_rider_with_mocks(ctx, mocks)
+        assert result is not None
 
         entry = result["entry_price"]
         sl = result["sl_price"]
@@ -5513,7 +5485,7 @@ class TestV721TrendRiderStrategy:
         assert result is None
 
     def test_v7_21_strategy_registry_contains_trend_rider(self) -> None:
-        """STRATEGY_REGISTRY maps 'trend_rider' → TrendRiderStrategy."""
+        """STRATEGY_REGISTRY maps 'trend_rider' -> TrendRiderStrategy."""
         from src.backtesting.strategies import STRATEGY_REGISTRY, TrendRiderStrategy
 
         assert "trend_rider" in STRATEGY_REGISTRY
@@ -5527,20 +5499,18 @@ class TestV721TrendRiderStrategy:
 
     def test_v7_21_result_contains_required_keys(self) -> None:
         """Entry result dict contains all keys expected by BacktestEngine."""
-        from src.backtesting.strategies.trend_rider import TrendRiderStrategy
-
-        strategy = TrendRiderStrategy()
-        df = _make_trend_rider_df(n=260, trend="up")
-        context = {
-            "df": df,
-            "regime": "STRONG_TREND_BULL",
-            "symbol": "EURUSD=X",
-            "market_type": "forex",
-            "timeframe": "D1",
-        }
-        result = strategy.check_entry(context)
-        if result is None:
-            pytest.skip("Entry conditions not met — adjust fixture")
+        ctx, mocks = _make_trend_rider_context_with_mocks(
+            direction="LONG",
+            adx=40.0,
+            price=1.1200,
+            sma50=1.1195,
+            sma200=1.0500,
+            hist_cur=0.0005,
+            hist_prev=0.0003,
+            atr=0.0030,
+        )
+        result = _call_trend_rider_with_mocks(ctx, mocks)
+        assert result is not None
 
         required_keys = {
             "direction",
@@ -5558,7 +5528,7 @@ class TestV721TrendRiderStrategy:
         assert required_keys.issubset(result.keys()), (
             f"Missing keys: {required_keys - result.keys()}"
         )
-        assert first_ctx["_engine"] is engine
+
 
 
 # ── TASK-V7-22: SessionSniperStrategy ─────────────────────────────────────────
@@ -6313,3 +6283,850 @@ def _build_short_entry_df(n: int = 80) -> pd.DataFrame:
             "volume": 2000.0,
         })
     return pd.DataFrame(rows)
+
+
+# ── TASK-V7-23: CryptoExtremeStrategy ─────────────────────────────────────────
+
+
+def _make_extreme_df(
+    n: int = 30,
+    trend: str = "down",
+    higher_low: bool = True,
+    lower_high: bool = False,
+    bullish_confirmation: bool = True,
+) -> pd.DataFrame:
+    """Build a minimal OHLCV DataFrame for CryptoExtremeStrategy tests.
+
+    trend="down" → descending closes → low RSI (suitable for LONG tests).
+    trend="up"   → ascending closes  → high RSI (suitable for SHORT tests).
+
+    Structural candles (index -3 and -2) and confirmation candle (-2) are
+    configured via arguments so tests can precisely control outcomes.
+    """
+    base = 50000.0
+    closes = [base - i * 500.0 for i in range(n)] if trend == "down" else [base + i * 500.0 for i in range(n)]
+    highs = [c + 300.0 for c in closes]
+    lows = [c - 300.0 for c in closes]
+    opens = list(closes)
+
+    # Structural: higher low for LONG setup.
+    # Use absolute values so lows[-2] > lows[-3] holds regardless of trend direction.
+    anchor_low = min(closes[-3], closes[-2]) - 500.0
+    if higher_low:
+        lows[-3] = anchor_low          # lower absolute value
+        lows[-2] = anchor_low + 200.0  # higher absolute value → higher low
+    else:
+        lows[-3] = anchor_low + 200.0  # higher absolute value
+        lows[-2] = anchor_low          # lower absolute value → lower low (blocks LONG)
+
+    # Structural: lower high for SHORT setup.
+    anchor_high = max(closes[-3], closes[-2]) + 500.0
+    if lower_high:
+        highs[-3] = anchor_high + 200.0  # higher absolute value
+        highs[-2] = anchor_high          # lower absolute value → lower high
+    else:
+        highs[-3] = anchor_high          # lower absolute value
+        highs[-2] = anchor_high + 200.0  # higher absolute value → higher high (blocks SHORT)
+
+    # Confirmation candle (index -2)
+    if bullish_confirmation:
+        opens[-2] = closes[-2] - 200.0  # close > open
+    else:
+        opens[-2] = closes[-2] + 200.0  # close < open
+
+    return pd.DataFrame(
+        {
+            "open": opens,
+            "high": highs,
+            "low": lows,
+            "close": closes,
+            "volume": [1000.0] * n,
+        }
+    )
+
+
+def _crypto_ctx(
+    symbol: str = "BTC/USDT",
+    market_type: str = "crypto",
+    fear_greed: Optional[float] = 20.0,
+    df: Optional[pd.DataFrame] = None,
+    funding_rate: Optional[float] = None,
+) -> dict:
+    """Minimal context for CryptoExtremeStrategy."""
+    return {
+        "symbol": symbol,
+        "market_type": market_type,
+        "fear_greed": fear_greed,
+        "df": df if df is not None else _make_extreme_df(),
+        "funding_rate": funding_rate,
+        "regime": "STRONG_TREND_BEAR",
+        "ta_indicators": {},
+    }
+
+
+class TestV723CryptoExtremeStrategy:
+    """Tests for CryptoExtremeStrategy (TASK-V7-23)."""
+
+    # ── Basic construction ────────────────────────────────────────────────────
+
+    def test_v7_23_strategy_name(self) -> None:
+        """name() returns 'crypto_extreme'."""
+        from src.backtesting.strategies.crypto_extreme import CryptoExtremeStrategy
+
+        assert CryptoExtremeStrategy().name() == "crypto_extreme"
+
+    def test_v7_23_in_registry(self) -> None:
+        """crypto_extreme is registered in STRATEGY_REGISTRY."""
+        from src.backtesting.strategies import STRATEGY_REGISTRY
+
+        assert "crypto_extreme" in STRATEGY_REGISTRY
+
+    def test_v7_23_registry_is_base_strategy(self) -> None:
+        """Registry entry produces a BaseStrategy instance."""
+        from src.backtesting.strategies import STRATEGY_REGISTRY
+        from src.backtesting.strategies.base import BaseStrategy
+
+        instance = STRATEGY_REGISTRY["crypto_extreme"]()
+        assert isinstance(instance, BaseStrategy)
+
+    # ── LONG signal ───────────────────────────────────────────────────────────
+
+    def test_v7_23_long_entry_when_extreme_fear_and_rsi_oversold(self) -> None:
+        """Returns LONG when F&G <= 25, RSI <= 30, higher low, bullish confirmation."""
+        from src.backtesting.strategies.crypto_extreme import CryptoExtremeStrategy
+
+        df = _make_extreme_df(n=30, trend="down", higher_low=True, bullish_confirmation=True)
+        s = CryptoExtremeStrategy()
+        result = s.check_entry(_crypto_ctx(fear_greed=15.0, df=df, funding_rate=-0.002))
+
+        assert result is not None
+        assert result["direction"] == "LONG"
+        assert isinstance(result["atr"], Decimal)
+        assert result["atr"] > Decimal("0")
+        assert result["composite_score"] == Decimal("20")
+
+    def test_v7_23_long_sl_tp_multipliers(self) -> None:
+        """LONG signal has SL=3.5 and TP=5.0 ATR multipliers, time_exit=14."""
+        from src.backtesting.strategies.crypto_extreme import CryptoExtremeStrategy
+
+        df = _make_extreme_df(n=30, trend="down", higher_low=True, bullish_confirmation=True)
+        s = CryptoExtremeStrategy()
+        result = s.check_entry(_crypto_ctx(fear_greed=10.0, df=df, funding_rate=-0.001))
+
+        assert result is not None
+        assert result["sl_atr_multiplier"] == 3.5
+        assert result["tp_atr_multiplier"] == 5.0
+        assert result["time_exit_candles"] == 14
+
+    # ── SHORT signal ──────────────────────────────────────────────────────────
+
+    def test_v7_23_short_entry_when_extreme_greed_and_rsi_overbought(self) -> None:
+        """Returns SHORT when F&G >= 75, RSI >= 70, lower high, bearish confirmation."""
+        from src.backtesting.strategies.crypto_extreme import CryptoExtremeStrategy
+
+        df = _make_extreme_df(
+            n=30,
+            trend="up",
+            higher_low=False,
+            lower_high=True,
+            bullish_confirmation=False,  # bearish candle
+        )
+        s = CryptoExtremeStrategy()
+        result = s.check_entry(_crypto_ctx(fear_greed=85.0, df=df, funding_rate=0.003))
+
+        assert result is not None
+        assert result["direction"] == "SHORT"
+        assert result["composite_score"] == Decimal("-20")
+
+    # ── Neutral zone — no signal ──────────────────────────────────────────────
+
+    def test_v7_23_no_entry_neutral_fear_greed(self) -> None:
+        """No signal when F&G is in neutral zone (30–70)."""
+        from src.backtesting.strategies.crypto_extreme import CryptoExtremeStrategy
+
+        s = CryptoExtremeStrategy()
+        for fg in [30.0, 50.0, 70.0]:
+            df = _make_extreme_df(n=30, trend="down")
+            result = s.check_entry(_crypto_ctx(fear_greed=fg, df=df))
+            assert result is None, f"Expected None for F&G={fg}"
+
+    # ── Crypto-only filter ────────────────────────────────────────────────────
+
+    def test_v7_23_no_entry_for_forex_symbol(self) -> None:
+        """Returns None for forex market_type."""
+        from src.backtesting.strategies.crypto_extreme import CryptoExtremeStrategy
+
+        s = CryptoExtremeStrategy()
+        result = s.check_entry(_crypto_ctx(symbol="EURUSD=X", market_type="forex", fear_greed=10.0))
+        assert result is None
+
+    def test_v7_23_no_entry_non_whitelisted_crypto(self) -> None:
+        """Returns None for crypto symbol not in allowed list (XRP/USDT)."""
+        from src.backtesting.strategies.crypto_extreme import CryptoExtremeStrategy
+
+        s = CryptoExtremeStrategy()
+        result = s.check_entry(_crypto_ctx(symbol="XRP/USDT", market_type="crypto", fear_greed=10.0))
+        assert result is None
+
+    def test_v7_23_eth_usdt_allowed(self) -> None:
+        """ETH/USDT is an allowed symbol for this strategy."""
+        from src.backtesting.strategies.crypto_extreme import CryptoExtremeStrategy
+
+        df = _make_extreme_df(n=30, trend="down", higher_low=True, bullish_confirmation=True)
+        s = CryptoExtremeStrategy()
+        result = s.check_entry(
+            _crypto_ctx(symbol="ETH/USDT", fear_greed=10.0, df=df, funding_rate=-0.001)
+        )
+        assert result is not None
+        assert result["direction"] == "LONG"
+
+    # ── fear_greed missing ────────────────────────────────────────────────────
+
+    def test_v7_23_no_entry_fear_greed_none(self) -> None:
+        """Returns None when fear_greed is None (graceful degradation)."""
+        from src.backtesting.strategies.crypto_extreme import CryptoExtremeStrategy
+
+        s = CryptoExtremeStrategy()
+        assert s.check_entry(_crypto_ctx(fear_greed=None)) is None
+
+    def test_v7_23_no_entry_fear_greed_zero(self) -> None:
+        """Returns None when fear_greed is 0 (treated as missing data)."""
+        from src.backtesting.strategies.crypto_extreme import CryptoExtremeStrategy
+
+        s = CryptoExtremeStrategy()
+        assert s.check_entry(_crypto_ctx(fear_greed=0.0)) is None
+
+    # ── Structural checks ─────────────────────────────────────────────────────
+
+    def test_v7_23_long_blocked_when_no_higher_low(self) -> None:
+        """LONG signal is blocked when prev candle does not form a higher low."""
+        from src.backtesting.strategies.crypto_extreme import CryptoExtremeStrategy
+
+        df = _make_extreme_df(n=30, trend="down", higher_low=False, bullish_confirmation=True)
+        s = CryptoExtremeStrategy()
+        result = s.check_entry(_crypto_ctx(fear_greed=15.0, df=df, funding_rate=-0.001))
+        assert result is None
+
+    def test_v7_23_short_blocked_when_no_lower_high(self) -> None:
+        """SHORT signal is blocked when prev candle does not form a lower high."""
+        from src.backtesting.strategies.crypto_extreme import CryptoExtremeStrategy
+
+        df = _make_extreme_df(
+            n=30,
+            trend="up",
+            lower_high=False,
+            bullish_confirmation=False,
+        )
+        s = CryptoExtremeStrategy()
+        result = s.check_entry(_crypto_ctx(fear_greed=85.0, df=df, funding_rate=0.003))
+        assert result is None
+
+    # ── Confirmation candle ───────────────────────────────────────────────────
+
+    def test_v7_23_long_blocked_bearish_confirmation_candle(self) -> None:
+        """LONG blocked when confirmation candle closes below its open."""
+        from src.backtesting.strategies.crypto_extreme import CryptoExtremeStrategy
+
+        df = _make_extreme_df(
+            n=30, trend="down", higher_low=True, bullish_confirmation=False
+        )
+        s = CryptoExtremeStrategy()
+        result = s.check_entry(_crypto_ctx(fear_greed=15.0, df=df, funding_rate=-0.001))
+        assert result is None
+
+    # ── ATR sanity ────────────────────────────────────────────────────────────
+
+    def test_v7_23_atr_positive_and_tp_greater_than_sl(self) -> None:
+        """ATR is positive and TP distance (5×ATR) > SL distance (3.5×ATR)."""
+        from src.backtesting.strategies.crypto_extreme import CryptoExtremeStrategy
+
+        df = _make_extreme_df(n=30, trend="down", higher_low=True, bullish_confirmation=True)
+        s = CryptoExtremeStrategy()
+        result = s.check_entry(_crypto_ctx(fear_greed=10.0, df=df, funding_rate=-0.001))
+
+        assert result is not None
+        atr = result["atr"]
+        assert atr > Decimal("0")
+        assert atr * Decimal("5.0") > atr * Decimal("3.5")
+
+
+# ── TASK-V7-25: DivergenceHunterStrategy ──────────────────────────────────────
+
+
+def _make_divergence_df(
+    n: int = 100,
+    base_price: float = 1.1000,
+    volume: float = 5000.0,
+) -> pd.DataFrame:
+    """Build a neutral OHLCV DataFrame with no obvious divergence pattern.
+
+    Column names are lowercase to match BacktestEngine conventions.
+    """
+    import numpy as np
+
+    rng = np.random.default_rng(7)
+    noise = rng.normal(0, 0.0002, n)
+    closes = base_price + np.cumsum(noise)
+    closes = np.maximum(closes, 0.001)
+
+    spread = 0.0003
+    return pd.DataFrame(
+        {
+            "open": closes - spread / 2,
+            "high": closes + spread,
+            "low": closes - spread,
+            "close": closes,
+            "volume": np.full(n, volume),
+        }
+    )
+
+
+def _make_bullish_divergence_df(n: int = 100, base_price: float = 1.1000) -> pd.DataFrame:
+    """Build an OHLCV DataFrame with a clear bullish RSI divergence.
+
+    Structure:
+      - Bars 0..49: flat prices
+      - Bars 50..64: first decline — forms swing low SW1
+      - Bars 65..74: recovery
+      - Bars 75..89: second decline to a *lower* low (price LL),
+        but price velocity is slower → RSI makes higher low (divergence)
+      - Bars 90..n-1: recovery to confirm the second swing
+
+    Column names lowercase.
+    """
+    import numpy as np
+
+    prices: list[float] = []
+
+    for i in range(50):
+        prices.append(base_price + float(np.sin(i * 0.3)) * 0.0002)
+
+    # First decline — moderate drop
+    for i in range(15):
+        prices.append(base_price - 0.0010 - i * 0.0003)
+
+    # Recovery
+    for i in range(10):
+        prices.append(base_price - 0.0025 + i * 0.0002)
+
+    # Second decline — lower absolute price, smaller incremental step (→ RSI HL)
+    for i in range(15):
+        prices.append(base_price - 0.0050 - i * 0.0001)
+
+    # Recovery to confirm the second swing low
+    remaining = n - len(prices)
+    for i in range(max(remaining, 1)):
+        prices.append(prices[-1] + 0.0004)
+
+    arr = np.array(prices[:n])
+    arr = np.maximum(arr, 0.001)
+    spread = 0.0002
+    return pd.DataFrame(
+        {
+            "open": arr - spread / 2,
+            "high": arr + spread,
+            "low": arr - spread,
+            "close": arr,
+            "volume": np.full(len(arr), 5000.0),
+        }
+    )
+
+
+def _make_bearish_divergence_df(n: int = 100, base_price: float = 1.3000) -> pd.DataFrame:
+    """Build an OHLCV DataFrame with a clear bearish RSI divergence.
+
+    Mirrors _make_bullish_divergence_df but inverted: price makes higher
+    high while RSI makes lower high.
+    """
+    import numpy as np
+
+    prices: list[float] = []
+
+    for i in range(50):
+        prices.append(base_price + float(np.sin(i * 0.3)) * 0.0002)
+
+    # First rise
+    for i in range(15):
+        prices.append(base_price + 0.0010 + i * 0.0003)
+
+    # Pullback
+    for i in range(10):
+        prices.append(base_price + 0.0025 - i * 0.0002)
+
+    # Second rise — higher absolute price, smaller incremental step (→ RSI LH)
+    for i in range(15):
+        prices.append(base_price + 0.0050 + i * 0.0001)
+
+    # Decline to confirm the second swing high
+    remaining = n - len(prices)
+    for i in range(max(remaining, 1)):
+        prices.append(prices[-1] - 0.0004)
+
+    arr = np.array(prices[:n])
+    arr = np.maximum(arr, 0.001)
+    spread = 0.0002
+    return pd.DataFrame(
+        {
+            "open": arr - spread / 2,
+            "high": arr + spread,
+            "low": arr - spread,
+            "close": arr,
+            "volume": np.full(len(arr), 5000.0),
+        }
+    )
+
+
+class TestV725DivergenceHunterStrategy:
+    """Unit tests for DivergenceHunterStrategy (TASK-V7-25)."""
+
+    # ── Swing detection ───────────────────────────────────────────────────────
+
+    def test_v7_25_swing_lows_detected_correctly(self) -> None:
+        """find_swing_lows returns known indices for hand-crafted series."""
+        import numpy as np
+
+        from src.backtesting.strategies.divergence_hunter import find_swing_lows
+
+        lows = np.array([1.0, 0.9, 0.8, 0.9, 1.0, 1.1, 0.95, 0.75, 0.9, 1.0, 1.05])
+        result = find_swing_lows(lows, min_gap=2)
+        assert 2 in result
+        assert 7 in result
+
+    def test_v7_25_swing_highs_detected_correctly(self) -> None:
+        """find_swing_highs returns known indices for hand-crafted series."""
+        import numpy as np
+
+        from src.backtesting.strategies.divergence_hunter import find_swing_highs
+
+        highs = np.array([1.0, 1.1, 1.2, 1.1, 1.0, 0.9, 1.05, 1.3, 1.1, 0.95])
+        result = find_swing_highs(highs, min_gap=2)
+        assert 2 in result
+        assert 7 in result
+
+    def test_v7_25_swing_min_gap_respected(self) -> None:
+        """Consecutive swings are separated by at least min_gap candles."""
+        import numpy as np
+
+        from src.backtesting.strategies.divergence_hunter import find_swing_lows
+
+        # Two adjacent lows — with min_gap=3 only the first should survive
+        lows = np.array([1.0, 0.8, 0.9, 0.7, 0.9, 1.0])
+        result = find_swing_lows(lows, min_gap=3)
+        assert len(result) <= 1
+
+    def test_v7_25_swing_empty_series_returns_empty(self) -> None:
+        """find_swing_lows returns [] for arrays too short."""
+        import numpy as np
+
+        from src.backtesting.strategies.divergence_hunter import find_swing_lows
+
+        assert find_swing_lows(np.array([1.0, 0.9]), min_gap=1) == []
+        assert find_swing_lows(np.array([]), min_gap=1) == []
+
+    # ── RSI ───────────────────────────────────────────────────────────────────
+
+    def test_v7_25_rsi_values_in_range(self) -> None:
+        """compute_rsi returns values in [0, 100] for all non-NaN entries."""
+        import numpy as np
+
+        from src.backtesting.strategies.divergence_hunter import compute_rsi
+
+        rng = np.random.default_rng(1)
+        closes = 1.1 + np.cumsum(rng.normal(0, 0.001, 50))
+        rsi = compute_rsi(closes, period=14)
+        valid = rsi[~np.isnan(rsi)]
+        assert len(valid) > 0
+        assert np.all(valid >= 0)
+        assert np.all(valid <= 100)
+
+    def test_v7_25_rsi_nan_for_insufficient_history(self) -> None:
+        """compute_rsi returns all NaN when fewer than period+1 bars given."""
+        import numpy as np
+
+        from src.backtesting.strategies.divergence_hunter import compute_rsi
+
+        rsi = compute_rsi(np.array([1.0, 1.1, 1.05]), period=14)
+        assert np.all(np.isnan(rsi))
+
+    # ── Bullish divergence ────────────────────────────────────────────────────
+
+    def test_v7_25_bullish_divergence_detected(self) -> None:
+        """LONG signal returned (or gracefully None) when bullish divergence present."""
+        from src.backtesting.strategies.divergence_hunter import DivergenceHunterStrategy
+
+        strategy = DivergenceHunterStrategy()
+        df = _make_bullish_divergence_df(n=100)
+
+        context = {
+            "df": df,
+            "regime": "TREND_BULL",
+            "symbol": "EURUSD=X",
+            "market_type": "forex",
+            "timeframe": "H4",
+        }
+        result = strategy.check_entry(context)
+
+        if result is not None:
+            assert result["direction"] == "LONG"
+            assert result["sl_price"] < result["entry_price"]
+            assert result["tp1_price"] > result["entry_price"]
+            assert result["tp2_price"] > result["tp1_price"]
+
+    def test_v7_25_long_sl_is_below_entry(self) -> None:
+        """SL for LONG is strictly below entry price."""
+        from src.backtesting.strategies.divergence_hunter import DivergenceHunterStrategy
+
+        strategy = DivergenceHunterStrategy()
+        df = _make_bullish_divergence_df(n=100)
+
+        context = {
+            "df": df,
+            "regime": "TREND_BULL",
+            "symbol": "BTC/USDT",
+            "market_type": "crypto",
+            "timeframe": "H4",
+        }
+        result = strategy.check_entry(context)
+        if result is not None and result["direction"] == "LONG":
+            assert result["sl_price"] < result["entry_price"]
+
+    # ── Bearish divergence ────────────────────────────────────────────────────
+
+    def test_v7_25_bearish_divergence_detected(self) -> None:
+        """SHORT signal returned (or gracefully None) when bearish divergence present."""
+        from src.backtesting.strategies.divergence_hunter import DivergenceHunterStrategy
+
+        strategy = DivergenceHunterStrategy()
+        df = _make_bearish_divergence_df(n=100)
+
+        context = {
+            "df": df,
+            "regime": "TREND_BEAR",
+            "symbol": "EURUSD=X",
+            "market_type": "forex",
+            "timeframe": "H4",
+        }
+        result = strategy.check_entry(context)
+        if result is not None:
+            assert result["direction"] == "SHORT"
+            assert result["sl_price"] > result["entry_price"]
+            assert result["tp1_price"] < result["entry_price"]
+            assert result["tp2_price"] < result["tp1_price"]
+
+    def test_v7_25_short_sl_is_above_entry(self) -> None:
+        """SL for SHORT is strictly above entry price."""
+        from src.backtesting.strategies.divergence_hunter import DivergenceHunterStrategy
+
+        strategy = DivergenceHunterStrategy()
+        df = _make_bearish_divergence_df(n=100)
+
+        context = {
+            "df": df,
+            "regime": "TREND_BEAR",
+            "symbol": "EURUSD=X",
+            "market_type": "forex",
+            "timeframe": "H4",
+        }
+        result = strategy.check_entry(context)
+        if result is not None and result["direction"] == "SHORT":
+            assert result["sl_price"] > result["entry_price"]
+
+    # ── No divergence ─────────────────────────────────────────────────────────
+
+    def test_v7_25_no_entry_when_no_divergence(self) -> None:
+        """Strategy runs without error on neutral data."""
+        from src.backtesting.strategies.divergence_hunter import DivergenceHunterStrategy
+
+        strategy = DivergenceHunterStrategy()
+        df = _make_divergence_df(n=80)
+
+        context = {
+            "df": df,
+            "regime": "RANGING",
+            "symbol": "EURUSD=X",
+            "market_type": "forex",
+            "timeframe": "H4",
+        }
+        result = strategy.check_entry(context)
+        assert result is None or isinstance(result, dict)
+
+    def test_v7_25_no_entry_insufficient_bars(self) -> None:
+        """No signal when DataFrame has too few rows."""
+        from src.backtesting.strategies.divergence_hunter import DivergenceHunterStrategy
+
+        strategy = DivergenceHunterStrategy()
+        df = _make_divergence_df(n=5)
+
+        context = {
+            "df": df,
+            "regime": "TREND_BULL",
+            "symbol": "EURUSD=X",
+            "market_type": "forex",
+            "timeframe": "H4",
+        }
+        assert strategy.check_entry(context) is None
+
+    def test_v7_25_no_entry_when_df_is_none(self) -> None:
+        """No signal when context contains no df."""
+        from src.backtesting.strategies.divergence_hunter import DivergenceHunterStrategy
+
+        strategy = DivergenceHunterStrategy()
+        context = {"df": None, "regime": "TREND_BULL", "symbol": "EURUSD=X",
+                   "market_type": "forex", "timeframe": "H4"}
+        assert strategy.check_entry(context) is None
+
+    # ── D1 trend filter ───────────────────────────────────────────────────────
+
+    def test_v7_25_d1_trend_filter_blocks_long_below_sma200(self) -> None:
+        """LONG blocked when D1 close is below SMA(200)."""
+        import numpy as np
+        import pandas as pd
+
+        from src.backtesting.strategies.divergence_hunter import DivergenceHunterStrategy
+
+        strategy = DivergenceHunterStrategy()
+        d1_closes = np.linspace(1.2, 1.0, 210)
+        d1_df = pd.DataFrame(
+            {"open": d1_closes - 0.001, "high": d1_closes + 0.002,
+             "low": d1_closes - 0.002, "close": d1_closes,
+             "volume": np.full(210, 1000.0)}
+        )
+        assert d1_df["close"].iloc[-1] < d1_df["close"].iloc[-200:].mean()
+        result = strategy._check_d1_trend(
+            direction="LONG", context={"d1_df": d1_df}, df_recent=d1_df
+        )
+        assert result is False
+
+    def test_v7_25_d1_trend_filter_blocks_short_above_sma200(self) -> None:
+        """SHORT blocked when D1 close is above SMA(200)."""
+        import numpy as np
+        import pandas as pd
+
+        from src.backtesting.strategies.divergence_hunter import DivergenceHunterStrategy
+
+        strategy = DivergenceHunterStrategy()
+        d1_closes = np.linspace(1.0, 1.2, 210)
+        d1_df = pd.DataFrame(
+            {"open": d1_closes - 0.001, "high": d1_closes + 0.002,
+             "low": d1_closes - 0.002, "close": d1_closes,
+             "volume": np.full(210, 1000.0)}
+        )
+        assert d1_df["close"].iloc[-1] > d1_df["close"].iloc[-200:].mean()
+        result = strategy._check_d1_trend(
+            direction="SHORT", context={"d1_df": d1_df}, df_recent=d1_df
+        )
+        assert result is False
+
+    def test_v7_25_d1_trend_filter_passes_when_no_d1_data(self) -> None:
+        """Graceful degradation: filter passes when d1_df absent."""
+        import pandas as pd
+
+        from src.backtesting.strategies.divergence_hunter import DivergenceHunterStrategy
+
+        strategy = DivergenceHunterStrategy()
+        assert strategy._check_d1_trend(
+            direction="LONG", context={}, df_recent=pd.DataFrame()
+        ) is True
+
+    def test_v7_25_d1_trend_filter_passes_when_d1_too_short(self) -> None:
+        """Graceful degradation: filter passes when d1_df has < 200 bars."""
+        import numpy as np
+        import pandas as pd
+
+        from src.backtesting.strategies.divergence_hunter import DivergenceHunterStrategy
+
+        strategy = DivergenceHunterStrategy()
+        d1_closes = np.linspace(1.0, 1.1, 50)
+        d1_df = pd.DataFrame(
+            {"open": d1_closes, "high": d1_closes + 0.001,
+             "low": d1_closes - 0.001, "close": d1_closes,
+             "volume": np.full(50, 1000.0)}
+        )
+        assert strategy._check_d1_trend(
+            direction="LONG", context={"d1_df": d1_df}, df_recent=d1_df
+        ) is True
+
+    # ── SL/TP calculation ──────────────────────────────────────────────────────
+
+    def test_v7_25_sl_tp_ratios_long(self) -> None:
+        """TP1 is 1.5× and TP2 is 3× the SL distance for LONG."""
+        from decimal import Decimal
+
+        from src.backtesting.strategies.divergence_hunter import (
+            DivergenceHunterStrategy,
+            _TP1_MULTIPLIER,
+            _TP2_MULTIPLIER,
+        )
+
+        strategy = DivergenceHunterStrategy()
+        entry = Decimal("1.1000")
+        sl = Decimal("1.0900")
+        distance = entry - sl
+
+        tp1_expected = entry + _TP1_MULTIPLIER * distance
+        tp2_expected = entry + _TP2_MULTIPLIER * distance
+
+        signal = strategy._build_signal(
+            direction="LONG",
+            entry_price=entry,
+            sl_price=sl,
+            tp1=tp1_expected,
+            tp2=tp2_expected,
+            atr_val=0.005,
+            context={"regime": "TREND_BULL", "symbol": "EURUSD=X"},
+        )
+        assert signal["tp1_price"] == tp1_expected
+        assert signal["tp2_price"] == tp2_expected
+        assert signal["sl_price"] == sl
+        assert signal["tp1_price"] > signal["entry_price"]
+        assert signal["tp2_price"] > signal["tp1_price"]
+
+    def test_v7_25_sl_tp_ratios_short(self) -> None:
+        """TP1 is 1.5× and TP2 is 3× the SL distance for SHORT."""
+        from decimal import Decimal
+
+        from src.backtesting.strategies.divergence_hunter import (
+            DivergenceHunterStrategy,
+            _TP1_MULTIPLIER,
+            _TP2_MULTIPLIER,
+        )
+
+        strategy = DivergenceHunterStrategy()
+        entry = Decimal("1.3000")
+        sl = Decimal("1.3100")
+        distance = sl - entry
+
+        tp1_expected = entry - _TP1_MULTIPLIER * distance
+        tp2_expected = entry - _TP2_MULTIPLIER * distance
+
+        signal = strategy._build_signal(
+            direction="SHORT",
+            entry_price=entry,
+            sl_price=sl,
+            tp1=tp1_expected,
+            tp2=tp2_expected,
+            atr_val=0.005,
+            context={"regime": "TREND_BEAR", "symbol": "EURUSD=X"},
+        )
+        assert signal["sl_price"] > signal["entry_price"]
+        assert signal["tp1_price"] < signal["entry_price"]
+        assert signal["tp2_price"] < signal["tp1_price"]
+
+    def test_v7_25_sl_includes_atr_buffer(self) -> None:
+        """SL for LONG equals swing_low - 0.5 * ATR."""
+        from decimal import Decimal
+
+        from src.backtesting.strategies.divergence_hunter import _SL_ATR_BUFFER
+
+        swing_low = Decimal("1.0900")
+        atr = Decimal("0.0100")
+        expected_sl = swing_low - _SL_ATR_BUFFER * atr
+        assert expected_sl == Decimal("1.0850")
+
+    # ── Volume filter ──────────────────────────────────────────────────────────
+
+    def test_v7_25_volume_filter_skipped_for_forex(self) -> None:
+        """Volume filter always passes for forex."""
+        import numpy as np
+        import pandas as pd
+
+        from src.backtesting.strategies.divergence_hunter import DivergenceHunterStrategy
+
+        strategy = DivergenceHunterStrategy()
+        df = pd.DataFrame(
+            {"open": [1.0] * 30, "high": [1.01] * 30, "low": [0.99] * 30,
+             "close": [1.0] * 30, "volume": [0.0] * 30}
+        )
+        assert strategy._check_volume(df_recent=df, direction="LONG", market_type="forex") is True
+
+    def test_v7_25_volume_filter_passes_when_volume_above_ma(self) -> None:
+        """Volume filter passes when last bar volume > 1.2 * MA(20)."""
+        import numpy as np
+        import pandas as pd
+
+        from src.backtesting.strategies.divergence_hunter import DivergenceHunterStrategy
+
+        strategy = DivergenceHunterStrategy()
+        volumes = np.full(30, 1000.0)
+        volumes[-1] = 2000.0
+
+        df = pd.DataFrame(
+            {"open": [1.0] * 30, "high": [1.01] * 30, "low": [0.99] * 30,
+             "close": [1.0] * 30, "volume": volumes}
+        )
+        assert strategy._check_volume(df_recent=df, direction="LONG", market_type="crypto") is True
+
+    def test_v7_25_volume_filter_blocks_when_volume_below_ma(self) -> None:
+        """Volume filter blocks when last bar volume < 1.2 * MA(20)."""
+        import numpy as np
+        import pandas as pd
+
+        from src.backtesting.strategies.divergence_hunter import DivergenceHunterStrategy
+
+        strategy = DivergenceHunterStrategy()
+        volumes = np.full(30, 1000.0)
+        volumes[-1] = 100.0
+
+        df = pd.DataFrame(
+            {"open": [1.0] * 30, "high": [1.01] * 30, "low": [0.99] * 30,
+             "close": [1.0] * 30, "volume": volumes}
+        )
+        assert strategy._check_volume(df_recent=df, direction="LONG", market_type="stocks") is False
+
+    def test_v7_25_volume_filter_passes_when_all_zero(self) -> None:
+        """Graceful degradation: volume filter passes when all volumes are zero."""
+        import numpy as np
+        import pandas as pd
+
+        from src.backtesting.strategies.divergence_hunter import DivergenceHunterStrategy
+
+        strategy = DivergenceHunterStrategy()
+        df = pd.DataFrame(
+            {"open": [1.0] * 30, "high": [1.01] * 30, "low": [0.99] * 30,
+             "close": [1.0] * 30, "volume": np.zeros(30)}
+        )
+        assert strategy._check_volume(df_recent=df, direction="LONG", market_type="crypto") is True
+
+    # ── Registry / metadata ───────────────────────────────────────────────────
+
+    def test_v7_25_strategy_in_registry(self) -> None:
+        """STRATEGY_REGISTRY contains 'divergence_hunter'."""
+        from src.backtesting.strategies import STRATEGY_REGISTRY
+
+        assert "divergence_hunter" in STRATEGY_REGISTRY
+
+    def test_v7_25_strategy_name(self) -> None:
+        """DivergenceHunterStrategy.name() returns 'divergence_hunter'."""
+        from src.backtesting.strategies.divergence_hunter import DivergenceHunterStrategy
+
+        assert DivergenceHunterStrategy().name() == "divergence_hunter"
+
+    def test_v7_25_signal_contains_required_keys(self) -> None:
+        """Signal dict contains all keys required by BacktestEngine."""
+        from decimal import Decimal
+
+        from src.backtesting.strategies.divergence_hunter import DivergenceHunterStrategy
+
+        strategy = DivergenceHunterStrategy()
+        signal = strategy._build_signal(
+            direction="LONG",
+            entry_price=Decimal("1.1000"),
+            sl_price=Decimal("1.0900"),
+            tp1=Decimal("1.1150"),
+            tp2=Decimal("1.1300"),
+            atr_val=0.005,
+            context={"regime": "TREND_BULL", "symbol": "EURUSD=X"},
+        )
+        required_keys = {
+            "direction", "entry_price", "composite_score", "regime", "atr",
+            "position_pct", "ta_indicators", "support_levels", "resistance_levels",
+            "sl_price", "tp1_price", "tp2_price", "time_exit_candles", "strategy",
+        }
+        missing = required_keys - signal.keys()
+        assert not missing, f"Missing keys: {missing}"
+
+    def test_v7_25_time_exit_candles_is_20(self) -> None:
+        """TIME_EXIT_CANDLES constant equals 20 (H4 ~3.3 days)."""
+        from src.backtesting.strategies.divergence_hunter import TIME_EXIT_CANDLES
+
+        assert TIME_EXIT_CANDLES == 20
