@@ -7130,3 +7130,302 @@ class TestV725DivergenceHunterStrategy:
         from src.backtesting.strategies.divergence_hunter import TIME_EXIT_CANDLES
 
         assert TIME_EXIT_CANDLES == 20
+
+
+# ── TASK-V7-24: GoldMacroStrategy ─────────────────────────────────────────────
+
+
+def _make_gold_df(
+    n: int = 120,
+    base_price: float = 1950.0,
+    trend: str = "up",
+) -> pd.DataFrame:
+    """Build a synthetic GC=F OHLCV DataFrame for GoldMacroStrategy tests.
+
+    Uses lowercase column names matching BacktestEngine convention.
+    trend="up"   -> prices rise by 0.5 per bar
+    trend="down" -> prices fall by 0.5 per bar
+    trend="flat" -> prices stay near base_price
+    """
+    if trend == "up":
+        drift = 0.5
+    elif trend == "down":
+        drift = -0.5
+    else:
+        drift = 0.0
+
+    prices = [max(base_price + drift * i, 1.0) for i in range(n)]
+    spread = 2.0  # $2 spread for gold
+
+    return pd.DataFrame(
+        {
+            "open": [p - spread * 0.5 for p in prices],
+            "high": [p + spread for p in prices],
+            "low": [p - spread for p in prices],
+            "close": prices,
+            "volume": [10000.0] * n,
+        }
+    )
+
+
+def _make_vix_row_24(value: float, days_ago: int = 1) -> MagicMock:
+    """Build a mock macro_data row representing a VIXCLS observation."""
+    row = MagicMock()
+    row.indicator_name = "VIXCLS"
+    row.value = Decimal(str(value))
+    row.release_date = (
+        datetime.datetime(2024, 6, 1, tzinfo=datetime.timezone.utc)
+        - datetime.timedelta(days=days_ago)
+    )
+    return row
+
+
+def _make_gold_context(
+    df: pd.DataFrame,
+    vix_values: list,
+    dxy_rsi: Optional[float],
+    symbol: str = "GC=F",
+    adx: float = 25.0,
+    atr: float = 20.0,
+    candle_ts: Optional[datetime.datetime] = None,
+) -> dict:
+    """Build a minimal context dict for GoldMacroStrategy.check_entry()."""
+    if candle_ts is None:
+        candle_ts = datetime.datetime(2024, 6, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+
+    # Build VIX macro rows: index 0 = oldest, index -1 = most recent (before candle_ts)
+    macro_data = []
+    for i, val in enumerate(vix_values):
+        days_ago = len(vix_values) - i  # oldest = most days ago
+        macro_data.append(_make_vix_row_24(val, days_ago=days_ago))
+
+    return {
+        "symbol": symbol,
+        "market_type": "stocks",
+        "timeframe": "D1",
+        "regime": "STRONG_TREND_BULL",
+        "df": df,
+        "ta_indicators": {"adx": adx},
+        "atr_value": atr,
+        "dxy_rsi": dxy_rsi,
+        "macro_data": macro_data,
+        "candle_ts": candle_ts,
+        "fear_greed": None,
+        "geo_score": None,
+        "central_bank_rates": {},
+    }
+
+
+class TestV724GoldMacroStrategy:
+    """Unit tests for GoldMacroStrategy (TASK-V7-24)."""
+
+    def test_v7_24_long_risk_off_condition_a(self) -> None:
+        """LONG entry when risk-off Condition A is satisfied.
+
+        Condition A: VIX > 20 AND rising (2-day change > +2),
+                     DXY RSI < 50, GC=F > SMA(50).
+        """
+        from src.backtesting.strategies.gold_macro import GoldMacroStrategy
+
+        strategy = GoldMacroStrategy()
+        # Uptrend so current price > SMA(50)
+        df = _make_gold_df(n=120, trend="up")
+
+        # VIX: was 21, now 24 -> change = +3 > 2 (risk-off, rising)
+        ctx = _make_gold_context(
+            df=df,
+            vix_values=[21.0, 24.0],
+            dxy_rsi=45.0,  # < 50 -- DXY momentum weak
+        )
+        result = strategy.check_entry(ctx)
+        assert result is not None, "Expected LONG signal on risk-off Condition A"
+        assert result["direction"] == "LONG"
+
+    def test_v7_24_long_real_rate_decline_condition_b(self) -> None:
+        """LONG entry when real rate decline Condition B is satisfied.
+
+        Condition B: DXY RSI < 50 (DXY bearish momentum),
+                     GC=F breaks 10-day high, ADX > 20.
+        """
+        from src.backtesting.strategies.gold_macro import GoldMacroStrategy
+
+        strategy = GoldMacroStrategy()
+        # Uptrend: current bar is all-time high -- definitely breaks 10-day high
+        df = _make_gold_df(n=120, trend="up")
+
+        # VIX not risk-off (VIX < 20, barely rising < 2) -- only Condition B fires
+        ctx = _make_gold_context(
+            df=df,
+            vix_values=[12.0, 12.5],   # VIX < 20, rising only +0.5 < 2
+            dxy_rsi=44.0,               # < 50 -- DXY bearish momentum
+            adx=28.0,                   # > 20
+        )
+        result = strategy.check_entry(ctx)
+        assert result is not None, "Expected LONG signal on Condition B (real rate decline)"
+        assert result["direction"] == "LONG"
+
+    def test_v7_24_short_risk_on_condition(self) -> None:
+        """SHORT entry when risk-on conditions are satisfied.
+
+        SHORT: VIX < 15 AND declining, DXY RSI > 55, GC=F < SMA(50).
+        """
+        from src.backtesting.strategies.gold_macro import GoldMacroStrategy
+
+        strategy = GoldMacroStrategy()
+        # Downtrend: by bar ~100 current price is well below SMA(50)
+        df = _make_gold_df(n=120, base_price=2100.0, trend="down")
+
+        # VIX: was 16, now 13 -> declining, below 15
+        ctx = _make_gold_context(
+            df=df,
+            vix_values=[16.0, 13.0],
+            dxy_rsi=60.0,   # > 55 -- strong DXY
+        )
+        result = strategy.check_entry(ctx)
+        assert result is not None, "Expected SHORT signal on risk-on condition"
+        assert result["direction"] == "SHORT"
+
+    def test_v7_24_no_entry_for_non_gold_symbol(self) -> None:
+        """Strategy must return None for symbols other than GC=F."""
+        from src.backtesting.strategies.gold_macro import GoldMacroStrategy
+
+        strategy = GoldMacroStrategy()
+        df = _make_gold_df(n=120, trend="up")
+
+        ctx = _make_gold_context(
+            df=df,
+            vix_values=[22.0, 25.0],
+            dxy_rsi=42.0,
+            symbol="EURUSD=X",  # wrong symbol
+        )
+        result = strategy.check_entry(ctx)
+        assert result is None, "Should not signal for non-GC=F symbol"
+
+    def test_v7_24_no_entry_when_vix_data_unavailable(self) -> None:
+        """Strategy returns None (graceful degradation) when VIX macro_data is empty."""
+        from src.backtesting.strategies.gold_macro import GoldMacroStrategy
+
+        strategy = GoldMacroStrategy()
+        df = _make_gold_df(n=120, trend="up")
+
+        ctx = _make_gold_context(
+            df=df,
+            vix_values=[],   # no VIX data at all
+            dxy_rsi=42.0,
+        )
+        result = strategy.check_entry(ctx)
+        assert result is None, "Should return None when VIX data unavailable"
+
+    def test_v7_24_no_entry_when_only_one_vix_observation(self) -> None:
+        """Strategy needs at least 2 VIX observations to compute 2-day change."""
+        from src.backtesting.strategies.gold_macro import GoldMacroStrategy
+
+        strategy = GoldMacroStrategy()
+        df = _make_gold_df(n=120, trend="up")
+
+        ctx = _make_gold_context(
+            df=df,
+            vix_values=[22.0],  # only 1 observation -- cannot compute change
+            dxy_rsi=42.0,
+        )
+        result = strategy.check_entry(ctx)
+        assert result is None, "Should return None with only 1 VIX observation"
+
+    def test_v7_24_no_entry_when_dxy_rsi_unavailable(self) -> None:
+        """Strategy returns None (graceful degradation) when DXY RSI is None."""
+        from src.backtesting.strategies.gold_macro import GoldMacroStrategy
+
+        strategy = GoldMacroStrategy()
+        df = _make_gold_df(n=120, trend="up")
+        candle_ts = datetime.datetime(2024, 6, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+        macro_data = [_make_vix_row_24(22.0, 2), _make_vix_row_24(25.0, 1)]
+
+        ctx = {
+            "symbol": "GC=F",
+            "market_type": "stocks",
+            "timeframe": "D1",
+            "regime": "STRONG_TREND_BULL",
+            "df": df,
+            "ta_indicators": {},   # no dxy_rsi key
+            "atr_value": 20.0,
+            "dxy_rsi": None,       # explicitly None
+            "macro_data": macro_data,
+            "candle_ts": candle_ts,
+        }
+        result = strategy.check_entry(ctx)
+        assert result is None, "Should return None when DXY RSI is unavailable"
+
+    def test_v7_24_sl_tp_calculation(self) -> None:
+        """Signal contains correct ATR value and SL/TP multipliers per spec (2.5 / 3.5)."""
+        from src.backtesting.strategies.gold_macro import (
+            GoldMacroStrategy,
+            SL_ATR_MULTIPLIER,
+            TP_ATR_MULTIPLIER,
+        )
+
+        strategy = GoldMacroStrategy()
+        df = _make_gold_df(n=120, trend="up")
+        atr = 18.5
+
+        ctx = _make_gold_context(
+            df=df,
+            vix_values=[21.0, 24.0],
+            dxy_rsi=44.0,
+            atr=atr,
+        )
+        result = strategy.check_entry(ctx)
+        assert result is not None, "Need a signal to verify SL/TP multipliers"
+
+        assert result["atr"] == Decimal(str(round(atr, 5)))
+        assert result["sl_atr_multiplier"] == SL_ATR_MULTIPLIER
+        assert result["tp_atr_multiplier"] == TP_ATR_MULTIPLIER
+        assert SL_ATR_MULTIPLIER == Decimal("2.5"), "SL multiplier must be 2.5 per spec"
+        assert TP_ATR_MULTIPLIER == Decimal("3.5"), "TP multiplier must be 3.5 per spec"
+
+    def test_v7_24_strategy_name(self) -> None:
+        """Strategy name must be 'gold_macro'."""
+        from src.backtesting.strategies.gold_macro import GoldMacroStrategy
+
+        assert GoldMacroStrategy().name() == "gold_macro"
+
+    def test_v7_24_registry_contains_gold_macro(self) -> None:
+        """STRATEGY_REGISTRY must map 'gold_macro' to GoldMacroStrategy."""
+        from src.backtesting.strategies import STRATEGY_REGISTRY, GoldMacroStrategy
+
+        assert "gold_macro" in STRATEGY_REGISTRY
+        assert STRATEGY_REGISTRY["gold_macro"] is GoldMacroStrategy
+
+    def test_v7_24_no_entry_insufficient_price_history(self) -> None:
+        """Returns None when price history is shorter than SMA(50) + 1 bars."""
+        from src.backtesting.strategies.gold_macro import GoldMacroStrategy
+
+        strategy = GoldMacroStrategy()
+        df = _make_gold_df(n=30, trend="up")  # only 30 bars, need SMA_PERIOD + 1 = 51
+
+        ctx = _make_gold_context(
+            df=df,
+            vix_values=[21.0, 25.0],
+            dxy_rsi=44.0,
+        )
+        result = strategy.check_entry(ctx)
+        assert result is None, "Should return None when not enough price bars"
+
+    def test_v7_24_no_entry_neutral_conditions(self) -> None:
+        """No entry when neither LONG nor SHORT conditions are met.
+
+        VIX in neutral band (15-20), DXY RSI neutral (50-55),
+        flat price means above_sma50 == False and below_sma50 == False.
+        """
+        from src.backtesting.strategies.gold_macro import GoldMacroStrategy
+
+        strategy = GoldMacroStrategy()
+        df = _make_gold_df(n=120, trend="flat")
+
+        ctx = _make_gold_context(
+            df=df,
+            vix_values=[17.0, 17.5],  # 15 < VIX < 20, rising only +0.5 < 2
+            dxy_rsi=52.0,              # neutral 50-55
+        )
+        result = strategy.check_entry(ctx)
+        # flat trend: close == base_price == sma50, above_sma50 = False
+        assert result is None, "Expected no signal in neutral market conditions"
