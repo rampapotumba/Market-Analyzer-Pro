@@ -83,19 +83,22 @@ _DEFAULT_TP2_RR = 3.5
 # ── SIM-18: Dynamic R:R table per market regime ───────────────────────────────
 # target_rr: TP1 = entry ± SL_distance × target_rr
 # min_rr:    reject level-snap if it would reduce R:R below this threshold
+# V6-CAL2-05: R:R ratios reduced by ~30% across all regimes.
+# Motivation: 75% trades exit by time_exit, only 10% reach TP.
+# TP targets were too far — price doesn't reach TP within 24 candles.
 REGIME_RR_MAP: dict[str, dict[str, float]] = {
-    "STRONG_TREND_BULL": {"min_rr": 2.0, "target_rr": 2.5},
-    "STRONG_TREND_BEAR": {"min_rr": 2.0, "target_rr": 2.5},
-    "TREND_BULL":        {"min_rr": 1.5, "target_rr": 2.0},
-    "TREND_BEAR":        {"min_rr": 1.5, "target_rr": 2.0},
-    "RANGING":           {"min_rr": 1.0, "target_rr": 1.3},
-    "VOLATILE":          {"min_rr": 1.5, "target_rr": 2.0},
-    "DEFAULT":           {"min_rr": 1.3, "target_rr": 1.5},
-    # Legacy aliases
-    "WEAK_TREND_BULL":   {"min_rr": 1.5, "target_rr": 2.0},
-    "WEAK_TREND_BEAR":   {"min_rr": 1.5, "target_rr": 2.0},
-    "HIGH_VOLATILITY":   {"min_rr": 1.5, "target_rr": 2.0},
-    "LOW_VOLATILITY":    {"min_rr": 1.3, "target_rr": 1.5},
+    "STRONG_TREND_BULL": {"min_rr": 1.4, "target_rr": 1.75},   # was 2.0/2.5
+    "STRONG_TREND_BEAR": {"min_rr": 1.4, "target_rr": 1.75},   # was 2.0/2.5
+    "TREND_BULL":        {"min_rr": 1.0, "target_rr": 1.4},    # was 1.5/2.0
+    "TREND_BEAR":        {"min_rr": 1.0, "target_rr": 1.4},    # was 1.5/2.0
+    "RANGING":           {"min_rr": 0.7, "target_rr": 0.9},    # was 1.0/1.3
+    "VOLATILE":          {"min_rr": 1.0, "target_rr": 1.4},    # was 1.5/2.0
+    "DEFAULT":           {"min_rr": 0.9, "target_rr": 1.05},   # was 1.3/1.5
+    # Legacy aliases — same reduction
+    "WEAK_TREND_BULL":   {"min_rr": 1.0, "target_rr": 1.4},
+    "WEAK_TREND_BEAR":   {"min_rr": 1.0, "target_rr": 1.4},
+    "HIGH_VOLATILITY":   {"min_rr": 1.0, "target_rr": 1.4},
+    "LOW_VOLATILITY":    {"min_rr": 0.9, "target_rr": 1.05},
 }
 
 _TP_SNAP_BAND = Decimal("0.20")  # ±20% of tp1 — look for S/R to snap to

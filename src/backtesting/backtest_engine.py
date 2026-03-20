@@ -101,6 +101,11 @@ _COOLDOWN_MINUTES: dict[str, int] = {
 # Mirrors TIME_EXIT_CANDLES in config.py.
 _TIME_EXIT_CANDLES: dict[str, int] = {"H1": 24, "H4": 20, "D1": 10}
 
+# CAL2-06: Trailing stop constants.
+# When MFE >= 50% of TP distance, move SL to lock 20% of TP distance profit.
+_TRAILING_STOP_MFE_TRIGGER = Decimal("0.5")   # activate when MFE >= 50% of TP dist
+_TRAILING_STOP_LOCK_RATIO = Decimal("0.2")    # lock entry + 20% of TP dist
+
 # EU/NA forex pairs blocked during Asian low-liquidity session (00:00–06:59 UTC)
 # mirrors SignalEngine._FOREX_PAIRS_EU_NA + _is_low_liquidity_session
 _FOREX_PAIRS_EU_NA: frozenset[str] = frozenset({
@@ -277,10 +282,14 @@ def _compute_summary(
     losses = [t for t in metric_trades if t.result == "loss"]
 
     win_rate = (len(wins) / metric_total * 100) if metric_total > 0 else 0.0
-    total_pnl = sum(float(t.pnl_usd or 0) for t in trades)  # total PnL includes eod
+    # CAL2-01: total_pnl excludes end_of_data trades — these are unrealised positions,
+    # not real exits. Including them inflated PF/PnL by ~37% in v6-cal-r1 backtest.
+    total_pnl = sum(float(t.pnl_usd or 0) for t in metric_trades)
+    total_pnl_incl_eod = sum(float(t.pnl_usd or 0) for t in trades)
     gross_win = sum(float(t.pnl_usd or 0) for t in wins)
     gross_loss = abs(sum(float(t.pnl_usd or 0) for t in losses))
     profit_factor = (gross_win / gross_loss) if gross_loss > 0 else None
+    eod_warning = total > 0 and len(eod_trades) / total > 0.05
 
     avg_dur = (
         sum(t.duration_minutes or 0 for t in metric_trades) / metric_total
@@ -331,9 +340,9 @@ def _compute_summary(
             monthly[key]["pnl_usd"] += float(t.pnl_usd or 0)
             monthly[key]["trades"] += 1
 
-    # By symbol
+    # By symbol — CAL2-02: exclude end_of_data trades, add win_rate_pct
     by_symbol: dict[str, dict] = {}
-    for t in trades:
+    for t in metric_trades:
         s = t.symbol
         if s not in by_symbol:
             by_symbol[s] = {"trades": 0, "wins": 0, "pnl_usd": 0.0}
@@ -341,6 +350,33 @@ def _compute_summary(
         if t.result == "win":
             by_symbol[s]["wins"] += 1
         by_symbol[s]["pnl_usd"] += float(t.pnl_usd or 0)
+    # Add win_rate_pct to each symbol entry
+    for s, d in by_symbol.items():
+        d["win_rate_pct"] = round(d["wins"] / d["trades"] * 100, 2) if d["trades"] > 0 else 0.0
+
+    # CAL2-09: Concentration risk warning
+    concentration_warning: Optional[str] = None
+    if by_symbol and total_pnl > 0:
+        symbol_pnls = sorted(
+            [(s, d["pnl_usd"]) for s, d in by_symbol.items()],
+            key=lambda x: x[1], reverse=True,
+        )
+        top1_pct = symbol_pnls[0][1] / total_pnl * 100 if total_pnl > 0 else 0
+        top2_pct = (
+            (symbol_pnls[0][1] + symbol_pnls[1][1]) / total_pnl * 100
+            if len(symbol_pnls) >= 2 and total_pnl > 0 else top1_pct
+        )
+        concentration_warnings: list[str] = []
+        if top1_pct > 40:
+            concentration_warnings.append(
+                f"{symbol_pnls[0][0]} contributes {top1_pct:.1f}% of PnL"
+            )
+        if top2_pct > 70:
+            concentration_warnings.append(
+                f"Top 2 instruments contribute {top2_pct:.1f}% of PnL"
+            )
+        if concentration_warnings:
+            concentration_warning = "; ".join(concentration_warnings)
 
     # By score bucket (mirrors SIM-14 buckets, unscaled — kept for backward compatibility)
     def _score_bucket(score: Optional[Decimal]) -> str:
@@ -425,9 +461,9 @@ def _compute_summary(
     avg_win_dur = sum(win_durations) / len(win_durations) if win_durations else 0.0
     avg_loss_dur = sum(loss_durations) / len(loss_durations) if loss_durations else 0.0
 
-    # By weekday
+    # By weekday — CAL2-02: exclude end_of_data trades
     by_weekday: dict[str, dict] = {}
-    for t in trades:
+    for t in metric_trades:
         if t.entry_at:
             wd = str(t.entry_at.weekday())  # 0=Mon..4=Fri
             if wd not in by_weekday:
@@ -455,9 +491,9 @@ def _compute_summary(
         for hr, v in by_hour.items()
     }
 
-    # By regime
+    # By regime — CAL2-02: exclude end_of_data trades
     by_regime: dict[str, dict] = {}
-    for t in trades:
+    for t in metric_trades:
         regime_key = getattr(t, "regime", None) or "UNKNOWN"
         if regime_key not in by_regime:
             by_regime[regime_key] = {"trades": 0, "wins": 0, "pnl_usd": 0.0}
@@ -471,6 +507,8 @@ def _compute_summary(
     tp_hit_count = sum(1 for t in trades if t.exit_reason == "tp_hit")
     mae_exit_count = sum(1 for t in trades if t.exit_reason == "mae_exit")
     time_exit_count = sum(1 for t in trades if t.exit_reason == "time_exit")
+    # CAL2-06: trailing stop count
+    trailing_stop_count = sum(1 for t in trades if t.exit_reason == "trailing_stop")
 
     # V6-CAL-07: MAE as percentage of SL distance (not raw price units).
     # mae / sl_distance * 100 gives real % — how far price moved against position
@@ -529,7 +567,12 @@ def _compute_summary(
         "total_trades_excl_eod": metric_total,
         "win_rate_pct": round(win_rate, 2),
         "profit_factor": round(profit_factor, 4) if profit_factor is not None else None,
+        # CAL2-01: total_pnl_usd excludes end_of_data (real metric)
         "total_pnl_usd": round(total_pnl, 4),
+        # CAL2-01: full PnL including end_of_data for reference
+        "total_pnl_usd_incl_eod": round(total_pnl_incl_eod, 4),
+        # CAL2-01: warning flag when end_of_data > 5% of total trades
+        "eod_warning": eod_warning,
         "max_drawdown_pct": round(max_dd, 4),
         "avg_duration_minutes": round(avg_dur, 1),
         "long_count": long_count,
@@ -552,6 +595,8 @@ def _compute_summary(
         "tp_hit_count": tp_hit_count,
         "mae_exit_count": mae_exit_count,
         "time_exit_count": time_exit_count,
+        # CAL2-06: trailing stop exits
+        "trailing_stop_count": trailing_stop_count,
         # V6-CAL-07: MAE as % of SL distance (fixed from raw price units)
         "avg_mae_pct_of_sl": round(avg_mae_pct_of_sl, 2),
         "avg_mae_pct_of_sl_winners": round(avg_mae_pct_of_sl_winners, 2),
@@ -561,6 +606,8 @@ def _compute_summary(
         # V6 TASK-V6-12: end_of_data trades reported separately
         "end_of_data_count": len(eod_trades),
         "end_of_data_pnl": round(sum(float(t.pnl_usd or 0) for t in eod_trades), 4),
+        # CAL2-09: concentration risk warning
+        "concentration_warning": concentration_warning,
     }
 
     # V6 TASK-V6-10: merge filter diagnostics into summary if provided
@@ -1347,6 +1394,8 @@ class BacktestEngine:
                 "regime": signal["regime"],
                 # V6 TASK-V6-11: track bar index for time/MAE exit
                 "entry_bar_index": i + 1,  # entry happens at next_candle (i+1)
+                # CAL2-06: trailing stop tracking
+                "trailing_sl_active": False,
             }
             # Skip to next candle
             i += 1
@@ -1418,6 +1467,28 @@ class BacktestEngine:
         candle_close = Decimal(str(candle.close))
         timeframe = open_trade.get("timeframe", "H1")
 
+        exit_price: Optional[Decimal] = None
+        exit_reason: Optional[str] = None
+
+        # CAL2-06: Trailing stop activation.
+        # When MFE >= 50% of TP distance, move SL to entry + 20% of TP dist.
+        # Runs FIRST so that SL check below uses the updated (trailing) SL level.
+        tp_distance = abs(tp - entry)
+        mfe_current = Decimal(str(open_trade.get("mfe", 0)))
+        if (
+            tp_distance > Decimal("0")
+            and mfe_current >= tp_distance * _TRAILING_STOP_MFE_TRIGGER
+            and not open_trade.get("trailing_sl_active")
+        ):
+            if direction == "LONG":
+                trailing_sl_new = entry + tp_distance * _TRAILING_STOP_LOCK_RATIO
+            else:
+                trailing_sl_new = entry - tp_distance * _TRAILING_STOP_LOCK_RATIO
+            open_trade["trailing_sl_active"] = True
+            open_trade["stop_loss"] = trailing_sl_new
+            # Update sl to the new trailing value for this candle's hit check
+            sl = trailing_sl_new
+
         sl_hit = False
         tp_hit = False
 
@@ -1428,16 +1499,14 @@ class BacktestEngine:
             sl_hit = candle_high >= sl
             tp_hit = candle_low <= tp
 
-        exit_price: Optional[Decimal] = None
-        exit_reason: Optional[str] = None
-
         if sl_hit or tp_hit:
             # Worst case (SIM-06): if both hit → SL
             if sl_hit:
                 exit_price = sl
                 if apply_slippage:
                     exit_price = _compute_sl_exit_price(sl, direction, market_type, entry)
-                exit_reason = "sl_hit"
+                # CAL2-06: if trailing was active, label as trailing_stop
+                exit_reason = "trailing_stop" if open_trade.get("trailing_sl_active") else "sl_hit"
             else:
                 exit_price = tp
                 exit_reason = "tp_hit"

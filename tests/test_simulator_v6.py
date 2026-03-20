@@ -690,54 +690,57 @@ class TestV607CalendarFilter:
 
 
 class TestV608ShortQuality:
-    """TASK-V6-08: Asymmetric SHORT threshold (×1.2) and stricter RSI (< 40)."""
+    """TASK-V6-08: Asymmetric SHORT threshold and stricter RSI (< 30).
+
+    V6-CAL2-03: SHORT_SCORE_MULTIPLIER reduced from 2.0 to 1.3 to allow SHORT trades.
+    """
 
     def test_v6_08_short_threshold_multiplied(self) -> None:
-        """SHORT effective_threshold = base * available_weight * 2.0 (CAL-04 raised from 1.2).
+        """SHORT effective_threshold = base * available_weight * 1.3 (CAL2-03 reduced from 2.0).
 
-        Live mode: threshold = 15 * 1.0 * 2.0 = 30.0.
-        composite=-28.0 → abs=28 < 30 → blocked.
+        Live mode: threshold = 15 * 1.0 * 1.3 = 19.5.
+        composite=-18.0 → abs=18 < 19.5 → blocked.
         """
         from src.signals.filter_pipeline import SignalFilterPipeline
 
         pipeline = SignalFilterPipeline()
-        # Global threshold 15, scale=1.0, multiplier=2.0 → effective=30.0
-        # composite=-28.0 → abs=28 < 30 → blocked
+        # Global threshold 15, scale=1.0, multiplier=1.3 → effective=19.5
+        # composite=-18.0 → abs=18 < 19.5 → blocked
         passed, reason = pipeline.check_score_threshold(
-            -28.0, "forex", "EURUSD=X", available_weight=1.0, direction="SHORT"
+            -18.0, "forex", "EURUSD=X", available_weight=1.0, direction="SHORT"
         )
-        assert not passed, f"Expected SHORT composite=-28 to be blocked (threshold=30), got pass"
+        assert not passed, f"Expected SHORT composite=-18 to be blocked (threshold=19.5), got pass"
         assert "score_below_threshold" in reason
 
     def test_v6_08_short_passes_above_threshold(self) -> None:
-        """SHORT with composite=-31 passes threshold of 30.0 (CAL-04: 15*1.0*2.0=30)."""
+        """SHORT with composite=-20 passes threshold of 19.5 (CAL2-03: 15*1.0*1.3=19.5)."""
         from src.signals.filter_pipeline import SignalFilterPipeline
 
         pipeline = SignalFilterPipeline()
         passed, reason = pipeline.check_score_threshold(
-            -31.0, "forex", "EURUSD=X", available_weight=1.0, direction="SHORT"
+            -20.0, "forex", "EURUSD=X", available_weight=1.0, direction="SHORT"
         )
-        assert passed, f"Expected SHORT composite=-31 to pass (threshold=30), got: {reason}"
+        assert passed, f"Expected SHORT composite=-20 to pass (threshold=19.5), got: {reason}"
 
     def test_v6_08_short_threshold_with_scale(self) -> None:
-        """SHORT in backtest: threshold = 15 * 0.65 * 2.0 = 19.5 (with CAL-01 floor).
+        """SHORT in backtest: threshold = 15 * 0.65 * 1.3 = 12.675 (with CAL-01 floor, CAL2-03 multiplier).
 
-        Note: CAL-01 raises floor from 0.45 to 0.65, CAL-04 raises multiplier to 2.0.
+        Note: CAL-01 raises floor from 0.45 to 0.65, CAL2-03 lowers multiplier from 2.0 to 1.3.
         """
         from src.signals.filter_pipeline import SignalFilterPipeline
 
         pipeline = SignalFilterPipeline()
-        # composite=-19.0, effective = 15 * 0.65 * 2.0 = 19.5 → blocked
+        # composite=-12.0, effective = 15 * 0.65 * 1.3 = 12.675 → blocked
         passed, _ = pipeline.check_score_threshold(
-            -19.0, "forex", "EURUSD=X", available_weight=0.45, direction="SHORT"
+            -12.0, "forex", "EURUSD=X", available_weight=0.45, direction="SHORT"
         )
         assert not passed
 
-        # composite=-20.0, effective=19.5 → pass
+        # composite=-13.0, effective=12.675 → pass
         passed, reason = pipeline.check_score_threshold(
-            -20.0, "forex", "EURUSD=X", available_weight=0.45, direction="SHORT"
+            -13.0, "forex", "EURUSD=X", available_weight=0.45, direction="SHORT"
         )
-        assert passed, f"Expected pass for SHORT composite=-20.0 (threshold=19.5), got: {reason}"
+        assert passed, f"Expected pass for SHORT composite=-13.0 (threshold=12.675), got: {reason}"
 
     def test_v6_08_long_threshold_unaffected(self) -> None:
         """LONG threshold is not modified by SHORT multiplier."""
@@ -791,10 +794,13 @@ class TestV608ShortQuality:
         assert not passed, "LONG RSI=49 should be blocked"
 
     def test_v6_08_short_config_constants(self) -> None:
-        """Config has SHORT_SCORE_MULTIPLIER=2.0 and SHORT_RSI_THRESHOLD=30 (after CAL-04)."""
+        """Config has SHORT_SCORE_MULTIPLIER=1.3 (V6-CAL2-03) and SHORT_RSI_THRESHOLD=30."""
         from src.config import SHORT_RSI_THRESHOLD, SHORT_SCORE_MULTIPLIER
 
-        assert SHORT_SCORE_MULTIPLIER == 2.0, f"Expected 2.0 (CAL-04), got {SHORT_SCORE_MULTIPLIER}"
+        # V6-CAL2-03: reduced from 2.0 to 1.3 to allow SHORT trades in backtest
+        assert SHORT_SCORE_MULTIPLIER == pytest.approx(1.3), (
+            f"Expected 1.3 (V6-CAL2-03 reduced from 2.0), got {SHORT_SCORE_MULTIPLIER}"
+        )
         assert SHORT_RSI_THRESHOLD == 30, f"Expected 30 (CAL-04), got {SHORT_RSI_THRESHOLD}"
 
 
@@ -811,18 +817,20 @@ class TestV609SpyOverride:
         assert "SPY" in INSTRUMENT_OVERRIDES, "SPY must be in INSTRUMENT_OVERRIDES"
 
     def test_v6_09_spy_min_composite_score(self) -> None:
-        """SPY min_composite_score = 30 (raised from 25 by CAL-06)."""
+        """SPY min_composite_score = 22 (V6-CAL2-08: relaxed from 30 to allow more trades)."""
         from src.config import INSTRUMENT_OVERRIDES
 
         score = INSTRUMENT_OVERRIDES["SPY"].get("min_composite_score")
-        assert score == 30, f"Expected SPY min_composite_score=30 (CAL-06), got {score}"
+        assert score == 22, f"Expected SPY min_composite_score=22 (V6-CAL2-08), got {score}"
 
     def test_v6_09_spy_regime_restricted(self) -> None:
-        """SPY is restricted to STRONG_TREND_BULL only (CAL-06: removed STRONG_TREND_BEAR)."""
+        """SPY is restricted to STRONG_TREND_BULL and VOLATILE (V6-CAL2-08: VOLATILE added)."""
         from src.config import INSTRUMENT_OVERRIDES
 
         allowed = INSTRUMENT_OVERRIDES["SPY"].get("allowed_regimes", [])
         assert "STRONG_TREND_BULL" in allowed
+        # V6-CAL2-08: VOLATILE added to allow more trades
+        assert "VOLATILE" in allowed
         # RANGING and TREND_BULL should NOT be allowed
         assert "RANGING" not in allowed
         assert "TREND_BULL" not in allowed
@@ -854,31 +862,31 @@ class TestV609SpyOverride:
         assert passed, f"Expected STRONG_TREND_BULL to pass for SPY, got: {reason}"
 
     def test_v6_09_spy_high_score_required(self) -> None:
-        """SPY composite=29 (< 30) is blocked even with scale=1.0 (CAL-06: raised to 30)."""
+        """SPY composite=21 (< 22) is blocked even with scale=1.0 (V6-CAL2-08: 22)."""
         from src.signals.filter_pipeline import SignalFilterPipeline
 
         pipeline = SignalFilterPipeline()
         passed, reason = pipeline.check_score_threshold(
-            29.0, "stocks", "SPY", available_weight=1.0
+            21.0, "stocks", "SPY", available_weight=1.0
         )
-        assert not passed, f"Expected SPY composite=29 to be blocked (threshold=30), got pass"
+        assert not passed, f"Expected SPY composite=21 to be blocked (threshold=22), got pass"
 
     def test_v6_09_spy_scaled_threshold(self) -> None:
-        """SPY in backtest: threshold = 30 * 0.65 = 19.5 (with CAL-01 floor)."""
+        """SPY in backtest: threshold = 22 * 0.65 = 14.3 (with CAL-01 floor, V6-CAL2-08 score=22)."""
         from src.signals.filter_pipeline import SignalFilterPipeline
 
         pipeline = SignalFilterPipeline()
-        # composite=19.0 < 19.5 → blocked
+        # composite=14.0 < 14.3 → blocked
         passed, _ = pipeline.check_score_threshold(
-            19.0, "stocks", "SPY", available_weight=0.45
+            14.0, "stocks", "SPY", available_weight=0.45
         )
         assert not passed
 
-        # composite=20.0 >= 19.5 → pass
+        # composite=15.0 >= 14.3 → pass
         passed, reason = pipeline.check_score_threshold(
-            20.0, "stocks", "SPY", available_weight=0.45
+            15.0, "stocks", "SPY", available_weight=0.45
         )
-        assert passed, f"Expected SPY composite=20.0 to pass at scale=0.65 (floor), got: {reason}"
+        assert passed, f"Expected SPY composite=15.0 to pass at scale=0.65 (floor), got: {reason}"
 
 
 # ── TASK-V6-10: Filter diagnostics (rejection counters) ──────────────────────
@@ -1543,13 +1551,16 @@ class TestV6Cal02BearRegimes:
         assert "regime_blocked" in reason
 
     def test_v6_cal_02_bull_regimes_pass(self) -> None:
-        """TREND_BULL and STRONG_TREND_BULL are not blocked."""
+        """STRONG_TREND_BULL passes; TREND_BULL is blocked (V6-CAL2-07: added to BLOCKED_REGIMES)."""
         from src.signals.filter_pipeline import SignalFilterPipeline
 
         pipeline = SignalFilterPipeline()
-        for regime in ("TREND_BULL", "STRONG_TREND_BULL"):
-            passed, reason = pipeline.check_regime(regime, "EURUSD=X")
-            assert passed, f"Expected {regime} to pass, got: {reason}"
+        # STRONG_TREND_BULL is still allowed
+        passed, reason = pipeline.check_regime("STRONG_TREND_BULL", "EURUSD=X")
+        assert passed, f"Expected STRONG_TREND_BULL to pass, got: {reason}"
+        # TREND_BULL now blocked (V6-CAL2-07)
+        passed, reason = pipeline.check_regime("TREND_BULL", "EURUSD=X")
+        assert not passed, f"Expected TREND_BULL to be blocked (V6-CAL2-07), got: {reason}"
 
     def test_v6_cal_02_volatile_passes(self) -> None:
         """VOLATILE regime is not blocked."""
@@ -1560,13 +1571,17 @@ class TestV6Cal02BearRegimes:
         assert passed, f"Expected VOLATILE to pass, got: {reason}"
 
     def test_v6_cal_02_blocked_regimes_config(self) -> None:
-        """BLOCKED_REGIMES contains exactly RANGING, TREND_BEAR, STRONG_TREND_BEAR."""
+        """BLOCKED_REGIMES contains RANGING, TREND_BEAR, STRONG_TREND_BEAR, TREND_BULL.
+
+        V6-CAL2-07: TREND_BULL added (45 trades, 17.8% WR, -$45.83 in v6-cal-r1).
+        """
         from src.config import BLOCKED_REGIMES
 
         assert "RANGING" in BLOCKED_REGIMES
         assert "TREND_BEAR" in BLOCKED_REGIMES
         assert "STRONG_TREND_BEAR" in BLOCKED_REGIMES
-        assert len(BLOCKED_REGIMES) == 3
+        assert "TREND_BULL" in BLOCKED_REGIMES
+        assert len(BLOCKED_REGIMES) == 4
 
 
 # ── V6-CAL-03: TIME_EXIT H1 = 24 ─────────────────────────────────────────────
@@ -1663,20 +1678,20 @@ class TestV6Cal03TimeExit:
 
 
 class TestV6Cal04ShortFilter:
-    """V6-CAL-04: SHORT_SCORE_MULTIPLIER=2.0, SHORT_RSI_THRESHOLD=30."""
+    """V6-CAL-04 + V6-CAL2-03: SHORT_SCORE_MULTIPLIER=1.3 (reduced from 2.0), SHORT_RSI_THRESHOLD=30."""
 
     def test_v6_cal_04_short_multiplier_2x(self) -> None:
-        """SHORT effective_threshold = 9.75 * 2.0 = 19.5 (at floor=0.65).
+        """SHORT effective_threshold = 9.75 * 1.3 = 12.675 (at floor=0.65, V6-CAL2-03).
 
-        composite=-15 → abs=15 < 19.5 → blocked.
+        composite=-12 → abs=12 < 12.675 → blocked.
         """
         from src.signals.filter_pipeline import SignalFilterPipeline
 
         pipeline = SignalFilterPipeline()
         passed, reason = pipeline.check_score_threshold(
-            -15.0, "forex", "EURUSD=X", available_weight=0.45, direction="SHORT"
+            -12.0, "forex", "EURUSD=X", available_weight=0.45, direction="SHORT"
         )
-        assert not passed, f"Expected SHORT composite=-15 to be blocked (threshold=19.5), got pass"
+        assert not passed, f"Expected SHORT composite=-12 to be blocked (threshold=12.675), got pass"
         assert "score_below_threshold" in reason
 
     def test_v6_cal_04_short_rsi_30(self) -> None:
@@ -1690,15 +1705,15 @@ class TestV6Cal04ShortFilter:
         assert "momentum_misaligned_short" in reason
 
     def test_v6_cal_04_short_passes_strong(self) -> None:
-        """SHORT with composite=-25 and RSI=20 passes all filters."""
+        """SHORT with composite=-13 and RSI=20 passes all filters (V6-CAL2-03: threshold=12.675)."""
         from src.signals.filter_pipeline import SignalFilterPipeline
 
         pipeline = SignalFilterPipeline()
-        # Threshold: 15 * 0.65 * 2.0 = 19.5; -25 abs=25 > 19.5 → passes score
+        # Threshold: 15 * 0.65 * 1.3 = 12.675; -13 abs=13 > 12.675 → passes score
         passed, reason = pipeline.check_score_threshold(
-            -25.0, "forex", "EURUSD=X", available_weight=0.45, direction="SHORT"
+            -13.0, "forex", "EURUSD=X", available_weight=0.45, direction="SHORT"
         )
-        assert passed, f"Expected SHORT composite=-25 to pass (threshold=19.5), got: {reason}"
+        assert passed, f"Expected SHORT composite=-13 to pass (threshold=12.675), got: {reason}"
 
         # RSI=20 < 30 → passes momentum
         indicators = {"rsi": 20.0, "macd": -0.001, "macd_signal": 0.001}
@@ -1802,13 +1817,15 @@ class TestV6Cal06PerInstrumentOverrides:
         assert score == 22, f"Expected NZDUSD min_composite_score=22, got {score}"
 
     def test_v6_cal_06_spy_strict_override(self) -> None:
-        """SPY uses min_composite_score=30 and only STRONG_TREND_BULL."""
+        """SPY uses min_composite_score=22 (V6-CAL2-08: relaxed from 30) and STRONG_TREND_BULL + VOLATILE."""
         from src.config import INSTRUMENT_OVERRIDES
 
         spy = INSTRUMENT_OVERRIDES.get("SPY", {})
-        assert spy.get("min_composite_score") == 30
+        # V6-CAL2-08: relaxed from 30 to 22 to allow more trades
+        assert spy.get("min_composite_score") == 22
         allowed = spy.get("allowed_regimes", [])
         assert "STRONG_TREND_BULL" in allowed
+        assert "VOLATILE" in allowed  # V6-CAL2-08: added
         assert "STRONG_TREND_BEAR" not in allowed
 
     def test_v6_cal_06_usdjpy_threshold_applied_in_pipeline(self) -> None:
@@ -2114,3 +2131,537 @@ class TestV6Cal09WeekdayMultiplier:
         assert WEAK_WEEKDAY_SCORE_MULTIPLIER == 1.5
         assert 0 in WEAK_WEEKDAYS  # Monday
         assert 1 in WEAK_WEEKDAYS  # Tuesday
+
+
+# ── Calibration Round 2 tests ─────────────────────────────────────────────────
+
+
+def _make_trade_cal2(
+    symbol: str = "EURUSD=X",
+    direction: str = "LONG",
+    entry_price: str = "1.1000",
+    exit_price: str = "1.1100",
+    pnl_usd: str = "10.00",
+    exit_reason: str = "tp_hit",
+    result: str = "win",
+    entry_at=None,
+    exit_at=None,
+    regime: str = "STRONG_TREND_BULL",
+) -> "MagicMock":
+    from unittest.mock import MagicMock
+    from decimal import Decimal
+    import datetime
+
+    t = MagicMock()
+    t.symbol = symbol
+    t.direction = direction
+    t.entry_price = Decimal(entry_price)
+    t.exit_price = Decimal(exit_price)
+    t.pnl_usd = Decimal(pnl_usd)
+    t.result = result
+    t.exit_reason = exit_reason
+    t.pnl_pips = Decimal("100.0000")
+    t.composite_score = Decimal("12.0")
+    t.entry_at = entry_at or datetime.datetime(2024, 1, 15, 10, 0, tzinfo=datetime.timezone.utc)
+    t.exit_at = exit_at or datetime.datetime(2024, 1, 16, 10, 0, tzinfo=datetime.timezone.utc)
+    t.duration_minutes = 1440
+    t.mfe = Decimal("0.0100")
+    t.mae = Decimal("0.0020")
+    t.regime = regime
+    t.timeframe = "H1"
+    t.sl_price = Decimal(entry_price) - Decimal("0.0050")
+    return t
+
+
+class TestCal201ExcludeEodFromMetrics:
+    """TASK-CAL2-01: PF and total_pnl_usd exclude end_of_data trades."""
+
+    def test_cal2_01_pf_excludes_eod(self) -> None:
+        """PF and total_pnl_usd are computed from real trades only."""
+        from decimal import Decimal
+        from src.backtesting.backtest_engine import _compute_summary
+
+        real_win = _make_trade_cal2(pnl_usd="20.00", exit_reason="tp_hit", result="win")
+        real_win2 = _make_trade_cal2(pnl_usd="15.00", exit_reason="tp_hit", result="win")
+        real_loss = _make_trade_cal2(pnl_usd="-10.00", exit_reason="sl_hit", result="loss")
+        eod1 = _make_trade_cal2(pnl_usd="-50.00", exit_reason="end_of_data", result="loss")
+        eod2 = _make_trade_cal2(pnl_usd="30.00", exit_reason="end_of_data", result="win")
+
+        trades = [real_win, real_win2, real_loss, eod1, eod2]
+        summary = _compute_summary(trades, Decimal("1000"))
+
+        # PF = gross_win / gross_loss = (20+15) / 10 = 3.5 (not influenced by eod)
+        assert summary["profit_factor"] == pytest.approx(3.5, abs=0.01)
+        # total_pnl_usd = 20+15-10 = 25.0 (no eod)
+        assert summary["total_pnl_usd"] == pytest.approx(25.0, abs=0.01)
+        # total_pnl_usd_incl_eod = 20+15-10-50+30 = 5.0
+        assert summary["total_pnl_usd_incl_eod"] == pytest.approx(5.0, abs=0.01)
+        # end_of_data_pnl = -50+30 = -20.0
+        assert summary["end_of_data_pnl"] == pytest.approx(-20.0, abs=0.01)
+
+    def test_cal2_01_eod_warning_flag_true(self) -> None:
+        """eod_warning=True when end_of_data count > 5% of total."""
+        from decimal import Decimal
+        from src.backtesting.backtest_engine import _compute_summary
+
+        real_trades = [_make_trade_cal2(exit_reason="tp_hit") for _ in range(9)]
+        eod_trade = _make_trade_cal2(exit_reason="end_of_data")
+        trades = real_trades + [eod_trade]  # 10% eod > 5%
+
+        summary = _compute_summary(trades, Decimal("1000"))
+        assert summary["eod_warning"] is True
+
+    def test_cal2_01_eod_warning_flag_false_within_threshold(self) -> None:
+        """eod_warning=False when end_of_data <= 5% of total."""
+        from decimal import Decimal
+        from src.backtesting.backtest_engine import _compute_summary
+
+        real_trades = [_make_trade_cal2(exit_reason="tp_hit") for _ in range(98)]
+        eod_trade = _make_trade_cal2(exit_reason="end_of_data")
+        trades = real_trades + [eod_trade]  # 1% eod <= 5%
+
+        summary = _compute_summary(trades, Decimal("1000"))
+        assert summary["eod_warning"] is False
+
+    def test_cal2_01_total_pnl_usd_incl_eod_in_summary(self) -> None:
+        """Summary contains total_pnl_usd_incl_eod field."""
+        from decimal import Decimal
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trades = [_make_trade_cal2()]
+        summary = _compute_summary(trades, Decimal("1000"))
+        assert "total_pnl_usd_incl_eod" in summary
+        assert "eod_warning" in summary
+
+
+class TestCal202BySymbolExcludesEod:
+    """TASK-CAL2-02: by_symbol, by_regime, by_weekday exclude end_of_data and have win_rate_pct."""
+
+    def test_cal2_02_by_symbol_excludes_eod(self) -> None:
+        """eod trade does not count in by_symbol wins or trades."""
+        from decimal import Decimal
+        from src.backtesting.backtest_engine import _compute_summary
+
+        real_win = _make_trade_cal2(symbol="EURUSD=X", pnl_usd="10.00", exit_reason="tp_hit", result="win")
+        eod_loss = _make_trade_cal2(symbol="EURUSD=X", pnl_usd="-5.00", exit_reason="end_of_data", result="loss")
+
+        summary = _compute_summary([real_win, eod_loss], Decimal("1000"))
+        by_sym = summary["by_symbol"]
+
+        assert "EURUSD=X" in by_sym
+        assert by_sym["EURUSD=X"]["trades"] == 1  # only real trade
+        assert by_sym["EURUSD=X"]["wins"] == 1
+
+    def test_cal2_02_by_symbol_has_win_rate(self) -> None:
+        """by_symbol entries contain win_rate_pct."""
+        from decimal import Decimal
+        from src.backtesting.backtest_engine import _compute_summary
+
+        t1 = _make_trade_cal2(symbol="GBPUSD=X", pnl_usd="10.00", exit_reason="tp_hit", result="win")
+        t2 = _make_trade_cal2(symbol="GBPUSD=X", pnl_usd="-5.00", exit_reason="sl_hit", result="loss")
+
+        summary = _compute_summary([t1, t2], Decimal("1000"))
+        by_sym = summary["by_symbol"]
+
+        assert "win_rate_pct" in by_sym["GBPUSD=X"]
+        assert by_sym["GBPUSD=X"]["win_rate_pct"] == pytest.approx(50.0)
+
+    def test_cal2_02_by_regime_excludes_eod(self) -> None:
+        """eod trade does not appear in by_regime counts."""
+        from decimal import Decimal
+        from src.backtesting.backtest_engine import _compute_summary
+
+        real = _make_trade_cal2(regime="STRONG_TREND_BULL", exit_reason="tp_hit", result="win")
+        eod = _make_trade_cal2(regime="STRONG_TREND_BULL", exit_reason="end_of_data", result="win")
+
+        summary = _compute_summary([real, eod], Decimal("1000"))
+        by_regime = summary["by_regime"]
+        # Only real trade counted
+        assert by_regime.get("STRONG_TREND_BULL", {}).get("trades", 0) == 1
+
+    def test_cal2_02_by_weekday_excludes_eod(self) -> None:
+        """eod trade does not appear in by_weekday counts."""
+        import datetime
+        from decimal import Decimal
+        from src.backtesting.backtest_engine import _compute_summary
+
+        monday = datetime.datetime(2024, 1, 15, 10, 0, tzinfo=datetime.timezone.utc)  # Monday
+        real = _make_trade_cal2(exit_reason="tp_hit", result="win", entry_at=monday)
+        eod = _make_trade_cal2(exit_reason="end_of_data", result="loss", entry_at=monday)
+
+        summary = _compute_summary([real, eod], Decimal("1000"))
+        by_wd = summary["by_weekday"]
+        # weekday 0 = Monday — only real trade counted
+        assert by_wd.get("0", {}).get("trades", 0) == 1
+
+
+class TestCal203ShortThreshold:
+    """TASK-CAL2-03: SHORT_SCORE_MULTIPLIER=1.3 makes SHORT reachable."""
+
+    def test_cal2_03_short_multiplier_value(self) -> None:
+        """SHORT_SCORE_MULTIPLIER is 1.3."""
+        from src.config import SHORT_SCORE_MULTIPLIER
+        assert SHORT_SCORE_MULTIPLIER == pytest.approx(1.3)
+
+    def test_cal2_03_short_threshold_reachable(self) -> None:
+        """composite=-13.0, direction=SHORT passes score filter in backtest mode."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        # effective_threshold = 15 * max(0.45, 0.65) * 1.3 = 15 * 0.65 * 1.3 = 12.675
+        # abs(-13.0) = 13.0 >= 12.675 → pass
+        passed, reason = pipeline.check_score_threshold(
+            composite=-13.0,
+            market_type="forex",
+            symbol="EURUSD=X",
+            available_weight=0.45,
+            direction="SHORT",
+        )
+        assert passed, f"Expected SHORT -13.0 to pass (threshold ~12.675), got: {reason}"
+
+    def test_cal2_03_short_threshold_blocks_weak(self) -> None:
+        """composite=-8.0 SHORT is blocked (below effective threshold)."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, reason = pipeline.check_score_threshold(
+            composite=-8.0,
+            market_type="forex",
+            symbol="EURUSD=X",
+            available_weight=0.45,
+            direction="SHORT",
+        )
+        assert not passed
+        assert "score_below_threshold" in reason
+
+
+class TestCal204WeekendBlock:
+    """TASK-CAL2-04: Saturday and Sunday blocked for all instruments."""
+
+    def test_cal2_04_saturday_blocked_crypto(self) -> None:
+        """Saturday blocked even for crypto."""
+        import datetime
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        # 2024-01-06 is Saturday
+        saturday = datetime.datetime(2024, 1, 6, 14, 0, tzinfo=datetime.timezone.utc)
+        passed, reason = pipeline.check_weekday(saturday, "crypto")
+        assert not passed
+        assert "weekend_block" in reason
+
+    def test_cal2_04_sunday_blocked_forex(self) -> None:
+        """Sunday blocked for forex."""
+        import datetime
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        # 2024-01-07 is Sunday
+        sunday = datetime.datetime(2024, 1, 7, 10, 0, tzinfo=datetime.timezone.utc)
+        passed, reason = pipeline.check_weekday(sunday, "forex")
+        assert not passed
+        assert "weekend_block" in reason
+
+    def test_cal2_04_friday_still_allowed(self) -> None:
+        """Friday 12:00 is still allowed (not past 18:00)."""
+        import datetime
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        # 2024-01-05 is Friday
+        friday_noon = datetime.datetime(2024, 1, 5, 12, 0, tzinfo=datetime.timezone.utc)
+        passed, reason = pipeline.check_weekday(friday_noon, "forex")
+        assert passed, f"Friday 12:00 should be allowed, got: {reason}"
+
+    def test_cal2_04_saturday_blocked_stocks(self) -> None:
+        """Saturday blocked for stocks."""
+        import datetime
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        saturday = datetime.datetime(2024, 1, 6, 10, 0, tzinfo=datetime.timezone.utc)
+        passed, reason = pipeline.check_weekday(saturday, "stocks")
+        assert not passed
+        assert "weekend_block" in reason
+
+
+class TestCal205RrReduced:
+    """TASK-CAL2-05: R:R ratios reduced by ~30% in REGIME_RR_MAP."""
+
+    def test_cal2_05_volatile_rr_reduced(self) -> None:
+        """VOLATILE target_rr=1.4 (was 2.0)."""
+        from src.signals.risk_manager_v2 import REGIME_RR_MAP
+
+        assert REGIME_RR_MAP["VOLATILE"]["target_rr"] == pytest.approx(1.4)
+        assert REGIME_RR_MAP["VOLATILE"]["min_rr"] == pytest.approx(1.0)
+
+    def test_cal2_05_strong_trend_bull_rr_reduced(self) -> None:
+        """STRONG_TREND_BULL target_rr=1.75 (was 2.5)."""
+        from src.signals.risk_manager_v2 import REGIME_RR_MAP
+
+        assert REGIME_RR_MAP["STRONG_TREND_BULL"]["target_rr"] == pytest.approx(1.75)
+
+    def test_cal2_05_default_rr_reduced(self) -> None:
+        """DEFAULT target_rr=1.05 (was 1.5)."""
+        from src.signals.risk_manager_v2 import REGIME_RR_MAP
+
+        assert REGIME_RR_MAP["DEFAULT"]["target_rr"] == pytest.approx(1.05)
+
+    def test_cal2_05_ranging_rr_reduced(self) -> None:
+        """RANGING target_rr=0.9 (was 1.3)."""
+        from src.signals.risk_manager_v2 import REGIME_RR_MAP
+
+        assert REGIME_RR_MAP["RANGING"]["target_rr"] == pytest.approx(0.9)
+
+
+class TestCal206TrailingStop:
+    """TASK-CAL2-06: Trailing stop activates at MFE >= 50% of TP distance."""
+
+    def _make_check_exit_trade(self, direction: str = "LONG"):
+        """Return open_trade dict for _check_exit testing."""
+        from decimal import Decimal
+        return {
+            "symbol": "EURUSD=X",
+            "timeframe": "H1",
+            "direction": direction,
+            "entry_price": Decimal("1.1000"),
+            "entry_at": None,
+            "stop_loss": Decimal("1.0950") if direction == "LONG" else Decimal("1.1050"),
+            "take_profit": Decimal("1.1100") if direction == "LONG" else Decimal("1.0900"),
+            "composite_score": Decimal("12.0"),
+            "position_pct": 2.0,
+            "mfe": 0.0,
+            "mae": 0.0,
+            "regime": "STRONG_TREND_BULL",
+            "entry_bar_index": 0,
+            "trailing_sl_active": False,
+        }
+
+    def _make_candle(self, high: str, low: str, close: str, ts=None):
+        """Return mock candle object."""
+        from unittest.mock import MagicMock
+        from decimal import Decimal
+        import datetime
+
+        c = MagicMock()
+        c.high = Decimal(high)
+        c.low = Decimal(low)
+        c.close = Decimal(close)
+        c.timestamp = ts or datetime.datetime(2024, 1, 15, 12, 0, tzinfo=datetime.timezone.utc)
+        return c
+
+    def test_cal2_06_trailing_stop_activates_long(self) -> None:
+        """When MFE >= 50% of TP distance, SL moves to entry + 20% of TP dist."""
+        from decimal import Decimal
+        from unittest.mock import MagicMock
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        engine = BacktestEngine.__new__(BacktestEngine)
+        trade = self._make_check_exit_trade("LONG")
+        # entry=1.1000, tp=1.1100, tp_dist=0.0100, 50% = 0.0050
+        # MFE=0.0055 >= 0.0050 → trailing should activate
+        trade["mfe"] = 0.0055
+        # candle that does NOT hit trailing_sl (entry + 20% = 1.1000 + 0.002 = 1.1020)
+        candle = self._make_candle(high="1.1060", low="1.1025", close="1.1040")
+
+        result = engine._check_exit(
+            open_trade=trade,
+            candle=candle,
+            market_type="forex",
+            apply_slippage=False,
+            candles_since_entry=5,
+            account_size=Decimal("1000"),
+        )
+        # Should NOT exit (price above trailing_sl), but trailing_sl_active should be set
+        assert result is None
+        assert trade["trailing_sl_active"] is True
+        assert trade["stop_loss"] == Decimal("1.1020")  # entry + 0.002
+
+    def test_cal2_06_trailing_stop_exits_on_next_candle(self) -> None:
+        """After trailing_sl activated, next candle hitting it triggers trailing_stop exit."""
+        from decimal import Decimal
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        engine = BacktestEngine.__new__(BacktestEngine)
+        trade = self._make_check_exit_trade("LONG")
+        # Simulate trailing already active
+        trade["mfe"] = 0.0055
+        trade["trailing_sl_active"] = True
+        trade["stop_loss"] = Decimal("1.1020")  # entry + 20% of TP dist
+        # candle low dips below trailing SL
+        candle = self._make_candle(high="1.1040", low="1.1015", close="1.1015")
+
+        result = engine._check_exit(
+            open_trade=trade,
+            candle=candle,
+            market_type="forex",
+            apply_slippage=False,
+            candles_since_entry=6,
+            account_size=Decimal("1000"),
+        )
+        assert result is not None
+        assert result.exit_reason == "trailing_stop"
+
+    def test_cal2_06_trailing_not_active_below_50pct(self) -> None:
+        """MFE=40% of TP distance → trailing does not activate."""
+        from decimal import Decimal
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        engine = BacktestEngine.__new__(BacktestEngine)
+        trade = self._make_check_exit_trade("LONG")
+        # tp_dist=0.0100, 40% = 0.004
+        trade["mfe"] = 0.004
+        # candle well above sl, well below tp
+        candle = self._make_candle(high="1.1040", low="1.1020", close="1.1030")
+
+        result = engine._check_exit(
+            open_trade=trade,
+            candle=candle,
+            market_type="forex",
+            apply_slippage=False,
+            candles_since_entry=3,
+            account_size=Decimal("1000"),
+        )
+        assert result is None
+        assert trade["trailing_sl_active"] is False
+
+    def test_cal2_06_trailing_stop_short(self) -> None:
+        """Trailing stop activates and exits for SHORT direction."""
+        from decimal import Decimal
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        engine = BacktestEngine.__new__(BacktestEngine)
+        trade = self._make_check_exit_trade("SHORT")
+        # entry=1.1000, tp=1.0900, tp_dist=0.0100, 50% = 0.0050
+        # trailing_sl for SHORT = entry - 20% = 1.1000 - 0.002 = 1.0980
+        trade["mfe"] = 0.0055
+        trade["trailing_sl_active"] = True
+        trade["stop_loss"] = Decimal("1.0980")
+        # candle high hits trailing SL
+        candle = self._make_candle(high="1.0985", low="1.0950", close="1.0960")
+
+        result = engine._check_exit(
+            open_trade=trade,
+            candle=candle,
+            market_type="forex",
+            apply_slippage=False,
+            candles_since_entry=6,
+            account_size=Decimal("1000"),
+        )
+        assert result is not None
+        assert result.exit_reason == "trailing_stop"
+
+    def test_cal2_06_trailing_stop_count_in_summary(self) -> None:
+        """trailing_stop_count field present in summary."""
+        from decimal import Decimal
+        from src.backtesting.backtest_engine import _compute_summary
+
+        t = _make_trade_cal2(exit_reason="trailing_stop", pnl_usd="5.00", result="win")
+        summary = _compute_summary([t], Decimal("1000"))
+        assert "trailing_stop_count" in summary
+        assert summary["trailing_stop_count"] == 1
+
+
+class TestCal207TrendBullBlocked:
+    """TASK-CAL2-07: TREND_BULL added to BLOCKED_REGIMES."""
+
+    def test_cal2_07_trend_bull_in_blocked_list(self) -> None:
+        """TREND_BULL is in BLOCKED_REGIMES config."""
+        from src.config import BLOCKED_REGIMES
+
+        assert "TREND_BULL" in BLOCKED_REGIMES
+
+    def test_cal2_07_trend_bull_blocked_by_filter(self) -> None:
+        """check_regime returns False for TREND_BULL."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, reason = pipeline.check_regime("TREND_BULL")
+        assert not passed
+        assert "TREND_BULL" in reason
+
+
+class TestCal208InstrumentOverrides:
+    """TASK-CAL2-08: AUDUSD=X override added, SPY relaxed."""
+
+    def test_cal2_08_audusd_override_exists(self) -> None:
+        """AUDUSD=X has min_composite_score=22 override."""
+        from src.config import INSTRUMENT_OVERRIDES
+
+        assert "AUDUSD=X" in INSTRUMENT_OVERRIDES
+        assert INSTRUMENT_OVERRIDES["AUDUSD=X"]["min_composite_score"] == 22
+
+    def test_cal2_08_audusd_higher_threshold(self) -> None:
+        """AUDUSD=X with composite=10 is blocked (below 22*0.65=14.3)."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, reason = pipeline.check_score_threshold(
+            composite=10.0,
+            market_type="forex",
+            symbol="AUDUSD=X",
+            available_weight=0.45,
+            direction="LONG",
+        )
+        assert not passed
+        assert "score_below_threshold" in reason
+
+    def test_cal2_08_spy_volatile_allowed(self) -> None:
+        """SPY with regime=VOLATILE passes check_regime."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, reason = pipeline.check_regime("VOLATILE", symbol="SPY")
+        assert passed, f"SPY VOLATILE should be allowed, got: {reason}"
+
+    def test_cal2_08_spy_score_relaxed(self) -> None:
+        """SPY min_composite_score is 22 (relaxed from 30)."""
+        from src.config import INSTRUMENT_OVERRIDES
+
+        assert INSTRUMENT_OVERRIDES["SPY"]["min_composite_score"] == 22
+
+
+class TestCal209ConcentrationWarning:
+    """TASK-CAL2-09: concentration_warning in summary."""
+
+    def test_cal2_09_concentration_warning_single(self) -> None:
+        """Top 1 symbol > 40% of PnL triggers warning."""
+        from decimal import Decimal
+        from src.backtesting.backtest_engine import _compute_summary
+
+        big = _make_trade_cal2(symbol="GC=F", pnl_usd="80.00", exit_reason="tp_hit", result="win")
+        small1 = _make_trade_cal2(symbol="EURUSD=X", pnl_usd="10.00", exit_reason="tp_hit", result="win")
+        small2 = _make_trade_cal2(symbol="GBPUSD=X", pnl_usd="10.00", exit_reason="tp_hit", result="win")
+
+        summary = _compute_summary([big, small1, small2], Decimal("1000"))
+        assert summary["concentration_warning"] is not None
+        assert "GC=F" in summary["concentration_warning"]
+
+    def test_cal2_09_concentration_warning_top2(self) -> None:
+        """Top 2 symbols contribute > 70% of PnL triggers warning."""
+        from decimal import Decimal
+        from src.backtesting.backtest_engine import _compute_summary
+
+        t1 = _make_trade_cal2(symbol="GC=F", pnl_usd="40.00", exit_reason="tp_hit", result="win")
+        t2 = _make_trade_cal2(symbol="EURUSD=X", pnl_usd="35.00", exit_reason="tp_hit", result="win")
+        t3 = _make_trade_cal2(symbol="GBPUSD=X", pnl_usd="15.00", exit_reason="tp_hit", result="win")
+        t4 = _make_trade_cal2(symbol="USDJPY=X", pnl_usd="10.00", exit_reason="tp_hit", result="win")
+
+        summary = _compute_summary([t1, t2, t3, t4], Decimal("1000"))
+        # GC=F = 40%, EURUSD = 35% → top 2 = 75% > 70%
+        assert summary["concentration_warning"] is not None
+        assert "Top 2" in summary["concentration_warning"]
+
+    def test_cal2_09_no_concentration_warning(self) -> None:
+        """Evenly distributed PnL produces no warning."""
+        from decimal import Decimal
+        from src.backtesting.backtest_engine import _compute_summary
+
+        symbols = ["A", "B", "C", "D", "E"]
+        trades = [
+            _make_trade_cal2(symbol=s, pnl_usd="20.00", exit_reason="tp_hit", result="win")
+            for s in symbols
+        ]
+        summary = _compute_summary(trades, Decimal("1000"))
+        # Each symbol = 20% → top1=20%, top2=40% — both below thresholds
+        assert summary["concentration_warning"] is None

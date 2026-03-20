@@ -148,7 +148,8 @@ MIN_COMPOSITE_SCORE_CRYPTO: int = 20   # for market == "crypto"
 
 # V6-CAL: TREND_BEAR и STRONG_TREND_BEAR добавлены —
 # 219 trades при 11% WR, -$922 PnL в v6 backtest.
-BLOCKED_REGIMES: list = ["RANGING", "TREND_BEAR", "STRONG_TREND_BEAR"]
+# V6-CAL2-07: TREND_BULL добавлен — 45 trades, 17.8% WR, -$45.83 в v6-cal-r1 backtest.
+BLOCKED_REGIMES: list = ["RANGING", "TREND_BEAR", "STRONG_TREND_BEAR", "TREND_BULL"]
 
 INSTRUMENT_OVERRIDES: dict = {
     # V6-CAL-05: Ужесточение — 102 trades, 9.8% WR, -$135 при relaxed settings.
@@ -179,16 +180,22 @@ INSTRUMENT_OVERRIDES: dict = {
     "NZDUSD=X": {
         "min_composite_score": 22,
     },
-    # V6-CAL-06 + V6-CAL-05: SPY ужесточено до 30, только STRONG_TREND_BULL.
+    # V6-CAL2-08: relaxed from 30/STRONG_TREND_BULL — 0 trades was too restrictive.
     "SPY": {
-        "min_composite_score": 30,
-        "allowed_regimes": ["STRONG_TREND_BULL"],
+        "min_composite_score": 22,
+        "allowed_regimes": ["STRONG_TREND_BULL", "VOLATILE"],
+    },
+    # V6-CAL2-08: AUDUSD=X — 46 trades, 8.7% WR, -$97.87. Ужесточение порога.
+    "AUDUSD=X": {
+        "min_composite_score": 22,
     },
 }
 
-# ── v6: SHORT signal quality (TASK-V6-08, V6-CAL-04) ─────────────────────────
+# ── v6: SHORT signal quality (TASK-V6-08, V6-CAL-04, V6-CAL2-03) ────────────
 # V6-CAL-04: SHORT WR 12.04%, "sell" bucket -$1,202. Требуем 2x conviction и RSI < 30.
-SHORT_SCORE_MULTIPLIER: float = 2.0   # SHORT effective_threshold *= 2.0
+# V6-CAL2-03: reduced from 2.0 to 1.3 to allow SHORT trades in backtest.
+# Effective threshold at 1.3: 15 * 0.65 * 1.3 = 12.675 (достижимо при ta_score >= 28.2).
+SHORT_SCORE_MULTIPLIER: float = 1.3   # SHORT effective_threshold *= 1.3
 SHORT_RSI_THRESHOLD: int = 30         # SHORT: RSI must be < 30 (deeply oversold)
 
 # ── v6: Score component weights (TASK-V6-02) ─────────────────────────────────

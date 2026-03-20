@@ -153,7 +153,7 @@ def test_sim25_crypto_higher_threshold_rejected():
     pipeline = SignalFilterPipeline()
     # BTC/USDT override min_composite_score=25 (v6-CAL-05: raised from 20). 6 < 25 → rejected.
     passed, reason = pipeline.check_score_threshold(6.0, "crypto", "BTC/USDT")
-    assert not passed, "Crypto score 6 should be rejected (BTC/USDT threshold=15)"
+    assert not passed, "Crypto score 6 should be rejected (BTC/USDT threshold=25)"
     assert "score_below_threshold" in reason
 
 
@@ -188,13 +188,20 @@ def test_sim26_ranging_blocked():
     assert "regime_blocked" in reason
 
 
-def test_sim26_trend_bull_allowed():
-    """Pipeline: TREND_BULL regime → allowed by check_regime."""
+def test_sim26_trend_bull_blocked_after_cal2_07():
+    """Pipeline: TREND_BULL regime → blocked (V6-CAL2-07: 45 trades, 17.8% WR, -$45.83).
+
+    Updated from original SIM-26 test: TREND_BULL was added to BLOCKED_REGIMES
+    in calibration round 2 (V6-CAL2-07) due to poor live performance.
+    """
     from src.signals.filter_pipeline import SignalFilterPipeline
+    from src.config import BLOCKED_REGIMES
+
+    assert "TREND_BULL" in BLOCKED_REGIMES
 
     pipeline = SignalFilterPipeline()
     passed, reason = pipeline.check_regime("TREND_BULL", "EURUSD=X")
-    assert passed, f"TREND_BULL regime should allow signal, got reason={reason}"
+    assert not passed, f"TREND_BULL should be blocked after V6-CAL2-07, got: {reason}"
 
 
 def test_sim26_volatile_allowed():
@@ -1074,7 +1081,8 @@ def test_sim42_pipeline_passes_valid_context():
         "composite_score": 20.0,
         "market_type": "forex",
         "symbol": "EURUSD=X",
-        "regime": "TREND_BULL",
+        # V6-CAL2-07: use STRONG_TREND_BULL (TREND_BULL now blocked)
+        "regime": "STRONG_TREND_BULL",
         "direction": "LONG",
         "timeframe": "H1",
         "df": None,
@@ -1098,7 +1106,8 @@ def test_sim42_live_and_backtest_same_result():
         "composite_score": 20.0,
         "market_type": "forex",
         "symbol": "EURUSD=X",
-        "regime": "TREND_BULL",
+        # V6-CAL2-07: use STRONG_TREND_BULL (TREND_BULL now blocked)
+        "regime": "STRONG_TREND_BULL",
         "direction": "LONG",
         "timeframe": "H1",
         "df": None,
@@ -1118,11 +1127,13 @@ def test_sim42_pipeline_disabled_filters_pass():
 
     Note: SIM-31 signal_strength check is always-on (not flag-controlled).
     A score of 11 → BUY → passes signal_strength gate even without score threshold.
+    V6-CAL2-07: TREND_BULL now blocked; use STRONG_TREND_BULL to test score filter isolation.
     """
     from src.signals.filter_pipeline import SignalFilterPipeline
     import datetime
 
-    pipeline = SignalFilterPipeline(apply_score_filter=False)
+    # Disable both score and regime filters to test that score=11 passes signal_strength
+    pipeline = SignalFilterPipeline(apply_score_filter=False, apply_regime_filter=False)
     ctx = {
         # 11.0 is below threshold=15 but would be blocked by score_filter if enabled.
         # With score_filter=False, it passes the threshold check.
@@ -1130,6 +1141,7 @@ def test_sim42_pipeline_disabled_filters_pass():
         "composite_score": 11.0,
         "market_type": "forex",
         "symbol": "EURUSD=X",
+        # V6-CAL2-07: TREND_BULL now blocked; regime filter is disabled for this test.
         "regime": "TREND_BULL",
         "direction": "LONG",
         "timeframe": "H1",
@@ -1153,7 +1165,8 @@ def test_sim42_pipeline_momentum_blocks():
         "composite_score": 20.0,
         "market_type": "forex",
         "symbol": "EURUSD=X",
-        "regime": "TREND_BULL",
+        # V6-CAL2-07: use STRONG_TREND_BULL (TREND_BULL now blocked before momentum check)
+        "regime": "STRONG_TREND_BULL",
         "direction": "LONG",
         "timeframe": "H1",
         "df": None,

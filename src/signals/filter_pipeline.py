@@ -419,7 +419,7 @@ class SignalFilterPipeline:
         )
         if direction == "LONG" and not (rsi_f > 50 and macd_f > sig_f):
             return False, f"momentum_misaligned_long:rsi={rsi_f:.1f},macd_diff={macd_f - sig_f:.5f}"
-        # V6 TASK-V6-08: SHORT requires RSI < 40 (not just < 50) for stronger bearish conviction
+        # V6 TASK-V6-08: SHORT requires RSI < 30 (not just < 50) for stronger bearish conviction
         if direction == "SHORT" and not (rsi_f < SHORT_RSI_THRESHOLD and macd_f < sig_f):
             return False, (
                 f"momentum_misaligned_short:rsi={rsi_f:.1f}"
@@ -428,9 +428,16 @@ class SignalFilterPipeline:
         return True, "ok"
 
     def check_weekday(self, ts: datetime.datetime, market_type: str) -> tuple[bool, str]:
-        """SIM-32: Weekday filter."""
+        """SIM-32 + V6-CAL2-04: Weekday filter.
+
+        V6-CAL2-04: blocks Saturday (5) and Sunday (6) for all instruments including crypto.
+        9 weekend trades = -$226 with 0 wins in v6-cal-r1 backtest.
+        """
         hour = ts.hour if ts.tzinfo else ts.replace(tzinfo=datetime.timezone.utc).hour
         weekday = ts.weekday()
+        # V6-CAL2-04: block Saturday and Sunday for ALL market types (no exemptions)
+        if weekday in (5, 6):
+            return False, f"weekend_block:day={weekday}"
         if weekday == 0 and hour < 10:
             if market_type == "crypto":
                 return True, "ok"  # crypto exempt
