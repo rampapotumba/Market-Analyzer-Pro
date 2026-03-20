@@ -244,20 +244,43 @@ def _compute_pnl(
 def _compute_summary(
     trades: list[BacktestTradeResult],
     account_size: Decimal,
+    filter_stats: Optional[dict] = None,
 ) -> dict[str, Any]:
-    """Compute aggregate backtest statistics."""
-    total = len(trades)
-    wins = [t for t in trades if t.result == "win"]
-    losses = [t for t in trades if t.result == "loss"]
+    """Compute aggregate backtest statistics.
 
-    win_rate = (len(wins) / total * 100) if total > 0 else 0.0
-    total_pnl = sum(float(t.pnl_usd or 0) for t in trades)
+    V6 TASK-V6-12: Primary metrics (WR, PF, avg_duration) exclude end_of_data trades.
+    end_of_data trades are reported separately in summary["end_of_data_count/pnl"].
+
+    V6 TASK-V6-10: filter_stats dict is merged into summary if provided.
+    """
+    total = len(trades)
+
+    # V6 TASK-V6-12: Separate end_of_data trades from real trades for metric computation
+    eod_trades = [t for t in trades if t.exit_reason == "end_of_data"]
+    real_trades = [t for t in trades if t.exit_reason != "end_of_data"]
+
+    # Warn if end_of_data trades represent a large fraction of all trades
+    if total > 0 and len(eod_trades) / total > 0.20:
+        logger.warning(
+            "end_of_data trades: %d/%d (%.1f%%) — metrics may be unreliable",
+            len(eod_trades), total, len(eod_trades) / total * 100,
+        )
+
+    # Primary metrics use only real_trades (no end_of_data distortion)
+    metric_trades = real_trades
+    metric_total = len(metric_trades)
+    wins = [t for t in metric_trades if t.result == "win"]
+    losses = [t for t in metric_trades if t.result == "loss"]
+
+    win_rate = (len(wins) / metric_total * 100) if metric_total > 0 else 0.0
+    total_pnl = sum(float(t.pnl_usd or 0) for t in trades)  # total PnL includes eod
     gross_win = sum(float(t.pnl_usd or 0) for t in wins)
     gross_loss = abs(sum(float(t.pnl_usd or 0) for t in losses))
     profit_factor = (gross_win / gross_loss) if gross_loss > 0 else None
 
     avg_dur = (
-        sum(t.duration_minutes or 0 for t in trades) / total if total > 0 else 0
+        sum(t.duration_minutes or 0 for t in metric_trades) / metric_total
+        if metric_total > 0 else 0
     )
 
     long_count = sum(1 for t in trades if t.direction == "LONG")
@@ -346,9 +369,9 @@ def _compute_summary(
 
     # ── SIM-44: Extended metrics ──────────────────────────────────────────────
 
-    # Direction-specific win rates
-    long_trades = [t for t in trades if t.direction == "LONG"]
-    short_trades = [t for t in trades if t.direction == "SHORT"]
+    # Direction-specific win rates (V6-12: exclude end_of_data)
+    long_trades = [t for t in metric_trades if t.direction == "LONG"]
+    short_trades = [t for t in metric_trades if t.direction == "SHORT"]
     long_wins = [t for t in long_trades if t.result == "win"]
     short_wins = [t for t in short_trades if t.result == "win"]
     win_rate_long = (len(long_wins) / len(long_trades) * 100) if long_trades else 0.0
@@ -428,8 +451,10 @@ def _compute_summary(
     _trade_data_str = json.dumps(_trade_dicts_for_hash, sort_keys=True, default=str)
     data_hash = hashlib.sha256(_trade_data_str.encode()).hexdigest()[:16]
 
-    return {
+    result: dict[str, Any] = {
         "total_trades": total,
+        # V6 TASK-V6-12: primary metrics exclude end_of_data trades
+        "total_trades_excl_eod": metric_total,
         "win_rate_pct": round(win_rate, 2),
         "profit_factor": round(profit_factor, 4) if profit_factor is not None else None,
         "total_pnl_usd": round(total_pnl, 4),
@@ -456,7 +481,16 @@ def _compute_summary(
         "avg_mae_pct_of_sl": round(avg_mae_pct_of_sl, 4),
         # V6 TASK-V6-01: data integrity hash
         "data_hash": data_hash,
+        # V6 TASK-V6-12: end_of_data trades reported separately
+        "end_of_data_count": len(eod_trades),
+        "end_of_data_pnl": round(sum(float(t.pnl_usd or 0) for t in eod_trades), 4),
     }
+
+    # V6 TASK-V6-10: merge filter diagnostics into summary if provided
+    if filter_stats is not None:
+        result["filter_stats"] = filter_stats
+
+    return result
 
 
 def _nan_to_none(val: float) -> Optional[float]:
@@ -770,8 +804,64 @@ class BacktestEngine:
         await self.db.commit()
 
         try:
-            trades = await self._simulate(params)
-            summary = _compute_summary(trades, params.account_size)
+            trades, filter_stats = await self._simulate(params)
+            summary = _compute_summary(trades, params.account_size, filter_stats=filter_stats)
+
+            # V6 TASK-V6-13: Walk-forward validation — run IS and OOS separately
+            if params.enable_walk_forward:
+                from dateutil.relativedelta import relativedelta
+
+                start_dt = datetime.datetime.fromisoformat(params.start_date)
+                is_end_dt = start_dt + relativedelta(months=params.in_sample_months)
+                oos_end_dt = is_end_dt + relativedelta(months=params.out_of_sample_months)
+
+                is_params = params.model_copy(update={
+                    "start_date": params.start_date,
+                    "end_date": is_end_dt.date().isoformat(),
+                    "enable_walk_forward": False,
+                })
+                oos_params = params.model_copy(update={
+                    "start_date": is_end_dt.date().isoformat(),
+                    "end_date": min(
+                        oos_end_dt.date().isoformat(),
+                        params.end_date,
+                    ),
+                    "enable_walk_forward": False,
+                })
+
+                is_trades, is_filter_stats = await self._simulate(is_params)
+                oos_trades, oos_filter_stats = await self._simulate(oos_params)
+
+                is_summary = _compute_summary(is_trades, params.account_size, filter_stats=is_filter_stats)
+                oos_summary = _compute_summary(oos_trades, params.account_size, filter_stats=oos_filter_stats)
+
+                is_wr = is_summary.get("win_rate_pct", 0.0)
+                oos_wr = oos_summary.get("win_rate_pct", 0.0)
+                is_pf = is_summary.get("profit_factor") or 0.0
+                oos_pf = oos_summary.get("profit_factor") or 0.0
+
+                summary["walk_forward"] = {
+                    "in_sample_period": f"{params.start_date} – {is_end_dt.date().isoformat()}",
+                    "out_of_sample_period": f"{is_end_dt.date().isoformat()} – {oos_end_dt.date().isoformat()}",
+                    "in_sample": {
+                        "total_trades": is_summary["total_trades"],
+                        "win_rate_pct": is_wr,
+                        "profit_factor": is_pf,
+                        "total_pnl_usd": is_summary["total_pnl_usd"],
+                    },
+                    "out_of_sample": {
+                        "total_trades": oos_summary["total_trades"],
+                        "win_rate_pct": oos_wr,
+                        "profit_factor": oos_pf,
+                        "total_pnl_usd": oos_summary["total_pnl_usd"],
+                    },
+                    "wr_delta": round(oos_wr - is_wr, 2),
+                    "pf_delta": round(float(oos_pf) - float(is_pf), 4),
+                }
+                logger.info(
+                    "[V6-13] Walk-forward: IS WR=%.1f%% PF=%s → OOS WR=%.1f%% PF=%s",
+                    is_wr, is_pf, oos_wr, oos_pf,
+                )
 
             trade_dicts = [
                 {
@@ -818,13 +908,15 @@ class BacktestEngine:
         self,
         params: BacktestParams,
         run_id: Optional[str] = None,
-    ) -> list[BacktestTradeResult]:
-        """Core simulation loop. Returns list of completed trades.
+    ) -> tuple[list[BacktestTradeResult], dict]:
+        """Core simulation loop. Returns (trades, aggregated_filter_stats).
 
         If run_id is provided, updates _backtest_progress[run_id] (0–100)
         after each symbol completes so callers can poll progress.
         """
         trades: list[BacktestTradeResult] = []
+        # V6 TASK-V6-10: aggregate filter stats across all symbols
+        agg_filter_stats: dict[str, int] = {}
 
         start_dt = datetime.datetime.fromisoformat(params.start_date).replace(
             tzinfo=datetime.timezone.utc
@@ -909,7 +1001,7 @@ class BacktestEngine:
                 if run_id:
                     _backtest_progress[run_id] = round(sym_base_pct + candle_pct * sym_share / 100, 1)
 
-            symbol_trades = await asyncio.to_thread(
+            symbol_trades, symbol_filter_stats = await asyncio.to_thread(
                 self._simulate_symbol,
                 symbol=symbol,
                 market_type=market_type,
@@ -923,12 +1015,15 @@ class BacktestEngine:
                 d1_rows_all=d1_data_cache.get(symbol, []),
             )
             trades.extend(symbol_trades)
+            # V6 TASK-V6-10: accumulate filter stats across symbols
+            for k, v in symbol_filter_stats.items():
+                agg_filter_stats[k] = agg_filter_stats.get(k, 0) + v
 
             if run_id:
                 _backtest_progress[run_id] = round((sym_idx + 1) / total_symbols * 100, 1)
                 logger.info("[SIM-22] %s done — progress %.1f%%", symbol, _backtest_progress[run_id])
 
-        return trades
+        return trades, agg_filter_stats
 
     def _simulate_symbol(
         self,
@@ -942,7 +1037,7 @@ class BacktestEngine:
         economic_events: Optional[list] = None,
         params: Optional[BacktestParams] = None,
         d1_rows_all: Optional[list] = None,
-    ) -> list[BacktestTradeResult]:
+    ) -> tuple[list[BacktestTradeResult], dict]:
         """Simulate one symbol over all its candles. Returns closed trades.
 
         NOTE: sync (no awaits) — called via asyncio.to_thread() to avoid blocking event loop.
@@ -1020,11 +1115,13 @@ class BacktestEngine:
 
             # ── Check open trade SL/TP on current candle ──────────────────────
             if open_trade is not None:
+                candles_since_entry = i - open_trade.get("entry_bar_index", i)
                 closed = self._check_exit(
                     open_trade=open_trade,
                     candle=current_candle,
                     market_type=market_type,
                     apply_slippage=apply_slippage,
+                    candles_since_entry=candles_since_entry,
                 )
                 if closed:
                     trades.append(closed)
@@ -1170,6 +1267,8 @@ class BacktestEngine:
                 "mfe": 0.0,
                 "mae": 0.0,
                 "regime": signal["regime"],
+                # V6 TASK-V6-11: track bar index for time/MAE exit
+                "entry_bar_index": i + 1,  # entry happens at next_candle (i+1)
             }
             # Skip to next candle
             i += 1
@@ -1210,7 +1309,8 @@ class BacktestEngine:
                 regime=open_trade.get("regime"),
             ))
 
-        return trades
+        # V6 TASK-V6-10: return filter stats alongside trades
+        return trades, pipeline.get_stats()
 
     def _check_exit(
         self,
@@ -1218,10 +1318,15 @@ class BacktestEngine:
         candle: Any,
         market_type: str,
         apply_slippage: bool,
+        candles_since_entry: int = 0,
     ) -> Optional[BacktestTradeResult]:
         """
         SIM-09 logic: check SL and TP by candle high/low.
         Worst case: if both SL and TP are breached → exit at SL.
+
+        V6 TASK-V6-11: also checks time exit and MAE exit.
+        Order: SL → TP → time_exit → mae_exit.
+
         Returns a closed BacktestTradeResult or None if still open.
         """
         direction = open_trade["direction"]
@@ -1230,6 +1335,8 @@ class BacktestEngine:
         entry = open_trade["entry_price"]
         candle_high = Decimal(str(candle.high))
         candle_low = Decimal(str(candle.low))
+        candle_close = Decimal(str(candle.close))
+        timeframe = open_trade.get("timeframe", "H1")
 
         sl_hit = False
         tp_hit = False
@@ -1241,18 +1348,53 @@ class BacktestEngine:
             sl_hit = candle_high >= sl
             tp_hit = candle_low <= tp
 
-        if not sl_hit and not tp_hit:
-            return None
+        exit_price: Optional[Decimal] = None
+        exit_reason: Optional[str] = None
 
-        # Worst case (SIM-06): if both hit → SL
-        if sl_hit:
-            exit_price = sl
-            if apply_slippage:
-                exit_price = _compute_sl_exit_price(sl, direction, market_type, entry)
-            exit_reason = "sl_hit"
-        else:
-            exit_price = tp
-            exit_reason = "tp_hit"
+        if sl_hit or tp_hit:
+            # Worst case (SIM-06): if both hit → SL
+            if sl_hit:
+                exit_price = sl
+                if apply_slippage:
+                    exit_price = _compute_sl_exit_price(sl, direction, market_type, entry)
+                exit_reason = "sl_hit"
+            else:
+                exit_price = tp
+                exit_reason = "tp_hit"
+
+        # V6 TASK-V6-11: Time exit — after N candles without profit
+        if exit_reason is None:
+            _time_exit_candles: dict[str, int] = {"H1": 48, "H4": 20, "D1": 10}
+            max_candles = _time_exit_candles.get(timeframe, 48)
+            if candles_since_entry >= max_candles:
+                # Compute unrealized PnL at candle close
+                if direction == "LONG":
+                    unrealized_move = candle_close - entry
+                else:
+                    unrealized_move = entry - candle_close
+                if unrealized_move <= Decimal("0"):
+                    exit_price = candle_close
+                    exit_reason = "time_exit"
+
+        # V6 TASK-V6-11: MAE exit — drawdown too large without progress
+        if exit_reason is None:
+            current_mae = Decimal(str(open_trade.get("mae", 0)))
+            current_mfe = Decimal(str(open_trade.get("mfe", 0)))
+            sl_distance = abs(entry - sl)
+            tp_distance = abs(tp - entry)
+            mae_threshold = sl_distance * Decimal("0.60")
+            mfe_threshold = tp_distance * Decimal("0.20")
+            if (
+                sl_distance > 0
+                and current_mae >= mae_threshold
+                and current_mfe < mfe_threshold
+                and candles_since_entry >= 3
+            ):
+                exit_price = candle_close
+                exit_reason = "mae_exit"
+
+        if exit_reason is None:
+            return None
 
         pnl_pips, pnl_usd = _compute_pnl(
             direction, entry, exit_price,

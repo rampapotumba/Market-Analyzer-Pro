@@ -28,6 +28,11 @@ class BacktestParams(BaseModel):
     apply_session_filter: bool = True
     min_composite_score: Optional[float] = None  # None = use global config
 
+    # V6 TASK-V6-13: Walk-forward validation parameters
+    enable_walk_forward: bool = False
+    in_sample_months: int = 18
+    out_of_sample_months: int = 6
+
     @field_validator("symbols")
     @classmethod
     def symbols_not_empty(cls, v: list[str]) -> list[str]:
@@ -90,3 +95,5 @@ class BacktestResult(BaseModel):
     equity_curve: list[dict[str, Any]] = []
     monthly_returns: list[dict[str, Any]] = []
     error: Optional[str] = None
+    # V6 TASK-V6-13: Walk-forward validation results
+    walk_forward: Optional[dict[str, Any]] = None

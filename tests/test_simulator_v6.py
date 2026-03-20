@@ -848,3 +848,565 @@ class TestV609SpyOverride:
             11.5, "stocks", "SPY", available_weight=0.45
         )
         assert passed, f"Expected SPY composite=11.5 to pass at scale=0.45, got: {reason}"
+
+
+# ── TASK-V6-10: Filter diagnostics (rejection counters) ──────────────────────
+
+
+class TestV610FilterDiagnostics:
+    """TASK-V6-10: SignalFilterPipeline tracks rejection counts per filter."""
+
+    def _make_minimal_context(
+        self,
+        composite: float = 7.5,
+        direction: str = "LONG",
+        regime: str = "TREND_BULL",
+        available_weight: float = 0.45,
+    ) -> dict:
+        return {
+            "composite_score": composite,
+            "market_type": "forex",
+            "symbol": "EURUSD=X",
+            "regime": regime,
+            "direction": direction,
+            "timeframe": "H1",
+            "candle_ts": datetime.datetime(2024, 6, 15, 12, 0, tzinfo=datetime.timezone.utc),
+            "available_weight": available_weight,
+            "d1_rows": [],
+            "economic_events": [],
+            "ta_indicators": {},
+        }
+
+    def test_v6_10_filter_stats_initial_zero(self) -> None:
+        """Freshly created pipeline has zero counters."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        assert pipeline.total_signals == 0
+        assert pipeline.passed_signals == 0
+        assert len(pipeline.rejection_counts) == 0
+
+    def test_v6_10_passed_signal_increments_passed(self) -> None:
+        """Signal that passes all filters increments passed_signals and total."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline(
+            apply_regime_filter=False,
+            apply_d1_trend_filter=False,
+            apply_volume_filter=False,
+            apply_momentum_filter=False,
+            apply_weekday_filter=False,
+            apply_calendar_filter=False,
+            apply_session_filter=False,
+            apply_dxy_filter=False,
+        )
+        context = self._make_minimal_context(composite=7.5, available_weight=0.45)
+        passed, _ = pipeline.run_all(context)
+        assert passed
+        assert pipeline.total_signals == 1
+        assert pipeline.passed_signals == 1
+        assert len(pipeline.rejection_counts) == 0
+
+    def test_v6_10_rejected_signal_increments_rejection_count(self) -> None:
+        """Signal blocked by score_threshold increments rejection_counts['score_threshold']."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline(
+            apply_regime_filter=False,
+            apply_d1_trend_filter=False,
+            apply_volume_filter=False,
+            apply_momentum_filter=False,
+            apply_weekday_filter=False,
+            apply_calendar_filter=False,
+            apply_session_filter=False,
+            apply_dxy_filter=False,
+        )
+        # composite=2.0 below threshold 15*0.45=6.75 → score_threshold rejection
+        context = self._make_minimal_context(composite=2.0, available_weight=0.45)
+        passed, _ = pipeline.run_all(context)
+        assert not passed
+        assert pipeline.total_signals == 1
+        assert pipeline.passed_signals == 0
+        assert pipeline.rejection_counts["score_threshold"] == 1
+
+    def test_v6_10_multiple_signals_accumulate_counts(self) -> None:
+        """Running multiple signals accumulates counts correctly."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline(
+            apply_regime_filter=False,
+            apply_d1_trend_filter=False,
+            apply_volume_filter=False,
+            apply_momentum_filter=False,
+            apply_weekday_filter=False,
+            apply_calendar_filter=False,
+            apply_session_filter=False,
+            apply_dxy_filter=False,
+        )
+        # 3 rejected signals
+        for _ in range(3):
+            context = self._make_minimal_context(composite=2.0, available_weight=0.45)
+            pipeline.run_all(context)
+        # 2 passed signals
+        for _ in range(2):
+            context = self._make_minimal_context(composite=7.5, available_weight=0.45)
+            pipeline.run_all(context)
+
+        assert pipeline.total_signals == 5
+        assert pipeline.passed_signals == 2
+        assert pipeline.rejection_counts["score_threshold"] == 3
+
+    def test_v6_10_get_stats_sums_correctly(self) -> None:
+        """get_stats() total_raw_signals == passed + sum(rejected_by_*)."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline(
+            apply_regime_filter=False,
+            apply_d1_trend_filter=False,
+            apply_volume_filter=False,
+            apply_momentum_filter=False,
+            apply_weekday_filter=False,
+            apply_calendar_filter=False,
+            apply_session_filter=False,
+            apply_dxy_filter=False,
+        )
+        for composite in [2.0, 7.5, 3.0, 8.0, 1.0]:
+            pipeline.run_all(self._make_minimal_context(composite=composite, available_weight=0.45))
+
+        stats = pipeline.get_stats()
+        total = stats["total_raw_signals"]
+        passed = stats["passed_all"]
+        rejected_sum = sum(v for k, v in stats.items() if k.startswith("rejected_by_"))
+        assert total == passed + rejected_sum
+
+    def test_v6_10_filter_stats_in_compute_summary(self) -> None:
+        """_compute_summary() includes filter_stats when provided."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        filter_stats = {
+            "total_raw_signals": 100,
+            "passed_all": 20,
+            "rejected_by_score_threshold": 50,
+            "rejected_by_momentum_filter": 30,
+        }
+        trades: list = []
+        summary = _compute_summary(trades, Decimal("1000"), filter_stats=filter_stats)
+        assert "filter_stats" in summary
+        assert summary["filter_stats"]["total_raw_signals"] == 100
+        assert summary["filter_stats"]["passed_all"] == 20
+
+    def test_v6_10_filter_stats_absent_when_not_provided(self) -> None:
+        """_compute_summary() without filter_stats has no filter_stats key."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        summary = _compute_summary([], Decimal("1000"))
+        assert "filter_stats" not in summary
+
+
+# ── TASK-V6-11: Time Exit and MAE Exit in backtest ────────────────────────────
+
+
+class TestV611TimeAndMaeExit:
+    """TASK-V6-11: _check_exit() implements time exit and MAE exit."""
+
+    def _make_candle(
+        self,
+        high: float = 1.1050,
+        low: float = 1.0950,
+        close: float = 1.1000,
+        ts: datetime.datetime = None,
+    ) -> MagicMock:
+        c = MagicMock()
+        c.high = high
+        c.low = low
+        c.close = close
+        c.timestamp = ts or datetime.datetime(2024, 6, 15, 14, 0, tzinfo=datetime.timezone.utc)
+        return c
+
+    def _make_open_trade(
+        self,
+        direction: str = "LONG",
+        entry_price: float = 1.1000,
+        stop_loss: float = 1.0900,
+        take_profit: float = 1.1200,
+        mfe: float = 0.0,
+        mae: float = 0.0,
+        entry_bar_index: int = 0,
+        timeframe: str = "H1",
+    ) -> dict:
+        return {
+            "symbol": "EURUSD=X",
+            "timeframe": timeframe,
+            "direction": direction,
+            "entry_price": Decimal(str(entry_price)),
+            "entry_at": datetime.datetime(2024, 6, 1, 10, 0, tzinfo=datetime.timezone.utc),
+            "stop_loss": Decimal(str(stop_loss)),
+            "take_profit": Decimal(str(take_profit)),
+            "composite_score": Decimal("7.5"),
+            "position_pct": Decimal("2.0"),
+            "mfe": mfe,
+            "mae": mae,
+            "regime": "TREND_BULL",
+            "entry_bar_index": entry_bar_index,
+        }
+
+    def test_v6_11_sl_still_works(self) -> None:
+        """SL hit is still detected correctly with new signature."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        engine = BacktestEngine.__new__(BacktestEngine)
+        trade = self._make_open_trade(direction="LONG", entry_price=1.1000, stop_loss=1.0900)
+        candle = self._make_candle(high=1.0950, low=1.0880)  # low <= sl → sl_hit
+        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=5)
+        assert result is not None
+        assert result.exit_reason == "sl_hit"
+
+    def test_v6_11_tp_still_works(self) -> None:
+        """TP hit is still detected correctly with new signature."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        engine = BacktestEngine.__new__(BacktestEngine)
+        trade = self._make_open_trade(direction="LONG", entry_price=1.1000, take_profit=1.1200)
+        candle = self._make_candle(high=1.1250, low=1.1050)  # high >= tp → tp_hit
+        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=5)
+        assert result is not None
+        assert result.exit_reason == "tp_hit"
+
+    def test_v6_11_time_exit_triggers_at_max_candles_with_negative_pnl(self) -> None:
+        """Time exit fires after 48 H1 candles with PnL <= 0."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        engine = BacktestEngine.__new__(BacktestEngine)
+        # LONG: entry=1.1000, SL=1.0900, TP=1.1200
+        # candle_close=1.0995 → price below entry → unrealized PnL < 0
+        trade = self._make_open_trade(
+            direction="LONG", entry_price=1.1000,
+            stop_loss=1.0900, take_profit=1.1200,
+            timeframe="H1",
+        )
+        # candle doesn't hit SL (low > 1.0900) or TP (high < 1.1200)
+        candle = self._make_candle(high=1.1010, low=1.0950, close=1.0995)
+        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=48)
+        assert result is not None, "Expected time exit after 48 candles with loss"
+        assert result.exit_reason == "time_exit"
+
+    def test_v6_11_time_exit_no_trigger_if_pnl_positive(self) -> None:
+        """Time exit does NOT fire when PnL > 0 (price above entry for LONG)."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        engine = BacktestEngine.__new__(BacktestEngine)
+        trade = self._make_open_trade(
+            direction="LONG", entry_price=1.1000,
+            stop_loss=1.0900, take_profit=1.1200,
+            timeframe="H1",
+        )
+        # candle_close=1.1050 → price above entry → PnL > 0
+        candle = self._make_candle(high=1.1060, low=1.0990, close=1.1050)
+        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=48)
+        assert result is None, "Expected NO time exit when PnL > 0"
+
+    def test_v6_11_time_exit_no_trigger_before_max_candles(self) -> None:
+        """Time exit does NOT fire before reaching max_candles."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        engine = BacktestEngine.__new__(BacktestEngine)
+        trade = self._make_open_trade(
+            direction="LONG", entry_price=1.1000,
+            stop_loss=1.0900, take_profit=1.1200,
+            timeframe="H1",
+        )
+        candle = self._make_candle(high=1.1010, low=1.0950, close=1.0990)
+        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=47)
+        assert result is None, "Expected no exit at candle 47 (max=48)"
+
+    def test_v6_11_time_exit_h4_uses_20_candles(self) -> None:
+        """H4 time exit threshold is 20 candles."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        engine = BacktestEngine.__new__(BacktestEngine)
+        trade = self._make_open_trade(
+            direction="LONG", entry_price=1.1000,
+            stop_loss=1.0900, take_profit=1.1200,
+            timeframe="H4",
+        )
+        candle = self._make_candle(high=1.1010, low=1.0950, close=1.0990)
+        # 19 candles — should NOT exit
+        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=19)
+        assert result is None
+
+        # 20 candles — should exit
+        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=20)
+        assert result is not None
+        assert result.exit_reason == "time_exit"
+
+    def test_v6_11_mae_exit_triggers(self) -> None:
+        """MAE exit fires when MAE >= 60% SL dist, MFE < 20% TP dist, >= 3 candles."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        engine = BacktestEngine.__new__(BacktestEngine)
+        # LONG: entry=1.1000, SL=1.0900 (sl_dist=0.01), TP=1.1200 (tp_dist=0.02)
+        # MAE threshold = 0.01 * 0.6 = 0.006
+        # MFE threshold = 0.02 * 0.2 = 0.004
+        trade = self._make_open_trade(
+            direction="LONG", entry_price=1.1000,
+            stop_loss=1.0900, take_profit=1.1200,
+            mae=0.007,   # > 0.006 threshold
+            mfe=0.003,   # < 0.004 threshold
+        )
+        candle = self._make_candle(high=1.1010, low=1.0950, close=1.0990)
+        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=3)
+        assert result is not None, "Expected MAE exit"
+        assert result.exit_reason == "mae_exit"
+
+    def test_v6_11_mae_exit_no_trigger_high_mfe(self) -> None:
+        """MAE exit does NOT fire when MFE >= 20% TP distance."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        engine = BacktestEngine.__new__(BacktestEngine)
+        trade = self._make_open_trade(
+            direction="LONG", entry_price=1.1000,
+            stop_loss=1.0900, take_profit=1.1200,
+            mae=0.007,   # > threshold
+            mfe=0.005,   # >= 0.004 threshold → blocks MAE exit
+        )
+        candle = self._make_candle(high=1.1010, low=1.0950, close=1.0990)
+        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=3)
+        assert result is None, "Expected no MAE exit when MFE is sufficient"
+
+    def test_v6_11_mae_exit_no_trigger_too_few_candles(self) -> None:
+        """MAE exit does NOT fire before 3 candles."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        engine = BacktestEngine.__new__(BacktestEngine)
+        trade = self._make_open_trade(
+            direction="LONG", entry_price=1.1000,
+            stop_loss=1.0900, take_profit=1.1200,
+            mae=0.007,
+            mfe=0.003,
+        )
+        candle = self._make_candle(high=1.1010, low=1.0950, close=1.0990)
+        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=2)
+        assert result is None, "Expected no MAE exit before 3 candles"
+
+    def test_v6_11_exit_order_sl_before_time(self) -> None:
+        """SL check runs before time exit (SL has priority)."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        engine = BacktestEngine.__new__(BacktestEngine)
+        trade = self._make_open_trade(
+            direction="LONG", entry_price=1.1000,
+            stop_loss=1.0900, take_profit=1.1200,
+            timeframe="H1",
+        )
+        # Candle low below SL AND we've held 48 candles — SL should win
+        candle = self._make_candle(high=1.1010, low=1.0880, close=1.0890)
+        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=48)
+        assert result is not None
+        assert result.exit_reason == "sl_hit", f"Expected sl_hit (has priority), got: {result.exit_reason}"
+
+
+# ── TASK-V6-12: Exclude end_of_data from metrics ─────────────────────────────
+
+
+class TestV612EndOfDataExclusion:
+    """TASK-V6-12: end_of_data trades excluded from WR, PF, avg_duration."""
+
+    def _make_trade(
+        self,
+        exit_reason: str = "tp_hit",
+        result: str = "win",
+        pnl: float = 10.0,
+        duration: int = 60,
+    ) -> MagicMock:
+        t = MagicMock()
+        t.symbol = "EURUSD=X"
+        t.timeframe = "H1"
+        t.direction = "LONG"
+        t.entry_price = Decimal("1.1000")
+        t.exit_price = Decimal("1.1100")
+        t.exit_reason = exit_reason
+        t.pnl_pips = Decimal("100.0")
+        t.pnl_usd = Decimal(str(pnl))
+        t.result = result
+        t.composite_score = Decimal("8.0")
+        t.entry_at = datetime.datetime(2024, 6, 1, 10, 0, tzinfo=datetime.timezone.utc)
+        t.exit_at = datetime.datetime(2024, 6, 2, 10, 0, tzinfo=datetime.timezone.utc)
+        t.duration_minutes = duration
+        t.mfe = Decimal("0.01")
+        t.mae = Decimal("0.002")
+        t.regime = "TREND_BULL"
+        return t
+
+    def test_v6_12_eod_excluded_from_win_rate(self) -> None:
+        """WR computed from real trades only (not end_of_data)."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        # 2 wins + 2 losses (real), 2 eod trades that are "wins"
+        trades = [
+            self._make_trade("tp_hit", "win", 10.0),
+            self._make_trade("tp_hit", "win", 10.0),
+            self._make_trade("sl_hit", "loss", -5.0),
+            self._make_trade("sl_hit", "loss", -5.0),
+            self._make_trade("end_of_data", "win", 100.0),  # should be excluded
+            self._make_trade("end_of_data", "win", 200.0),  # should be excluded
+        ]
+        summary = _compute_summary(trades, Decimal("1000"))
+        # WR should be 2/(2+2) = 50%, not 4/6 = 66.7%
+        assert summary["win_rate_pct"] == 50.0, (
+            f"Expected WR=50%, got {summary['win_rate_pct']} (end_of_data not excluded?)"
+        )
+
+    def test_v6_12_eod_excluded_from_profit_factor(self) -> None:
+        """PF computed from real trades only."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        # Real: 1 win=+10, 1 loss=-5 → PF=2.0
+        # EOD: 1 win=+500 (should not affect PF)
+        trades = [
+            self._make_trade("tp_hit", "win", 10.0),
+            self._make_trade("sl_hit", "loss", -5.0),
+            self._make_trade("end_of_data", "win", 500.0),
+        ]
+        summary = _compute_summary(trades, Decimal("1000"))
+        assert summary["profit_factor"] == 2.0, (
+            f"Expected PF=2.0, got {summary['profit_factor']} (eod trades inflating PF?)"
+        )
+
+    def test_v6_12_eod_excluded_from_avg_duration(self) -> None:
+        """avg_duration computed from real trades only."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        # Real: 2 trades with duration=60 min
+        # EOD: 1 trade with duration=10000 min (should not affect avg)
+        trades = [
+            self._make_trade("tp_hit", "win", 10.0, duration=60),
+            self._make_trade("sl_hit", "loss", -5.0, duration=60),
+            self._make_trade("end_of_data", "win", 50.0, duration=10000),
+        ]
+        summary = _compute_summary(trades, Decimal("1000"))
+        assert summary["avg_duration_minutes"] == 60.0, (
+            f"Expected avg_duration=60, got {summary['avg_duration_minutes']}"
+        )
+
+    def test_v6_12_summary_has_eod_count_and_pnl(self) -> None:
+        """Summary contains end_of_data_count and end_of_data_pnl fields."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trades = [
+            self._make_trade("tp_hit", "win", 10.0),
+            self._make_trade("end_of_data", "win", 100.0),
+            self._make_trade("end_of_data", "loss", -50.0),
+        ]
+        summary = _compute_summary(trades, Decimal("1000"))
+        assert "end_of_data_count" in summary
+        assert summary["end_of_data_count"] == 2
+        assert "end_of_data_pnl" in summary
+        assert summary["end_of_data_pnl"] == 50.0  # 100 + (-50)
+
+    def test_v6_12_summary_has_total_trades_excl_eod(self) -> None:
+        """Summary includes total_trades_excl_eod field."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trades = [
+            self._make_trade("tp_hit", "win", 10.0),
+            self._make_trade("sl_hit", "loss", -5.0),
+            self._make_trade("end_of_data", "win", 30.0),
+        ]
+        summary = _compute_summary(trades, Decimal("1000"))
+        assert summary["total_trades"] == 3
+        assert summary["total_trades_excl_eod"] == 2
+
+    def test_v6_12_eod_warning_above_20pct(self, caplog: Any) -> None:
+        """Warning logged when end_of_data > 20% of all trades."""
+        import logging
+
+        from src.backtesting.backtest_engine import _compute_summary
+
+        # 3 EOD out of 5 total = 60% → warning
+        trades = [
+            self._make_trade("tp_hit", "win", 10.0),
+            self._make_trade("sl_hit", "loss", -5.0),
+            self._make_trade("end_of_data", "win", 10.0),
+            self._make_trade("end_of_data", "win", 10.0),
+            self._make_trade("end_of_data", "win", 10.0),
+        ]
+        with caplog.at_level(logging.WARNING, logger="src.backtesting.backtest_engine"):
+            _compute_summary(trades, Decimal("1000"))
+        assert any("end_of_data" in r.message for r in caplog.records), (
+            "Expected warning about high end_of_data percentage"
+        )
+
+    def test_v6_12_no_eod_trades_unaffected(self) -> None:
+        """When no end_of_data trades, metrics unchanged."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trades = [
+            self._make_trade("tp_hit", "win", 10.0),
+            self._make_trade("sl_hit", "loss", -5.0),
+        ]
+        summary = _compute_summary(trades, Decimal("1000"))
+        assert summary["win_rate_pct"] == 50.0
+        assert summary["end_of_data_count"] == 0
+        assert summary["end_of_data_pnl"] == 0.0
+
+
+# ── TASK-V6-13: Walk-Forward validation ──────────────────────────────────────
+
+
+class TestV613WalkForward:
+    """TASK-V6-13: BacktestParams supports walk-forward IS/OOS split."""
+
+    def test_v6_13_walk_forward_disabled_by_default(self) -> None:
+        """enable_walk_forward is False by default."""
+        from src.backtesting.backtest_params import BacktestParams
+
+        params = BacktestParams(
+            symbols=["EURUSD=X"],
+            start_date="2024-01-01",
+            end_date="2025-12-31",
+        )
+        assert params.enable_walk_forward is False
+
+    def test_v6_13_walk_forward_params_set(self) -> None:
+        """Walk-forward parameters can be configured."""
+        from src.backtesting.backtest_params import BacktestParams
+
+        params = BacktestParams(
+            symbols=["EURUSD=X"],
+            start_date="2024-01-01",
+            end_date="2025-12-31",
+            enable_walk_forward=True,
+            in_sample_months=18,
+            out_of_sample_months=6,
+        )
+        assert params.enable_walk_forward is True
+        assert params.in_sample_months == 18
+        assert params.out_of_sample_months == 6
+
+    def test_v6_13_backtest_result_has_walk_forward_field(self) -> None:
+        """BacktestResult model has walk_forward Optional[dict] field."""
+        from src.backtesting.backtest_params import BacktestResult
+
+        result = BacktestResult(run_id="test-123", status="completed")
+        assert result.walk_forward is None
+
+    def test_v6_13_walk_forward_splits_correctly(self) -> None:
+        """IS=18 months → start to 2025-07, OOS=6 months → 2025-07 to 2026-01."""
+        from dateutil.relativedelta import relativedelta
+
+        start = datetime.datetime(2024, 1, 1)
+        in_sample_months = 18
+        out_of_sample_months = 6
+
+        is_end = start + relativedelta(months=in_sample_months)
+        oos_end = is_end + relativedelta(months=out_of_sample_months)
+
+        assert is_end == datetime.datetime(2025, 7, 1)
+        assert oos_end == datetime.datetime(2026, 1, 1)
+
+    def test_v6_13_compute_summary_no_walk_forward_key_without_flag(self) -> None:
+        """_compute_summary() result has no walk_forward key (set by run_backtest)."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        summary = _compute_summary([], Decimal("1000"))
+        assert "walk_forward" not in summary

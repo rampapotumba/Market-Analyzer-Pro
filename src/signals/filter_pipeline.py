@@ -7,6 +7,7 @@ simulation.
 
 import datetime
 import logging
+from collections import defaultdict
 from decimal import Decimal
 from typing import Optional
 
@@ -128,6 +129,11 @@ class SignalFilterPipeline:
         self.apply_dxy_filter = apply_dxy_filter
         self.min_composite_score = min_composite_score
 
+        # V6 TASK-V6-10: rejection counters for filter diagnostics
+        self.rejection_counts: dict[str, int] = defaultdict(int)
+        self.total_signals: int = 0
+        self.passed_signals: int = 0
+
     def run_all(self, context: dict) -> tuple[bool, str]:
         """
         Run all enabled filters against the signal context.
@@ -166,9 +172,18 @@ class SignalFilterPipeline:
         # Backtest passes 0.45 (only TA available).
         available_weight: float = context.get("available_weight", 1.0)
 
+        # V6 TASK-V6-10: count every incoming signal
+        self.total_signals += 1
+
+        def _check_and_count(filter_name: str, passed: bool, reason: str) -> tuple[bool, str]:
+            if not passed:
+                self.rejection_counts[filter_name] += 1
+            return passed, reason
+
         # Session filter: must run first (cheapest check)
         if self.apply_session_filter and candle_ts is not None:
             passed, reason = self.check_session_liquidity(candle_ts, symbol, market_type)
+            passed, reason = _check_and_count("session_filter", passed, reason)
             if not passed:
                 return False, reason
 
@@ -179,58 +194,80 @@ class SignalFilterPipeline:
                 available_weight=available_weight,
                 direction=direction,
             )
+            passed, reason = _check_and_count("score_threshold", passed, reason)
             if not passed:
                 return False, reason
 
         # SIM-31: Signal strength — always-on quality gate (not flag-controlled).
         # Blocks WEAK_BUY, WEAK_SELL, HOLD regardless of other filter flags.
         passed, reason = self.check_signal_strength(composite, direction, available_weight=available_weight)
+        passed, reason = _check_and_count("signal_strength", passed, reason)
         if not passed:
             return False, reason
 
         # SIM-26: RANGING regime block
         if self.apply_regime_filter:
             passed, reason = self.check_regime(regime, symbol)
+            passed, reason = _check_and_count("regime_filter", passed, reason)
             if not passed:
                 return False, reason
 
         # SIM-27: D1 MA200 trend filter
         if self.apply_d1_trend_filter:
             passed, reason = self.check_d1_trend(symbol, direction, timeframe, d1_rows)
+            passed, reason = _check_and_count("d1_trend_filter", passed, reason)
             if not passed:
                 return False, reason
 
         # SIM-29: Volume confirmation
         if self.apply_volume_filter and df is not None:
             passed, reason = self.check_volume(df, market_type)
+            passed, reason = _check_and_count("volume_filter", passed, reason)
             if not passed:
                 return False, reason
 
         # SIM-30: Momentum alignment
         if self.apply_momentum_filter:
             passed, reason = self.check_momentum(ta_indicators, direction)
+            passed, reason = _check_and_count("momentum_filter", passed, reason)
             if not passed:
                 return False, reason
 
         # SIM-38: DXY alignment filter
         if self.apply_dxy_filter:
             passed, reason = self.check_dxy_alignment(direction, symbol, dxy_rsi)
+            passed, reason = _check_and_count("dxy_filter", passed, reason)
             if not passed:
                 return False, reason
 
         # SIM-32: Weekday filter
         if self.apply_weekday_filter and candle_ts is not None:
             passed, reason = self.check_weekday(candle_ts, market_type)
+            passed, reason = _check_and_count("weekday_filter", passed, reason)
             if not passed:
                 return False, reason
 
         # SIM-33: Economic calendar
         if self.apply_calendar_filter:
             passed, reason = self.check_calendar(candle_ts, economic_events)
+            passed, reason = _check_and_count("calendar_filter", passed, reason)
             if not passed:
                 return False, reason
 
+        self.passed_signals += 1
         return True, "all_passed"
+
+    def get_stats(self) -> dict:
+        """V6 TASK-V6-10: Return filter rejection statistics.
+
+        Returns:
+            dict with total_raw_signals, passed_all, and per-filter rejection counts.
+        """
+        return {
+            "total_raw_signals": self.total_signals,
+            "passed_all": self.passed_signals,
+            **{f"rejected_by_{k}": v for k, v in sorted(self.rejection_counts.items())},
+        }
 
     def check_score_threshold(
         self,
