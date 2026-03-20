@@ -2155,3 +2155,260 @@ class TestV717D1DataAvailability:
         result = BacktestEngine._check_data_quality("EURUSD=X", df, "H1", d1_rows=[])
 
         assert result["d1_rows_available"] is False
+
+
+# ── TASK-V7-12: Regime detection wiring ──────────────────────────────────────
+
+
+def _make_backtest_trade(
+    regime: Optional[str] = "STRONG_TREND_BULL",
+    result: str = "win",
+    pnl_usd: float = 10.0,
+    direction: str = "LONG",
+    exit_reason: str = "tp_hit",
+    entry_at: Optional[datetime.datetime] = None,
+    exit_at: Optional[datetime.datetime] = None,
+) -> MagicMock:
+    """Build a minimal BacktestTradeResult-like mock for _compute_summary tests."""
+    t = MagicMock()
+    t.symbol = "EURUSD=X"
+    t.timeframe = "H1"
+    t.direction = direction
+    t.entry_price = Decimal("1.1000")
+    t.exit_price = Decimal("1.1100")
+    t.pnl_usd = Decimal(str(pnl_usd))
+    t.pnl_pips = Decimal("100.0000")
+    t.result = result
+    t.exit_reason = exit_reason
+    t.composite_score = Decimal("12.0")
+    t.entry_at = entry_at or datetime.datetime(2024, 6, 10, 10, 0, tzinfo=datetime.timezone.utc)
+    t.exit_at = exit_at or datetime.datetime(2024, 6, 11, 10, 0, tzinfo=datetime.timezone.utc)
+    t.duration_minutes = 1440
+    t.mfe = Decimal("0.0100")
+    t.mae = Decimal("0.0020")
+    t.regime = regime
+    t.sl_price = Decimal("1.0900")
+    t.fg_adjustment = None
+    t.fr_adjustment = None
+    return t
+
+
+class TestV712RegimeNeverNone:
+    """TASK-V7-12: regime field in trade records must never be None."""
+
+    def test_v7_12_precompute_regimes_returns_nonempty_list(self) -> None:
+        """_precompute_regimes returns a list with the same length as n."""
+        import numpy as np
+        from src.backtesting.backtest_engine import _precompute_regimes
+
+        n = 50
+        adx = np.full(n, 25.0)
+        atr = np.full(n, 0.001)
+        close = np.full(n, 1.1)
+        sma200 = np.full(n, float("nan"))
+
+        regimes = _precompute_regimes(adx, atr, close, sma200, n)
+
+        assert len(regimes) == n
+
+    def test_v7_12_precompute_regimes_no_none_values(self) -> None:
+        """Every element from _precompute_regimes is a non-empty string."""
+        import numpy as np
+        from src.backtesting.backtest_engine import _precompute_regimes
+
+        n = 300
+        adx = np.linspace(10.0, 40.0, n)
+        atr = np.full(n, 0.001)
+        close = np.linspace(1.05, 1.20, n)
+        sma200 = np.full(n, 1.1)
+
+        regimes = _precompute_regimes(adx, atr, close, sma200, n)
+
+        for i, r in enumerate(regimes):
+            assert isinstance(r, str) and r, f"regime at index {i} is empty/None: {r!r}"
+
+    def test_v7_12_precompute_regimes_known_values_trend_bull(self) -> None:
+        """Strong uptrend (ADX=35, close > SMA200, moderate ATR volatility) → STRONG_TREND_BULL."""
+        import numpy as np
+        from src.backtesting.backtest_engine import _precompute_regimes
+
+        n = 300
+        adx = np.full(n, 35.0)
+        # ATR must vary so percentile lands in the middle range (not LOW_VOLATILITY <20%)
+        # Use linearly increasing ATR to ensure the last value is at the ~100th percentile,
+        # then flatten — last 50 values are around the middle of the historical range.
+        atr = np.concatenate([np.linspace(0.0005, 0.0020, 200), np.full(100, 0.0012)])
+        close = np.full(n, 1.15)
+        sma200 = np.full(n, 1.10)
+
+        regimes = _precompute_regimes(adx, atr, close, sma200, n)
+
+        # At least some of the last elements should be STRONG_TREND_BULL
+        # (flat ATR in mid-range → not a volatility extreme → ADX path → STRONG_TREND_BULL)
+        tail = regimes[-20:]
+        dominant = max(set(tail), key=tail.count)
+        assert dominant == "STRONG_TREND_BULL", \
+            f"Expected dominant STRONG_TREND_BULL in last 20 bars, got: {set(tail)}"
+
+    def test_v7_12_precompute_regimes_low_bars_produces_warning(self) -> None:
+        """Fewer than 200 bars triggers a warning log."""
+        import logging
+        import numpy as np
+        from src.backtesting.backtest_engine import _precompute_regimes
+
+        n = 100
+        adx = np.full(n, 15.0)
+        atr = np.full(n, 0.001)
+        close = np.full(n, 1.1)
+        sma200 = np.full(n, float("nan"))
+
+        captured: list[logging.LogRecord] = []
+
+        class _Handler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                captured.append(record)
+
+        eng_logger = logging.getLogger("src.backtesting.backtest_engine")
+        handler = _Handler()
+        eng_logger.addHandler(handler)
+        old_level = eng_logger.level
+        eng_logger.setLevel(logging.WARNING)
+        try:
+            _precompute_regimes(adx, atr, close, sma200, n)
+        finally:
+            eng_logger.removeHandler(handler)
+            eng_logger.setLevel(old_level)
+
+        messages = " ".join(r.getMessage() for r in captured)
+        assert "SMA200" in messages or "200" in messages, \
+            f"Expected SMA200 warning, got: {messages!r}"
+
+
+class TestV712ComputeSummaryByRegime:
+    """TASK-V7-12: _compute_summary produces extended per-regime metrics."""
+
+    def test_v7_12_summary_by_regime_has_win_rate(self) -> None:
+        """by_regime includes win_rate_pct for each regime."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trades = [
+            _make_backtest_trade(regime="STRONG_TREND_BULL", result="win", pnl_usd=10.0),
+            _make_backtest_trade(regime="STRONG_TREND_BULL", result="win", pnl_usd=8.0),
+            _make_backtest_trade(regime="STRONG_TREND_BULL", result="loss", pnl_usd=-5.0),
+            _make_backtest_trade(regime="VOLATILE", result="win", pnl_usd=12.0),
+        ]
+
+        summary = _compute_summary(trades, Decimal("1000"))
+
+        assert "by_regime" in summary
+        assert "STRONG_TREND_BULL" in summary["by_regime"]
+        assert "win_rate_pct" in summary["by_regime"]["STRONG_TREND_BULL"]
+        assert abs(summary["by_regime"]["STRONG_TREND_BULL"]["win_rate_pct"] - 66.67) < 0.1
+
+    def test_v7_12_summary_by_regime_has_profit_factor(self) -> None:
+        """by_regime includes profit_factor per regime."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trades = [
+            _make_backtest_trade(regime="STRONG_TREND_BULL", result="win", pnl_usd=20.0),
+            _make_backtest_trade(regime="STRONG_TREND_BULL", result="loss", pnl_usd=-10.0),
+        ]
+
+        summary = _compute_summary(trades, Decimal("1000"))
+
+        pf = summary["by_regime"]["STRONG_TREND_BULL"]["profit_factor"]
+        assert pf is not None
+        assert abs(pf - 2.0) < 0.001
+
+    def test_v7_12_summary_by_regime_pf_none_when_no_losses(self) -> None:
+        """profit_factor is None when there are no losing trades in a regime."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trades = [
+            _make_backtest_trade(regime="STRONG_TREND_BULL", result="win", pnl_usd=15.0),
+            _make_backtest_trade(regime="STRONG_TREND_BULL", result="win", pnl_usd=10.0),
+        ]
+
+        summary = _compute_summary(trades, Decimal("1000"))
+
+        pf = summary["by_regime"]["STRONG_TREND_BULL"]["profit_factor"]
+        assert pf is None
+
+    def test_v7_12_summary_no_unknown_when_all_regimes_set(self) -> None:
+        """No UNKNOWN key in by_regime when all trades have a valid regime."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trades = [
+            _make_backtest_trade(regime="STRONG_TREND_BULL", result="win", pnl_usd=10.0),
+            _make_backtest_trade(regime="VOLATILE", result="loss", pnl_usd=-5.0),
+        ]
+
+        summary = _compute_summary(trades, Decimal("1000"))
+
+        assert "UNKNOWN" not in summary["by_regime"]
+
+    def test_v7_12_summary_unknown_appears_when_regime_is_none(self) -> None:
+        """Trades with regime=None are bucketed under 'UNKNOWN'."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trades = [
+            _make_backtest_trade(regime=None, result="win", pnl_usd=10.0),
+            _make_backtest_trade(regime=None, result="loss", pnl_usd=-5.0),
+        ]
+
+        summary = _compute_summary(trades, Decimal("1000"))
+
+        assert "UNKNOWN" in summary["by_regime"]
+        assert summary["by_regime"]["UNKNOWN"]["trades"] == 2
+
+    def test_v7_12_summary_regimes_with_zero_trades_present(self) -> None:
+        """regimes_with_zero_trades lists blocked regimes that had no trades."""
+        from src.backtesting.backtest_engine import _compute_summary
+        from src.config import BLOCKED_REGIMES
+
+        # Only use STRONG_TREND_BULL which is not in BLOCKED_REGIMES
+        trades = [
+            _make_backtest_trade(regime="STRONG_TREND_BULL", result="win", pnl_usd=10.0),
+        ]
+
+        summary = _compute_summary(trades, Decimal("1000"))
+
+        assert "regimes_with_zero_trades" in summary
+        zero_regimes = summary["regimes_with_zero_trades"]
+        assert isinstance(zero_regimes, list)
+        for r in BLOCKED_REGIMES:
+            assert r in zero_regimes, f"Expected {r} in zero_regimes: {zero_regimes}"
+
+    def test_v7_12_summary_blocked_regime_absent_from_zero_list_when_has_trades(self) -> None:
+        """A blocked regime with trades is not in regimes_with_zero_trades."""
+        from src.backtesting.backtest_engine import _compute_summary
+        from src.config import BLOCKED_REGIMES
+
+        if not BLOCKED_REGIMES:
+            return
+
+        blocked = BLOCKED_REGIMES[0]
+        trades = [
+            _make_backtest_trade(regime=blocked, result="win", pnl_usd=10.0),
+        ]
+
+        summary = _compute_summary(trades, Decimal("1000"))
+
+        assert blocked not in summary["regimes_with_zero_trades"]
+
+    def test_v7_12_summary_multiple_regimes_tracked_separately(self) -> None:
+        """Trades from different regimes produce separate entries in by_regime."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trades = [
+            _make_backtest_trade(regime="STRONG_TREND_BULL", result="win", pnl_usd=20.0),
+            _make_backtest_trade(regime="STRONG_TREND_BULL", result="loss", pnl_usd=-8.0),
+            _make_backtest_trade(regime="VOLATILE", result="win", pnl_usd=5.0),
+        ]
+
+        summary = _compute_summary(trades, Decimal("1000"))
+
+        by_r = summary["by_regime"]
+        assert set(by_r.keys()) >= {"STRONG_TREND_BULL", "VOLATILE"}
+        assert by_r["STRONG_TREND_BULL"]["trades"] == 2
+        assert by_r["VOLATILE"]["trades"] == 1
