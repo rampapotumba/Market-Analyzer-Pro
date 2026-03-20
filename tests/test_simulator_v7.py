@@ -7429,3 +7429,245 @@ class TestV724GoldMacroStrategy:
         result = strategy.check_entry(ctx)
         # flat trend: close == base_price == sma50, above_sma50 = False
         assert result is None, "Expected no signal in neutral market conditions"
+
+
+# ── TASK-V7-26: run_strategy_backtests script ─────────────────────────────────
+
+
+class TestV726StrategyBacktestScript:
+    """Tests for scripts/run_strategy_backtests.py (TASK-V7-26)."""
+
+    # ── Import / structure ────────────────────────────────────────────────────
+
+    def test_v7_26_script_importable(self) -> None:
+        """The script module must be importable without side-effects."""
+        import importlib.util
+        import sys
+        from pathlib import Path
+
+        script_path = Path(__file__).parent.parent / "scripts" / "run_strategy_backtests.py"
+        assert script_path.exists(), f"Script not found at {script_path}"
+
+        spec = importlib.util.spec_from_file_location(
+            "run_strategy_backtests", script_path
+        )
+        assert spec is not None
+        mod = importlib.util.module_from_spec(spec)
+        # Loading the module must not raise and must not start async tasks
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+        sys.modules.pop("run_strategy_backtests", None)
+
+    def test_v7_26_all_five_strategies_defined(self) -> None:
+        """STRATEGY_CONFIGS must contain exactly the 5 expected strategy keys."""
+        import importlib.util
+        from pathlib import Path
+
+        script_path = Path(__file__).parent.parent / "scripts" / "run_strategy_backtests.py"
+        spec = importlib.util.spec_from_file_location("run_strategy_backtests", script_path)
+        mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+
+        expected = {"trend_rider", "session_sniper", "crypto_extreme", "gold_macro", "divergence_hunter"}
+        assert set(mod.STRATEGY_CONFIGS.keys()) == expected
+
+    def test_v7_26_strategy_configs_have_required_fields(self) -> None:
+        """Every strategy config must have the mandatory fields with non-empty values."""
+        import importlib.util
+        from pathlib import Path
+
+        script_path = Path(__file__).parent.parent / "scripts" / "run_strategy_backtests.py"
+        spec = importlib.util.spec_from_file_location("run_strategy_backtests", script_path)
+        mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+
+        required_fields = {
+            "display_name", "timeframe", "start_date", "end_date",
+            "in_sample_months", "out_of_sample_months", "symbols",
+        }
+        for name, cfg in mod.STRATEGY_CONFIGS.items():
+            missing = required_fields - set(cfg.keys())
+            assert not missing, f"{name} is missing fields: {missing}"
+            assert cfg["symbols"], f"{name} symbols list is empty"
+            assert cfg["in_sample_months"] > 0, f"{name} in_sample_months must be > 0"
+            assert cfg["out_of_sample_months"] > 0, f"{name} out_of_sample_months must be > 0"
+            assert cfg["start_date"] < cfg["end_date"], (
+                f"{name} start_date must be before end_date"
+            )
+
+    # ── BacktestParams construction ───────────────────────────────────────────
+
+    def test_v7_26_build_params_trend_rider(self) -> None:
+        """build_backtest_params('trend_rider') must produce correct BacktestParams."""
+        import importlib.util
+        from pathlib import Path
+
+        script_path = Path(__file__).parent.parent / "scripts" / "run_strategy_backtests.py"
+        spec = importlib.util.spec_from_file_location("run_strategy_backtests", script_path)
+        mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+
+        params = mod.build_backtest_params("trend_rider")
+        assert params.strategy == "trend_rider"
+        assert params.timeframe == "D1"
+        assert params.start_date == "2020-01-01"
+        assert params.end_date == "2025-01-01"
+        assert params.in_sample_months == 18
+        assert params.out_of_sample_months == 6
+        assert params.enable_walk_forward is True
+        assert params.use_fundamental_data is True
+        assert len(params.symbols) > 0
+
+    def test_v7_26_build_params_session_sniper(self) -> None:
+        """build_backtest_params('session_sniper') must use H1 timeframe and 2023 start."""
+        import importlib.util
+        from pathlib import Path
+
+        script_path = Path(__file__).parent.parent / "scripts" / "run_strategy_backtests.py"
+        spec = importlib.util.spec_from_file_location("run_strategy_backtests", script_path)
+        mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+
+        params = mod.build_backtest_params("session_sniper")
+        assert params.strategy == "session_sniper"
+        assert params.timeframe == "H1"
+        assert params.start_date == "2023-01-01"
+        assert params.in_sample_months == 12
+        assert params.out_of_sample_months == 6
+        assert params.enable_walk_forward is True
+
+    def test_v7_26_build_params_crypto_extreme(self) -> None:
+        """build_backtest_params('crypto_extreme') must include BTC/USDT and ETH/USDT."""
+        import importlib.util
+        from pathlib import Path
+
+        script_path = Path(__file__).parent.parent / "scripts" / "run_strategy_backtests.py"
+        spec = importlib.util.spec_from_file_location("run_strategy_backtests", script_path)
+        mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+
+        params = mod.build_backtest_params("crypto_extreme")
+        assert params.strategy == "crypto_extreme"
+        assert params.timeframe == "D1"
+        assert "BTC/USDT" in params.symbols
+        assert "ETH/USDT" in params.symbols
+        assert params.enable_walk_forward is True
+
+    def test_v7_26_build_params_gold_macro(self) -> None:
+        """build_backtest_params('gold_macro') must include GC=F and use D1."""
+        import importlib.util
+        from pathlib import Path
+
+        script_path = Path(__file__).parent.parent / "scripts" / "run_strategy_backtests.py"
+        spec = importlib.util.spec_from_file_location("run_strategy_backtests", script_path)
+        mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+
+        params = mod.build_backtest_params("gold_macro")
+        assert params.strategy == "gold_macro"
+        assert params.timeframe == "D1"
+        assert "GC=F" in params.symbols
+        assert params.enable_walk_forward is True
+
+    def test_v7_26_build_params_divergence_hunter(self) -> None:
+        """build_backtest_params('divergence_hunter') must use H4 and start 2022."""
+        import importlib.util
+        from pathlib import Path
+
+        script_path = Path(__file__).parent.parent / "scripts" / "run_strategy_backtests.py"
+        spec = importlib.util.spec_from_file_location("run_strategy_backtests", script_path)
+        mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+
+        params = mod.build_backtest_params("divergence_hunter")
+        assert params.strategy == "divergence_hunter"
+        assert params.timeframe == "H4"
+        assert params.start_date == "2022-01-01"
+        assert params.in_sample_months == 12
+        assert params.enable_walk_forward is True
+
+    def test_v7_26_build_params_all_have_walk_forward_and_fundamental(self) -> None:
+        """All strategies must enable walk-forward and fundamental data."""
+        import importlib.util
+        from pathlib import Path
+
+        script_path = Path(__file__).parent.parent / "scripts" / "run_strategy_backtests.py"
+        spec = importlib.util.spec_from_file_location("run_strategy_backtests", script_path)
+        mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+
+        for name in mod.ALL_STRATEGIES:
+            params = mod.build_backtest_params(name)
+            assert params.enable_walk_forward is True, f"{name}: enable_walk_forward must be True"
+            assert params.use_fundamental_data is True, f"{name}: use_fundamental_data must be True"
+
+    # ── Verdict logic ─────────────────────────────────────────────────────────
+
+    def test_v7_26_verdict_valid_when_all_metrics_pass(self) -> None:
+        """_verdict returns VALID when PF, WR and Sharpe all meet thresholds."""
+        import importlib.util
+        from pathlib import Path
+
+        script_path = Path(__file__).parent.parent / "scripts" / "run_strategy_backtests.py"
+        spec = importlib.util.spec_from_file_location("run_strategy_backtests", script_path)
+        mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+
+        oos = {"profit_factor": 1.5, "win_rate": 0.55, "sharpe_ratio": 1.2}
+        assert mod._verdict(oos, total_oos_trades=20) == "VALID"
+
+    def test_v7_26_verdict_invalid_too_few_trades(self) -> None:
+        """_verdict returns INVALID when OOS trade count is below minimum."""
+        import importlib.util
+        from pathlib import Path
+
+        script_path = Path(__file__).parent.parent / "scripts" / "run_strategy_backtests.py"
+        spec = importlib.util.spec_from_file_location("run_strategy_backtests", script_path)
+        mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+
+        oos = {"profit_factor": 2.0, "win_rate": 0.70, "sharpe_ratio": 2.0}
+        assert mod._verdict(oos, total_oos_trades=5) == "INVALID"
+
+    def test_v7_26_verdict_invalid_low_pf(self) -> None:
+        """_verdict returns INVALID when profit factor is below threshold."""
+        import importlib.util
+        from pathlib import Path
+
+        script_path = Path(__file__).parent.parent / "scripts" / "run_strategy_backtests.py"
+        spec = importlib.util.spec_from_file_location("run_strategy_backtests", script_path)
+        mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+
+        oos = {"profit_factor": 1.0, "win_rate": 0.55, "sharpe_ratio": 1.2}
+        assert mod._verdict(oos, total_oos_trades=20) == "INVALID"
+
+    def test_v7_26_verdict_invalid_empty_metrics(self) -> None:
+        """_verdict returns INVALID when OOS metrics are empty (no trades closed)."""
+        import importlib.util
+        from pathlib import Path
+
+        script_path = Path(__file__).parent.parent / "scripts" / "run_strategy_backtests.py"
+        spec = importlib.util.spec_from_file_location("run_strategy_backtests", script_path)
+        mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+
+        assert mod._verdict({}, total_oos_trades=0) == "INVALID"
+
+    # ── ALL_STRATEGIES list consistency ───────────────────────────────────────
+
+    def test_v7_26_all_strategies_matches_strategy_registry(self) -> None:
+        """ALL_STRATEGIES in the script must be a subset of STRATEGY_REGISTRY keys."""
+        import importlib.util
+        from pathlib import Path
+
+        from src.backtesting.strategies import STRATEGY_REGISTRY
+
+        script_path = Path(__file__).parent.parent / "scripts" / "run_strategy_backtests.py"
+        spec = importlib.util.spec_from_file_location("run_strategy_backtests", script_path)
+        mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+
+        for name in mod.ALL_STRATEGIES:
+            assert name in STRATEGY_REGISTRY, (
+                f"Script strategy '{name}' not found in STRATEGY_REGISTRY"
+            )
