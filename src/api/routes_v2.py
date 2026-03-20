@@ -14,6 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.database.crud import (
     create_backtest_run,
+    delete_backtest_run,
+    get_backtest_trades,
     get_active_signals,
     get_all_instruments,
     get_backtest_results,
@@ -190,13 +192,14 @@ class AccuracyV2(BaseModel):
 
 
 class BacktestRunResponse(BaseModel):
-    """SIM-22 v4 schema."""
+    """SIM-22 v4 schema — lightweight, no summary/params payload."""
     id: str
     status: str
+    progress_pct: Optional[float] = None
     started_at: Optional[datetime.datetime] = None
     completed_at: Optional[datetime.datetime] = None
+    # params returned as parsed dict so frontend can show symbols/TF without heavy summary
     params: Optional[str] = None
-    summary: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -491,19 +494,29 @@ async def list_backtests_v4(
     db: AsyncSession = Depends(get_session),
 ):
     """SIM-22: List all backtest runs, newest first."""
+    from src.backtesting.backtest_engine import get_backtest_progress
     runs = await list_backtest_runs(db, limit=limit)
-    return runs
+    result = []
+    for run in runs:
+        d = BacktestRunResponse.model_validate(run)
+        if run.status == "running":
+            d.progress_pct = get_backtest_progress(run.id)
+        result.append(d)
+    return result
 
 
 @router_v2.get("/backtest/{run_id}/status")
 async def get_backtest_status(run_id: str, db: AsyncSession = Depends(get_session)):
     """SIM-22: Current status of a backtest run."""
+    from src.backtesting.backtest_engine import get_backtest_progress
     run = await get_backtest_run(db, run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Backtest run not found")
+    progress = get_backtest_progress(run_id) if run.status == "running" else None
     return {
         "run_id": run.id,
         "status": run.status,
+        "progress_pct": progress,
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "completed_at": run.completed_at.isoformat() if run.completed_at else None,
     }
@@ -558,7 +571,7 @@ async def run_backtest_v4(
             await update_backtest_run(bg_session, run_id, "running")
             await bg_session.commit()
             try:
-                trades = await engine._simulate(params)
+                trades = await engine._simulate(params, run_id=run_id)
                 summary = _compute_summary(trades, params.account_size)
                 trade_dicts = [
                     {
@@ -586,10 +599,58 @@ async def run_backtest_v4(
                 logger.error("[SIM-22] Background backtest %s failed: %s", run_id, exc)
                 await update_backtest_run(bg_session, run_id, "failed", {"error": str(exc)})
                 await bg_session.commit()
+            finally:
+                from src.backtesting.backtest_engine import _backtest_progress
+                _backtest_progress.pop(run_id, None)
 
     asyncio.create_task(_run_bg())
 
     return {"run_id": run_id, "status": "running"}
+
+
+@router_v2.get("/backtest/{run_id}/trades")
+async def get_backtest_trades_endpoint(
+    run_id: str,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_session),
+):
+    """Paginated trade list for a backtest run."""
+    trades, total = await get_backtest_trades(db, run_id, limit=limit, offset=offset)
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "trades": [
+            {
+                "id": t.id,
+                "symbol": t.symbol,
+                "direction": t.direction,
+                "entry_price": float(t.entry_price) if t.entry_price is not None else None,
+                "exit_price": float(t.exit_price) if t.exit_price is not None else None,
+                "exit_reason": t.exit_reason,
+                "pnl_pips": float(t.pnl_pips) if t.pnl_pips is not None else None,
+                "pnl_usd": float(t.pnl_usd) if t.pnl_usd is not None else None,
+                "result": t.result,
+                "entry_at": t.entry_at.isoformat() if t.entry_at else None,
+                "exit_at": t.exit_at.isoformat() if t.exit_at else None,
+                "duration_minutes": t.duration_minutes,
+            }
+            for t in trades
+        ],
+    }
+
+
+@router_v2.delete("/backtest/{run_id}", status_code=204)
+async def delete_backtest_run_endpoint(
+    run_id: str,
+    db: AsyncSession = Depends(get_session),
+):
+    """SIM-22: Delete a backtest run and all its trades."""
+    deleted = await delete_backtest_run(db, run_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Backtest run not found")
+    await db.commit()
 
 
 # ── Macroeconomics ────────────────────────────────────────────────────────────

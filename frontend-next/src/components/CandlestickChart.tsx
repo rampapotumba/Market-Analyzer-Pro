@@ -21,7 +21,6 @@ interface CandlestickChartProps {
 export function CandlestickChart({ candles, height = 320, dark = false }: CandlestickChartProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<{ remove: () => void } | null>(null);
-  const roRef = useRef<ResizeObserver | null>(null);
 
   useEffect(() => {
     if (!containerRef.current || candles.length === 0) return;
@@ -31,9 +30,7 @@ export function CandlestickChart({ candles, height = 320, dark = false }: Candle
     import("lightweight-charts").then((lc) => {
       if (cancelled || !containerRef.current) return;
 
-      // Clean up previous chart and observer
-      roRef.current?.disconnect();
-      roRef.current = null;
+      // Clean up previous chart
       chartRef.current?.remove();
       chartRef.current = null;
 
@@ -43,7 +40,7 @@ export function CandlestickChart({ candles, height = 320, dark = false }: Candle
       const borderCol = dark ? "#30363d" : "#e5e7eb";
 
       const chart = lc.createChart(containerRef.current, {
-        width: containerRef.current.clientWidth,
+        autoSize: true,
         height,
         layout: {
           background: { type: lc.ColorType.Solid, color: bg },
@@ -111,20 +108,10 @@ export function CandlestickChart({ candles, height = 320, dark = false }: Candle
 
       candleSeries.setData(candleData);
       chart.timeScale().fitContent();
-
-      const ro = new ResizeObserver(() => {
-        if (containerRef.current && chartRef.current) {
-          chart.applyOptions({ width: containerRef.current.clientWidth });
-        }
-      });
-      ro.observe(containerRef.current);
-      roRef.current = ro;
     });
 
     return () => {
       cancelled = true;
-      roRef.current?.disconnect();
-      roRef.current = null;
       chartRef.current?.remove();
       chartRef.current = null;
     };

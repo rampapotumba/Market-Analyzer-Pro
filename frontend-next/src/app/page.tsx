@@ -3,9 +3,12 @@
 import React, { useEffect, useRef, useState, useCallback } from "react";
 import { CandlestickChart } from "@/components/CandlestickChart";
 import { Tooltip } from "@/components/Tooltip";
+import { SIGNAL_STATUS, signalStatusLabel } from "@/lib/signalStatus";
 
-const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
-const WS_BASE = API.replace(/^http/, "ws");
+const API = process.env.NEXT_PUBLIC_API_URL ?? "";
+const WS_BASE = API
+  ? API.replace(/^http/, "ws")
+  : (typeof window !== "undefined" ? `ws://${window.location.host}` : "ws://localhost:3000");
 
 interface Instrument { id: number; symbol: string; name: string; market: string; is_active: boolean; }
 interface Candle { timestamp: string; open: number; high: number; low: number; close: number; volume: number; }
@@ -257,7 +260,12 @@ export default function TradingDashboard() {
     } catch {}
   }, [selected, timeframe]);
 
-  useEffect(() => { loadCandles(); }, [loadCandles]);
+  useEffect(() => {
+    loadCandles();
+    // Re-fetch after 5s — gives the background auto-collect time to fill gaps
+    const t = setTimeout(loadCandles, 5000);
+    return () => clearTimeout(t);
+  }, [loadCandles]);
 
   // Calendar events for countdown timers
   useEffect(() => {
@@ -302,7 +310,7 @@ export default function TradingDashboard() {
   // Load active signals
   const loadActiveSignals = useCallback(async () => {
     try {
-      const r = await fetch(`${API}/api/signals/active`);
+      const r = await fetch(`${API}/api/v2/signals/active`);
       if (r.ok) setActiveSignals(await r.json());
     } catch {}
   }, []);
@@ -321,7 +329,7 @@ export default function TradingDashboard() {
     const cached = signalCache.current[key];
     if (cached) setSignal(cached);
     // Then try to load fresher data from DB
-    fetch(`${API}/api/signals/latest/${encodeURIComponent(selected.symbol)}?timeframe=${timeframe}`)
+    fetch(`${API}/api/v2/signals/latest/${encodeURIComponent(selected.symbol)}?timeframe=${timeframe}`)
       .then(r => r.ok ? r.json() : null)
       .then((data: SignalData | null) => {
         if (data) {
@@ -366,9 +374,9 @@ export default function TradingDashboard() {
     ? livePrice >= 1000 ? 2 : livePrice >= 10 ? 2 : livePrice >= 1 ? 4 : 5
     : 5;
 
-  const groups: Record<string, Instrument[]> = { forex: [], stock: [], crypto: [] };
+  const groups: Record<string, Instrument[]> = { forex: [], stocks: [], crypto: [] };
   instruments.forEach(i => { (groups[i.market] ??= []).push(i); });
-  const groupLabels: Record<string, string> = { forex: "Forex", stock: "Stocks", crypto: "Crypto" };
+  const groupLabels: Record<string, string> = { forex: "Forex", stocks: "Stocks", crypto: "Crypto" };
 
   const filtered = (instr: Instrument) =>
     !filter || instr.symbol.toLowerCase().includes(filter.toLowerCase()) || instr.name.toLowerCase().includes(filter.toLowerCase());
@@ -427,7 +435,7 @@ export default function TradingDashboard() {
     forex: [
       { key: "GDPC1",   label: "Real GDP",      format: v => `${(v/1000).toFixed(0)}B`,  sig: v => v > 22000 ? "BUY" : "NEUTRAL" },
     ],
-    stock: [
+    stocks: [
       { key: "GDPC1",   label: "Real GDP",      format: v => `${(v/1000).toFixed(0)}B`,  sig: v => v > 22000 ? "BUY" : "NEUTRAL" },
       { key: "PAYEMS",  label: "Payrolls",      format: v => `${(v/1000).toFixed(0)}K`,  sig: v => v > 155000 ? "BUY" : "NEUTRAL" },
     ],
@@ -602,9 +610,15 @@ export default function TradingDashboard() {
               </div>
 
               {!signal ? (
-                <div style={{ textAlign: "center", padding: "40px 0", color: dark.muted }}>
-                  <div style={{ fontSize: 32, marginBottom: 8 }}>📊</div>
-                  <div style={{ fontSize: 12 }}>Click Analyze to generate a signal</div>
+                <div style={{ textAlign: "center", padding: "48px 0", color: dark.muted, display: "flex", flexDirection: "column", alignItems: "center", gap: 16 }}>
+                  <svg width="48" height="48" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg" opacity={0.25}>
+                    <rect x="4" y="28" width="8" height="16" rx="1" fill="#8b949e"/>
+                    <rect x="16" y="18" width="8" height="26" rx="1" fill="#8b949e"/>
+                    <rect x="28" y="10" width="8" height="34" rx="1" fill="#8b949e"/>
+                    <rect x="40" y="20" width="8" height="24" rx="1" fill="#8b949e"/>
+                    <path d="M8 20 L20 12 L32 6 L44 14" stroke="#8b949e" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" opacity={0.6}/>
+                  </svg>
+                  <span style={{ fontSize: 12, fontFamily: "monospace", letterSpacing: "0.3px" }}>Select an instrument and click Analyze</span>
                 </div>
               ) : (
                 <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
@@ -849,11 +863,15 @@ export default function TradingDashboard() {
                           <td style={{ padding: "5px 6px", fontFamily: "monospace", fontSize: 11 }}>{fmtPrice(s.entry_price)}</td>
                           <td style={{ padding: "5px 6px", fontWeight: 600, color: score >= 0 ? "#22c55e" : "#ef4444" }}>{fmtScore(score)}</td>
                           <td style={{ padding: "5px 6px" }}>
-                            <span style={{ fontSize: 10, padding: "1px 6px", borderRadius: 10,
-                              background: s.status === "active" || s.status === "tracking" ? "#0d3b1e" : "#1e293b",
-                              color: s.status === "active" || s.status === "tracking" ? "#4ade80" : dark.muted }}>
-                              {s.status}
-                            </span>
+                            {(() => {
+                              const st = SIGNAL_STATUS[s.status] ?? { color: "#8b949e", bg: "#8b949e18", label: s.status?.toUpperCase() };
+                              return (
+                                <span style={{ fontSize: 10, padding: "1px 6px", borderRadius: 4, fontFamily: "monospace", fontWeight: 700,
+                                  background: st.bg, color: st.color, border: `1px solid ${st.color}40` }}>
+                                  {signalStatusLabel(s.status)}
+                                </span>
+                              );
+                            })()}
                           </td>
                         </tr>
                       );

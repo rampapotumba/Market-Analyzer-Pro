@@ -1,9 +1,15 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { api } from "@/lib/api";
 import { PortfolioHeatBar } from "@/components/PortfolioHeatBar";
 import { Tooltip } from "@/components/Tooltip";
+
+const API = process.env.NEXT_PUBLIC_API_URL ?? "";
+// WebSocket must be absolute — derive from current page origin when no env var is set
+const WS_BASE = API
+  ? API.replace(/^http/, "ws")
+  : (typeof window !== "undefined" ? `ws://${window.location.host}` : "ws://localhost:3000");
 
 const C = {
   bg: '#0d1117',
@@ -33,6 +39,14 @@ interface SimStats {
   avg_win_usd: number;
   avg_loss_usd: number;
   profit_factor: number | null;
+  // SIM-16 account fields
+  account_initial_balance: number;
+  account_current_balance: number;
+  account_peak_balance: number;
+  account_drawdown_pct: number;
+  account_total_return_pct: number;
+  // SIM-24
+  partial_close_count?: number;
 }
 
 interface Trade {
@@ -68,6 +82,9 @@ interface OpenPosition {
   take_profit_1: number;
   unrealized_pnl_pct: number;
   unrealized_pnl_usd: number;
+  size_pct: number;
+  size_remaining_pct: number;
+  account_balance_at_entry: number | null;
   opened_at: string | null;
 }
 
@@ -81,6 +98,29 @@ function fmtUsd(v: number) {
 
 function fmtPct(v: number) {
   return (v >= 0 ? "+" : "") + v.toFixed(2) + "%";
+}
+
+function fmtPrice(price: number): string {
+  if (price >= 1000) return price.toFixed(2);
+  if (price >= 100)  return price.toFixed(2);
+  if (price >= 1)    return price.toFixed(4);
+  return price.toFixed(5);
+}
+
+/** SIM-12: Recompute unrealized P&L from live price. */
+function calcLivePnl(
+  pos: OpenPosition,
+  livePrice: number,
+  fallbackBalance: number,
+): { usd: number; pct: number } {
+  const balance = pos.account_balance_at_entry ?? fallbackBalance;
+  const effectiveSize = pos.size_pct * pos.size_remaining_pct; // e.g. 2 * 0.5 = 1
+  const movePct =
+    pos.direction === "LONG"
+      ? ((livePrice - pos.entry_price) / pos.entry_price) * 100
+      : ((pos.entry_price - livePrice) / pos.entry_price) * 100;
+  const usd = balance * (effectiveSize / 100) * (movePct / 100);
+  return { usd, pct: movePct };
 }
 
 function fmtDuration(mins: number | null) {
@@ -114,9 +154,92 @@ function StatCard({ label, value, sub, positive }: {
   );
 }
 
+// ── Account balance widget ────────────────────────────────────────────────────
+
+function AccountWidget({
+  stats,
+  liveEquity,
+}: {
+  stats: SimStats;
+  liveEquity: number;
+}) {
+  const initial = stats.account_initial_balance;
+  const current = stats.account_current_balance;
+  const peak = stats.account_peak_balance;
+  const drawdown = stats.account_drawdown_pct;
+  const totalReturn = stats.account_total_return_pct;
+  const liveReturn = initial > 0 ? ((liveEquity - initial) / initial) * 100 : 0;
+
+  const returnColor = totalReturn >= 0 ? C.green : C.red;
+  const liveColor = liveEquity >= current ? (liveEquity >= initial ? C.green : C.red) : C.red;
+
+  const bar = (val: number, max: number, color: string) => {
+    const pct = Math.min(100, max > 0 ? (val / max) * 100 : 0);
+    return (
+      <div style={{ height: 3, background: C.border, borderRadius: 2, marginTop: 6 }}>
+        <div style={{ height: '100%', width: `${pct}%`, background: color, borderRadius: 2, transition: 'width 0.4s' }} />
+      </div>
+    );
+  };
+
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 12 }}>
+      {/* Starting balance */}
+      <div style={{ borderRadius: 8, border: `1px solid ${C.border}`, background: C.card, padding: 18 }}>
+        <div style={{ fontSize: 10, color: C.muted, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.5px', fontFamily: 'monospace', marginBottom: 6 }}>
+          <Tooltip term="Starting Balance">Starting Balance</Tooltip>
+        </div>
+        <div style={{ fontSize: 22, fontWeight: 700, color: C.text, fontFamily: 'monospace' }}>
+          ${initial.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+        </div>
+        <div style={{ fontSize: 11, color: C.muted, fontFamily: 'monospace', marginTop: 4 }}>
+          Peak: ${peak.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+        </div>
+      </div>
+
+      {/* Current balance (realized P&L only) */}
+      <div style={{ borderRadius: 8, border: `1px solid ${C.border}`, background: C.card, padding: 18 }}>
+        <div style={{ fontSize: 10, color: C.muted, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.5px', fontFamily: 'monospace', marginBottom: 6 }}>
+          <Tooltip term="Current Balance">Current Balance</Tooltip>
+        </div>
+        <div style={{ fontSize: 22, fontWeight: 700, color: returnColor, fontFamily: 'monospace' }}>
+          ${current.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+        </div>
+        <div style={{ fontSize: 11, color: C.muted, fontFamily: 'monospace', marginTop: 4 }}>
+          {totalReturn >= 0 ? '+' : ''}{totalReturn.toFixed(2)}% · DD {drawdown.toFixed(2)}%
+        </div>
+        {bar(current, peak, returnColor)}
+      </div>
+
+      {/* Live equity (current balance + live unrealized) */}
+      <div style={{ borderRadius: 8, border: `1px solid ${liveColor}40`, background: C.card, padding: 18, position: 'relative' }}>
+        <div style={{ fontSize: 10, color: C.muted, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.5px', fontFamily: 'monospace', marginBottom: 6, display: 'flex', alignItems: 'center', gap: 6 }}>
+          <Tooltip term="Live Equity">Live Equity</Tooltip>
+          <span style={{ fontSize: 8, color: C.green, letterSpacing: 1 }}>● LIVE</span>
+        </div>
+        <div style={{ fontSize: 22, fontWeight: 700, color: liveColor, fontFamily: 'monospace' }}>
+          ${liveEquity.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+        </div>
+        <div style={{ fontSize: 11, color: C.muted, fontFamily: 'monospace', marginTop: 4 }}>
+          {liveReturn >= 0 ? '+' : ''}{liveReturn.toFixed(2)}% from start · incl. open
+        </div>
+        {bar(liveEquity, Math.max(liveEquity, peak), liveColor)}
+      </div>
+    </div>
+  );
+}
+
 // ── Open positions table ──────────────────────────────────────────────────────
 
-function OpenPositionsTable({ positions }: { positions: OpenPosition[] }) {
+function OpenPositionsTable({
+  positions,
+  livePrices,
+  accountSize,
+}: {
+  positions: OpenPosition[];
+  livePrices: Record<string, number>;
+  accountSize: number;
+}) {
   if (!positions.length) return null;
 
   const thStyle = {
@@ -141,32 +264,44 @@ function OpenPositionsTable({ positions }: { positions: OpenPosition[] }) {
             </tr>
           </thead>
           <tbody>
-            {positions.map((p) => (
-              <tr key={p.signal_id} style={{ borderBottom: `1px solid ${C.border}` }}>
-                <td style={{ padding: '10px 14px', fontWeight: 600, color: C.text, fontFamily: 'monospace' }}>{p.symbol}</td>
-                <td style={{ padding: '10px 14px', color: C.muted, fontFamily: 'monospace' }}>{p.timeframe}</td>
-                <td style={{ padding: '10px 14px' }}>
-                  <span style={{
-                    borderRadius: 4, padding: '2px 8px', fontSize: 11, fontWeight: 700,
-                    fontFamily: 'monospace',
-                    color: p.direction === 'LONG' ? C.green : C.red,
-                    background: p.direction === 'LONG' ? 'rgba(34,197,94,0.1)' : 'rgba(239,68,68,0.1)',
-                    border: `1px solid ${p.direction === 'LONG' ? 'rgba(34,197,94,0.3)' : 'rgba(239,68,68,0.3)'}`,
-                  }}>
-                    {p.direction}
-                  </span>
-                </td>
-                <td style={{ padding: '10px 14px', fontFamily: 'monospace', color: C.text }}>{p.entry_price.toFixed(5)}</td>
-                <td style={{ padding: '10px 14px', fontFamily: 'monospace', color: C.text }}>{p.current_price.toFixed(5)}</td>
-                <td style={{ padding: '10px 14px', fontFamily: 'monospace', color: C.red }}>{p.stop_loss ? p.stop_loss.toFixed(5) : "—"}</td>
-                <td style={{ padding: '10px 14px', fontFamily: 'monospace', color: C.green }}>{p.take_profit_1 ? p.take_profit_1.toFixed(5) : "—"}</td>
-                <td style={{ padding: '10px 14px', fontWeight: 600, fontFamily: 'monospace', color: p.unrealized_pnl_usd >= 0 ? C.green : C.red }}>
-                  {fmtUsd(p.unrealized_pnl_usd)}
-                  <span style={{ marginLeft: 6, fontSize: 11, fontWeight: 400, color: C.muted }}>{fmtPct(p.unrealized_pnl_pct)}</span>
-                </td>
-                <td style={{ padding: '10px 14px', color: C.muted, fontSize: 11, fontFamily: 'monospace' }}>{fmtTime(p.opened_at)}</td>
-              </tr>
-            ))}
+            {positions.map((p) => {
+              const livePrice = livePrices[p.symbol] ?? p.current_price;
+              const hasLive = p.symbol in livePrices;
+              const { usd: liveUsd, pct: livePct } = calcLivePnl(p, livePrice, accountSize);
+              const pnlColor = liveUsd >= 0 ? C.green : C.red;
+
+              return (
+                <tr key={p.signal_id} style={{ borderBottom: `1px solid ${C.border}` }}>
+                  <td style={{ padding: '10px 14px', fontWeight: 600, color: C.text, fontFamily: 'monospace' }}>{p.symbol}</td>
+                  <td style={{ padding: '10px 14px', color: C.muted, fontFamily: 'monospace' }}>{p.timeframe}</td>
+                  <td style={{ padding: '10px 14px' }}>
+                    <span style={{
+                      borderRadius: 4, padding: '2px 8px', fontSize: 11, fontWeight: 700,
+                      fontFamily: 'monospace',
+                      color: p.direction === 'LONG' ? C.green : C.red,
+                      background: p.direction === 'LONG' ? 'rgba(34,197,94,0.1)' : 'rgba(239,68,68,0.1)',
+                      border: `1px solid ${p.direction === 'LONG' ? 'rgba(34,197,94,0.3)' : 'rgba(239,68,68,0.3)'}`,
+                    }}>
+                      {p.direction}
+                    </span>
+                  </td>
+                  <td style={{ padding: '10px 14px', fontFamily: 'monospace', color: C.muted }}>{fmtPrice(p.entry_price)}</td>
+                  <td style={{ padding: '10px 14px', fontFamily: 'monospace', color: C.text }}>
+                    {fmtPrice(livePrice)}
+                    {hasLive && (
+                      <span style={{ marginLeft: 5, fontSize: 9, color: C.green, fontFamily: 'monospace' }}>●</span>
+                    )}
+                  </td>
+                  <td style={{ padding: '10px 14px', fontFamily: 'monospace', color: C.red }}>{p.stop_loss ? fmtPrice(p.stop_loss) : "—"}</td>
+                  <td style={{ padding: '10px 14px', fontFamily: 'monospace', color: C.green }}>{p.take_profit_1 ? fmtPrice(p.take_profit_1) : "—"}</td>
+                  <td style={{ padding: '10px 14px', fontWeight: 600, fontFamily: 'monospace', color: pnlColor }}>
+                    {fmtUsd(liveUsd)}
+                    <span style={{ marginLeft: 6, fontSize: 11, fontWeight: 400, color: C.muted }}>{fmtPct(livePct)}</span>
+                  </td>
+                  <td style={{ padding: '10px 14px', color: C.muted, fontSize: 11, fontFamily: 'monospace' }}>{fmtTime(p.opened_at)}</td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>
@@ -290,6 +425,8 @@ export default function SimulatorPage() {
   const [tradeFilter, setTradeFilter] = useState("ALL");
   const [loading, setLoading] = useState(true);
   const [heat, setHeat] = useState(0);
+  const [livePrices, setLivePrices] = useState<Record<string, number>>({});
+  const wsRef = useRef<WebSocket | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -323,8 +460,51 @@ export default function SimulatorPage() {
     return () => clearInterval(id);
   }, [load, loadTrades]);
 
+  // Live price WebSocket — subscribe to all-symbols feed
+  useEffect(() => {
+    let ws: WebSocket;
+    let retryTimer: ReturnType<typeof setTimeout>;
+
+    function connect() {
+      ws = new WebSocket(`${WS_BASE}/ws/prices`);
+      wsRef.current = ws;
+
+      ws.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.type === "tick" && msg.symbol && msg.price) {
+            const price = parseFloat(msg.price);
+            if (!isNaN(price)) {
+              setLivePrices((prev) => ({ ...prev, [msg.symbol]: price }));
+            }
+          }
+        } catch { /* ignore */ }
+      };
+
+      ws.onclose = () => {
+        retryTimer = setTimeout(connect, 3000);
+      };
+      ws.onerror = () => ws.close();
+    }
+
+    connect();
+    return () => {
+      clearTimeout(retryTimer);
+      wsRef.current?.close();
+    };
+  }, []);
+
   const pnlPositive = stats ? stats.total_pnl_usd >= 0 : undefined;
   const unrealizedPositive = stats ? stats.unrealized_pnl_usd >= 0 : undefined;
+
+  // Live equity = current balance + sum of live unrealized P&L across all open positions
+  const accountSize = stats?.account_current_balance ?? stats?.account_size_usd ?? 1000;
+  const liveUnrealized = openPositions.reduce((sum, pos) => {
+    const livePrice = livePrices[pos.symbol] ?? pos.current_price;
+    const { usd } = calcLivePnl(pos, livePrice, accountSize);
+    return sum + usd;
+  }, 0);
+  const liveEquity = accountSize + liveUnrealized;
 
   return (
     <div style={{ maxWidth: 1280, margin: '0 auto', padding: '24px 16px', display: 'flex', flexDirection: 'column', gap: 32 }}>
@@ -333,7 +513,10 @@ export default function SimulatorPage() {
         <div>
           <h1 style={{ fontSize: 22, fontWeight: 700, color: C.text, fontFamily: 'monospace', margin: 0 }}>Trade Simulator</h1>
           <p style={{ fontSize: 12, color: C.muted, fontFamily: 'monospace', marginTop: 4 }}>
-            Virtual account: <span style={{ fontWeight: 600, color: C.text }}>$1,000 USD</span>
+            Virtual account:{" "}
+            <span style={{ fontWeight: 600, color: C.text }}>
+              ${(stats?.account_current_balance ?? 1000).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USD
+            </span>
             {" · "}live SL/TP monitoring every 1 min · auto-refresh 30 s
           </p>
         </div>
@@ -356,6 +539,11 @@ export default function SimulatorPage() {
         <PortfolioHeatBar heatPct={heat} />
       </div>
 
+      {/* Account balance widgets */}
+      {stats && (
+        <AccountWidget stats={stats} liveEquity={liveEquity} />
+      )}
+
       {/* Stat widgets */}
       {loading && !stats ? (
         <div style={{ textAlign: 'center', color: C.muted, padding: 48, fontSize: 13, fontFamily: 'monospace' }}>Loading…</div>
@@ -376,9 +564,9 @@ export default function SimulatorPage() {
           />
           <StatCard
             label="Unrealized"
-            value={fmtUsd(stats.unrealized_pnl_usd)}
-            sub={`${stats.open_positions} position${stats.open_positions !== 1 ? "s" : ""}`}
-            positive={unrealizedPositive}
+            value={fmtUsd(liveUnrealized)}
+            sub={`${stats.open_positions} position${stats.open_positions !== 1 ? "s" : ""} · live`}
+            positive={liveUnrealized >= 0 ? true : liveUnrealized < 0 ? false : undefined}
           />
           <StatCard
             label="Profit Factor"
@@ -386,11 +574,24 @@ export default function SimulatorPage() {
             sub={`Avg win ${fmtUsd(stats.avg_win_usd)} / loss ${fmtUsd(stats.avg_loss_usd)}`}
             positive={stats.profit_factor != null ? stats.profit_factor >= 1 : undefined}
           />
+          {stats.partial_close_count != null && (
+            <StatCard
+              label="Partial Closes"
+              value={String(stats.partial_close_count)}
+              sub="TP1 hit → 50% closed"
+            />
+          )}
         </div>
       ) : null}
 
       <TradeHistory trades={trades} filter={tradeFilter} onFilter={setTradeFilter} />
-      {openPositions.length > 0 && <OpenPositionsTable positions={openPositions} />}
+      {openPositions.length > 0 && (
+        <OpenPositionsTable
+          positions={openPositions}
+          livePrices={livePrices}
+          accountSize={accountSize}
+        />
+      )}
     </div>
   );
 }

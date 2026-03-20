@@ -2,9 +2,12 @@
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import { CandlestickChart } from "@/components/CandlestickChart";
+import { SIGNAL_STATUS, signalStatusLabel } from "@/lib/signalStatus";
 
-const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
-const WS_BASE = API.replace(/^http/, "ws");
+const API = process.env.NEXT_PUBLIC_API_URL ?? "";
+const WS_BASE = API
+  ? API.replace(/^http/, "ws")
+  : (typeof window !== "undefined" ? `ws://${window.location.host}` : "ws://localhost:3000");
 
 interface Instrument { id: number; symbol: string; name: string; market: string; is_active: boolean; }
 interface Candle { timestamp: string; open: number; high: number; low: number; close: number; volume: number; }
@@ -213,7 +216,7 @@ export default function TradingDashboard() {
   // Load active signals
   const loadActiveSignals = useCallback(async () => {
     try {
-      const r = await fetch(`${API}/api/signals/active`);
+      const r = await fetch(`${API}/api/v2/signals/active`);
       if (r.ok) setActiveSignals(await r.json());
     } catch {}
   }, []);
@@ -232,7 +235,7 @@ export default function TradingDashboard() {
     const cached = signalCache.current[key];
     if (cached) setSignal(cached);
     // Then try to load fresher data from DB
-    fetch(`${API}/api/signals/latest/${encodeURIComponent(selected.symbol)}?timeframe=${timeframe}`)
+    fetch(`${API}/api/v2/signals/latest/${encodeURIComponent(selected.symbol)}?timeframe=${timeframe}`)
       .then(r => r.ok ? r.json() : null)
       .then((data: SignalData | null) => {
         if (data) {
@@ -722,11 +725,15 @@ export default function TradingDashboard() {
                           <td style={{ padding: "5px 6px", fontFamily: "monospace", fontSize: 11 }}>{fmtPrice(s.entry_price)}</td>
                           <td style={{ padding: "5px 6px", fontWeight: 600, color: score >= 0 ? "#22c55e" : "#ef4444" }}>{fmtScore(score)}</td>
                           <td style={{ padding: "5px 6px" }}>
-                            <span style={{ fontSize: 10, padding: "1px 6px", borderRadius: 10,
-                              background: s.status === "active" || s.status === "tracking" ? "#0d3b1e" : "#1e293b",
-                              color: s.status === "active" || s.status === "tracking" ? "#4ade80" : dark.muted }}>
-                              {s.status}
-                            </span>
+                            {(() => {
+                              const st = SIGNAL_STATUS[s.status] ?? { color: "#8b949e", bg: "#8b949e18", label: s.status?.toUpperCase() };
+                              return (
+                                <span style={{ fontSize: 10, padding: "1px 6px", borderRadius: 4, fontFamily: "monospace", fontWeight: 700,
+                                  background: st.bg, color: st.color, border: `1px solid ${st.color}40` }}>
+                                  {signalStatusLabel(s.status)}
+                                </span>
+                              );
+                            })()}
                           </td>
                         </tr>
                       );

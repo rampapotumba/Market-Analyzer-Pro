@@ -27,9 +27,16 @@ FINNHUB_SYMBOLS: dict[str, str] = {
     "OANDA:USD_JPY": "USDJPY=X",
     "OANDA:AUD_USD": "AUDUSD=X",
     "OANDA:USD_CHF": "USDCHF=X",
-    "BINANCE:AAPL":  "AAPL",
-    "BINANCE:MSFT":  "MSFT",
+    "AAPL":          "AAPL",
+    "MSFT":          "MSFT",
+    "GOOGL":         "GOOGL",
+    "SPY":           "SPY",
+    "QQQ":           "QQQ",
 }
+
+# Stocks to poll via yfinance (fallback when Finnhub key is absent)
+YFINANCE_STOCK_SYMBOLS: list[str] = ["AAPL", "MSFT", "GOOGL", "SPY", "QQQ"]
+YFINANCE_POLL_INTERVAL = 30  # seconds
 
 # ── Shared price cache (symbol → last price) ──────────────────────────────────
 last_prices: dict[str, float] = {}
@@ -37,9 +44,9 @@ last_prices: dict[str, float] = {}
 
 async def _broadcast(symbol: str, price: float, source: str) -> None:
     """Push price tick to all WebSocket subscribers."""
-    from src.api.websocket import manager  # avoid circular import at module level
+    from src.api.websocket_v2 import ws_manager_v2  # avoid circular import at module level
     last_prices[symbol] = price
-    await manager.broadcast_price(symbol, {
+    await ws_manager_v2.broadcast_price(symbol, {
         "type": "tick",
         "symbol": symbol,
         "price": price,
@@ -124,6 +131,30 @@ async def run_finnhub_stream() -> None:
             backoff = min(backoff * 2, 60)
 
 
+# ── yfinance polling (stocks fallback) ───────────────────────────────────────
+
+async def run_yfinance_stock_poll() -> None:
+    """Poll yfinance every 30s for stock prices and broadcast as ticks.
+
+    This is the fallback path when Finnhub is not configured or doesn't
+    cover a symbol. yfinance `fast_info.last_price` works during market hours.
+    """
+    import yfinance as yf
+
+    logger.info("[Realtime] Starting yfinance stock polling (%ds interval)", YFINANCE_POLL_INTERVAL)
+    while True:
+        for symbol in YFINANCE_STOCK_SYMBOLS:
+            try:
+                ticker = yf.Ticker(symbol)
+                price = ticker.fast_info.last_price
+                if price and price > 0:
+                    await _broadcast(symbol, float(price), "yfinance")
+            except Exception as exc:
+                logger.debug("[Realtime] yfinance poll failed for %s: %s", symbol, exc)
+            await asyncio.sleep(0.5)  # small pause between tickers
+        await asyncio.sleep(YFINANCE_POLL_INTERVAL)
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def start_realtime_streams() -> None:
@@ -131,6 +162,7 @@ async def start_realtime_streams() -> None:
     tasks = [
         asyncio.create_task(run_binance_stream(), name="binance-stream"),
         asyncio.create_task(run_finnhub_stream(), name="finnhub-stream"),
+        asyncio.create_task(run_yfinance_stock_poll(), name="yfinance-stock-poll"),
     ]
     logger.info(f"[Realtime] Started {len(tasks)} stream(s)")
     # Tasks run forever in background — don't await

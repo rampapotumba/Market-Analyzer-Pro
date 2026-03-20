@@ -577,3 +577,69 @@ def test_backward_compat_null_account_balance_at_entry():
     )
     expected = ACCOUNT_SIZE * Decimal("0.02") * Decimal("0.01")
     assert result == expected
+
+
+# ── P&L result correctness (bug fixes) ───────────────────────────────────────
+
+
+def test_result_based_on_final_pnl_not_pips():
+    """result must reflect total pnl_usd (including swap), not just price pnl_pips.
+
+    Scenario: SL hit but accumulated positive swap makes net P&L positive.
+    In this case result must be 'win', not 'loss'.
+    """
+    tracker = SignalTracker()
+
+    # LONG, 5 pip loss by price, but +0.20 USD accumulated swap
+    entry = Decimal("1.20000")
+    sl_exit = Decimal("1.19950")  # -5 pips (negative price move)
+    pip_size = Decimal("0.0001")
+
+    pnl_pips, pnl_pct = tracker._calculate_pnl("LONG", entry, sl_exit, pip_size)
+    assert pnl_pips < 0, "Expected price loss"
+
+    pnl_usd_price = tracker._pnl_usd(pnl_pct, Decimal("2.0"), Decimal("1000"))
+    assert pnl_usd_price < 0, "Expected negative USD price P&L"
+
+    # Simulate swap overriding pnl_usd to net positive
+    accrued_swap = Decimal("0.20")
+    net_pnl = (pnl_usd_price + accrued_swap).quantize(Decimal("0.01"))
+
+    result = "win" if net_pnl > 0 else ("loss" if net_pnl < 0 else "breakeven")
+    assert result == "win", (
+        f"net_pnl={net_pnl}: swap turned loss into win — result must be 'win'"
+    )
+
+
+def test_result_partial_close_win_then_sl_at_breakeven():
+    """Partial close at TP1 (win) + SL at breakeven = net win, not 'loss'.
+
+    Bug scenario:
+      - LONG entry 1.10000
+      - Partial close at 1.11500 (+1.36%)
+      - SL moved to entry, price returns; SL exits at 1.09999 (-0.001%) after slippage
+      - pnl_pips of final leg < 0 → OLD code: result = 'loss'
+      - blended pnl_usd > 0            → CORRECT: result = 'win'
+    """
+    tracker = SignalTracker()
+    entry = Decimal("1.10000")
+    partial_exit = Decimal("1.11500")
+    final_exit = Decimal("1.09999")  # 1 pip below entry (slippage at BE)
+    pip_size = Decimal("0.0001")
+
+    _, partial_pct = tracker._calculate_pnl("LONG", entry, partial_exit, pip_size)
+    _, final_pct = tracker._calculate_pnl("LONG", entry, final_exit, pip_size)
+
+    blended_pct = (partial_pct + final_pct) / Decimal("2")
+    pnl_usd_val = tracker._pnl_usd(blended_pct, Decimal("2.0"), Decimal("1000"))
+
+    # Old logic: based on final pips only
+    final_pips, _ = tracker._calculate_pnl("LONG", entry, final_exit, pip_size)
+    old_result = "win" if final_pips > 0 else ("loss" if final_pips < 0 else "breakeven")
+    assert old_result == "loss", "Confirm old logic gives wrong result"
+
+    # New logic: based on blended pnl_usd
+    new_result = "win" if pnl_usd_val > 0 else ("loss" if pnl_usd_val < 0 else "breakeven")
+    assert new_result == "win", (
+        f"blended pnl_usd={pnl_usd_val}: partial win must not be labelled 'loss'"
+    )

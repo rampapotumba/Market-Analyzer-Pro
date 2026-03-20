@@ -1,16 +1,16 @@
 """
-Telegram Bot notifications for trading signals (Phase 3).
+Telegram Bot notifications for virtual trade positions.
 
-Sends signal alerts to a configured Telegram chat.
+Sends alerts when positions are opened, closed, or reach lifecycle events
+(breakeven, partial close, trailing stop update).
 """
 
 import logging
-from typing import Any, Optional
+from typing import Optional
 
 import httpx
 
 from src.config import settings
-from src.database.models import Signal
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +19,7 @@ TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
 class TelegramNotifier:
     """
-    Sends trading signal notifications via Telegram Bot API.
+    Sends virtual position notifications via Telegram Bot API.
 
     Setup:
         1. Create a bot via @BotFather → get TELEGRAM_BOT_TOKEN
@@ -58,193 +58,136 @@ class TelegramNotifier:
             logger.error(f"[Telegram] Failed to send message: {exc}")
             return False
 
-    async def send_signal_alert(
+    async def send_position_opened(
         self,
-        signal: Signal,
         instrument_symbol: str,
-        instrument_name: str,
-    ) -> bool:
-        """
-        Send a formatted trading signal alert.
-
-        Format:
-            🔔 NEW SIGNAL: EUR/USD
-            Direction: ▲ LONG (STRONG BUY)
-            Entry: 1.08500
-            Stop Loss: 1.08350 (-15 pips)
-            TP1: 1.08700 (+20 pips)
-            TP2: 1.08975 (+47.5 pips)
-            R:R: 1:1.33
-            Score: +72.5 | Confidence: 85%
-            Timeframe: H4 | Horizon: 4-24 hours
-        """
-        if not self.enabled:
-            return False
-
-        direction = signal.direction
-        dir_symbol = "▲" if direction == "LONG" else ("▼" if direction == "SHORT" else "●")
-        score = float(signal.composite_score)
-        score_sign = "+" if score >= 0 else ""
-
-        entry = f"{float(signal.entry_price):.5f}" if signal.entry_price else "—"
-        sl = f"{float(signal.stop_loss):.5f}" if signal.stop_loss else "—"
-        tp1 = f"{float(signal.take_profit_1):.5f}" if signal.take_profit_1 else "—"
-        tp2 = f"{float(signal.take_profit_2):.5f}" if signal.take_profit_2 else "—"
-        rr = f"1:{float(signal.risk_reward):.2f}" if signal.risk_reward else "—"
-
-        emoji = "🟢" if direction == "LONG" else ("🔴" if direction == "SHORT" else "⚪")
-
-        text = (
-            f"{emoji} <b>NEW SIGNAL: {instrument_name}</b>\n"
-            f"━━━━━━━━━━━━━━━━\n"
-            f"Direction: <b>{dir_symbol} {direction}</b> ({signal.signal_strength.replace('_', ' ')})\n"
-            f"Entry: <code>{entry}</code>\n"
-            f"Stop Loss: <code>{sl}</code>\n"
-            f"TP1: <code>{tp1}</code>\n"
-            f"TP2: <code>{tp2}</code>\n"
-            f"R:R: <b>{rr}</b>\n"
-            f"━━━━━━━━━━━━━━━━\n"
-            f"Score: <b>{score_sign}{score:.1f}</b> | Confidence: <b>{signal.confidence:.1f}%</b>\n"
-            f"Timeframe: {signal.timeframe} | Horizon: {signal.horizon or '—'}\n"
-            f"Symbol: <code>{instrument_symbol}</code>"
-        )
-
-        return await self.send_message(text)
-
-    async def send_signal_result(
-        self,
         instrument_name: str,
         direction: str,
-        exit_reason: str,
-        pnl_pips: float,
+        timeframe: str,
+        entry_price: float,
+        stop_loss: Optional[float],
+        take_profit_1: Optional[float],
+        take_profit_2: Optional[float],
+        size_pct: float,
+        risk_reward: Optional[float],
+        spread_pips: Optional[float] = None,
     ) -> bool:
-        """Send notification when a signal is closed."""
+        """Send notification when a virtual position is opened."""
         if not self.enabled:
             return False
 
-        result_emoji = "✅" if pnl_pips > 0 else ("❌" if pnl_pips < 0 else "➖")
-        pnl_sign = "+" if pnl_pips >= 0 else ""
-        reason_map = {
-            "tp1_hit": "Take Profit 1 Hit",
-            "tp2_hit": "Take Profit 2 Hit ⭐",
-            "sl_hit": "Stop Loss Hit",
-            "expired": "Signal Expired",
-            "manual": "Manual Close",
-        }
-
-        text = (
-            f"{result_emoji} <b>SIGNAL CLOSED: {instrument_name}</b>\n"
-            f"Direction: {direction}\n"
-            f"Reason: {reason_map.get(exit_reason, exit_reason)}\n"
-            f"P&L: <b>{pnl_sign}{pnl_pips:.1f} pips</b>"
-        )
-
-        return await self.send_message(text)
-
-
-    async def send_signal_alert_v2(
-        self,
-        signal: Signal,
-        instrument_symbol: str,
-        instrument_name: str,
-    ) -> bool:
-        """
-        Enhanced v2 signal alert with regime, TP3, OF score, portfolio heat.
-
-        Format:
-            🟢 NEW SIGNAL v2: EUR/USD (STRONG BUY)
-            📊 Regime: STRONG_TREND_BULL
-            ─────────────────────
-            ▲ LONG  |  H4  |  Confidence: 82%
-            Score: +74.5  (TA:65 FA:55 Sent:40 Geo:10 OF:60)
-            ─────────────────────
-            Entry:   1.08500
-            SL:      1.08250  (risk 0.23%)
-            TP1:     1.08875  (RR 1:1.5)
-            TP2:     1.09250
-            TP3:     1.09750
-            ─────────────────────
-            Portfolio heat: 3.5%  (max 6%)
-        """
-        if not self.enabled:
-            return False
-
-        direction = signal.direction
         dir_symbol = "▲" if direction == "LONG" else "▼"
         emoji = "🟢" if direction == "LONG" else "🔴"
-        score = float(signal.composite_score or 0)
-        score_sign = "+" if score >= 0 else ""
 
-        def _fmt(val, decimals=5):
-            return f"{float(val):.{decimals}f}" if val is not None else "—"
+        def _fmt(val: Optional[float]) -> str:
+            if val is None:
+                return "—"
+            if val >= 10:
+                return f"{val:.2f}"
+            return f"{val:.5f}"
 
-        # Score breakdown
-        ta = f"TA:{signal.ta_score:.0f}" if signal.ta_score is not None else ""
-        fa = f"FA:{signal.fa_score:.0f}" if signal.fa_score is not None else ""
-        sent = f"Sent:{signal.sentiment_score:.0f}" if signal.sentiment_score is not None else ""
-        geo = f"Geo:{signal.geo_score:.0f}" if signal.geo_score is not None else ""
-        of = f"OF:{signal.of_score:.0f}" if signal.of_score is not None else ""
-        breakdown = " ".join(filter(None, [ta, fa, sent, geo, of]))
-
-        rr = f"1:{float(signal.risk_reward):.2f}" if signal.risk_reward else ""
-        tp1_line = f"TP1:     <code>{_fmt(signal.take_profit_1)}</code>"
-        if rr:
-            tp1_line += f"  (RR {rr})"
-
-        heat = f"{float(signal.portfolio_heat):.1f}%" if signal.portfolio_heat else "—"
+        rr_str = f"1:{risk_reward:.2f}" if risk_reward else "—"
+        spread_str = f"{spread_pips:.1f} pip{'s' if (spread_pips or 0) != 1 else ''}" if spread_pips else "—"
 
         text = (
-            f"{emoji} <b>SIGNAL v2: {instrument_name}</b>  "
-            f"({signal.signal_strength.replace('_', ' ')})\n"
-            f"📊 Regime: <b>{signal.regime or '—'}</b>\n"
+            f"{emoji} <b>POSITION OPENED: {instrument_name}</b>\n"
             f"─────────────────────\n"
-            f"<b>{dir_symbol} {direction}</b>  |  {signal.timeframe}  |  "
-            f"Confidence: <b>{float(signal.confidence):.1f}%</b>\n"
-            f"Score: <b>{score_sign}{score:.1f}</b>  ({breakdown})\n"
+            f"<b>{dir_symbol} {direction}</b>  |  {timeframe}  |  Size: <b>{size_pct:.1f}%</b>\n"
             f"─────────────────────\n"
-            f"Entry:   <code>{_fmt(signal.entry_price)}</code>\n"
-            f"SL:      <code>{_fmt(signal.stop_loss)}</code>\n"
-            f"{tp1_line}\n"
-            f"TP2:     <code>{_fmt(signal.take_profit_2)}</code>\n"
-            f"TP3:     <code>{_fmt(signal.take_profit_3)}</code>\n"
+            f"Entry:   <code>{_fmt(entry_price)}</code>  (spread: {spread_str})\n"
+            f"SL:      <code>{_fmt(stop_loss)}</code>\n"
+            f"TP1:     <code>{_fmt(take_profit_1)}</code>\n"
+            f"TP2:     <code>{_fmt(take_profit_2)}</code>\n"
+            f"R:R:     <b>{rr_str}</b>\n"
             f"─────────────────────\n"
-            f"Portfolio heat: <b>{heat}</b>  (max 6%)\n"
             f"<code>{instrument_symbol}</code>"
         )
 
         return await self.send_message(text)
 
+    async def send_position_closed(
+        self,
+        instrument_name: str,
+        instrument_symbol: str,
+        direction: str,
+        exit_reason: str,
+        entry_price: float,
+        exit_price: float,
+        pnl_pips: float,
+        pnl_usd: Optional[float] = None,
+    ) -> bool:
+        """Send notification when a virtual position is closed."""
+        if not self.enabled:
+            return False
+
+        result_emoji = "✅" if pnl_pips > 0 else ("❌" if pnl_pips < 0 else "➖")
+        pnl_sign = "+" if pnl_pips >= 0 else ""
+        usd_sign = "+" if (pnl_usd or 0) >= 0 else ""
+
+        reason_map = {
+            "tp1_hit":  "TP1 Hit 🎯",
+            "tp2_hit":  "TP2 Hit 🎯🎯",
+            "tp3_hit":  "TP3 Hit 🎯🎯🎯",
+            "sl_hit":   "Stop Loss Hit",
+            "expired":  "Expired",
+            "manual":   "Manual Close",
+        }
+        reason_label = reason_map.get(exit_reason, exit_reason.replace("_", " ").title())
+
+        def _fmt(val: float) -> str:
+            return f"{val:.2f}" if val >= 10 else f"{val:.5f}"
+
+        lines = [
+            f"{result_emoji} <b>POSITION CLOSED: {instrument_name}</b>",
+            f"─────────────────────",
+            f"Direction: {direction}  |  Reason: <b>{reason_label}</b>",
+            f"Entry: <code>{_fmt(entry_price)}</code>  →  Exit: <code>{_fmt(exit_price)}</code>",
+            f"P&L: <b>{pnl_sign}{pnl_pips:.1f} pips</b>",
+        ]
+        if pnl_usd is not None:
+            lines.append(f"P&L $: <b>{usd_sign}{pnl_usd:.2f} USD</b>")
+        lines.append(f"<code>{instrument_symbol}</code>")
+
+        return await self.send_message("\n".join(lines))
+
     async def send_lifecycle_alert(
         self,
         instrument_name: str,
+        instrument_symbol: str,
         direction: str,
         action: str,
         price: float,
-        new_sl: float = None,
-        pnl_pct: float = None,
+        new_sl: Optional[float] = None,
+        pnl_pct: Optional[float] = None,
+        pnl_usd: Optional[float] = None,
     ) -> bool:
-        """Send a trade-management event alert (breakeven, partial close, trail)."""
+        """Send a trade-management event (breakeven, partial close, trailing stop update)."""
         if not self.enabled:
             return False
 
         action_map = {
-            "breakeven": ("⚖️", "Breakeven set"),
-            "partial_close": ("💰", "Partial close 50%"),
-            "trailing_update": ("🔄", "Trailing stop updated"),
-            "exit_tp1": ("✅", "TP1 hit"),
-            "exit_tp2": ("✅✅", "TP2 hit"),
-            "exit_tp3": ("✅✅✅", "TP3 hit"),
-            "exit_sl": ("❌", "Stop Loss hit"),
+            "breakeven":        ("⚖️", "Breakeven set"),
+            "partial_close":    ("💰", "Partial close 50%"),
+            "trailing_update":  ("🔄", "Trailing stop updated"),
         }
-        icon, label = action_map.get(action, ("ℹ️", action))
+        icon, label = action_map.get(action, ("ℹ️", action.replace("_", " ").title()))
 
-        lines = [f"{icon} <b>{label}</b>: {instrument_name} ({direction})"]
-        lines.append(f"Price: <code>{price:.5f}</code>")
+        def _fmt(val: float) -> str:
+            return f"{val:.2f}" if val >= 10 else f"{val:.5f}"
+
+        lines = [
+            f"{icon} <b>{label}</b>: {instrument_name} ({direction})",
+            f"Price: <code>{_fmt(price)}</code>",
+        ]
         if new_sl is not None:
-            lines.append(f"New SL: <code>{new_sl:.5f}</code>")
+            lines.append(f"New SL: <code>{_fmt(new_sl)}</code>")
         if pnl_pct is not None:
             sign = "+" if pnl_pct >= 0 else ""
             lines.append(f"P&L: <b>{sign}{pnl_pct:.2f}%</b>")
+        if pnl_usd is not None:
+            sign = "+" if pnl_usd >= 0 else ""
+            lines.append(f"P&L $: <b>{sign}{pnl_usd:.2f} USD</b>")
+        lines.append(f"<code>{instrument_symbol}</code>")
 
         return await self.send_message("\n".join(lines))
 

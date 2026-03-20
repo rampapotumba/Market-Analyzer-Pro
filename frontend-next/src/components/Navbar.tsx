@@ -10,6 +10,7 @@ const NAV_ITEMS = [
   { href: "/backtests", label: "Backtests" },
   { href: "/macro", label: "Macro" },
   { href: "/calendar", label: "Calendar" },
+  { href: "/news", label: "News" },
   { href: "/accuracy", label: "Accuracy" },
   { href: "/logs", label: "Logs" },
   { href: "/settings", label: "Settings" },

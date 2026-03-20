@@ -131,8 +131,8 @@ class RiskManager:
         else:
             position_pct = (position_size_units / account) * Decimal("100")
 
-        # Cap at max risk
-        max_pct = Decimal(str(self.max_risk_pct)) * Decimal("10")  # 10x leverage max
+        # Cap at max risk per trade
+        max_pct = Decimal(str(self.max_risk_pct))
         position_pct = min(position_pct, max_pct)
 
         return position_pct.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)

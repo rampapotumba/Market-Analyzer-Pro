@@ -100,14 +100,16 @@ class YFinanceCollector(BaseCollector):
         interval = YFINANCE_TF_MAP.get(timeframe, "1h")
 
         try:
-            if start and end:
+            if start:
+                # When start is given, fetch from that date to end (or today)
+                end_dt = end or datetime.datetime.now(datetime.timezone.utc)
                 df = await self._with_retry(
                     self._fetch_yfinance,
                     symbol,
                     interval,
                     None,
                     start.strftime("%Y-%m-%d"),
-                    end.strftime("%Y-%m-%d"),
+                    end_dt.strftime("%Y-%m-%d"),
                 )
             else:
                 # Default: last 60 days

@@ -171,11 +171,11 @@ export default function AccuracyPage() {
           {/* Summary cards */}
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: 12 }}>
             <SummaryCard label="Total Trades"    value={String(stats!.total_trades)} />
-            <SummaryCard label="Win Rate"        value={`${stats!.win_rate_pct.toFixed(1)}%`}   color={winColor(stats!.win_rate_pct)} />
-            <SummaryCard label="Profit Factor"   value={stats!.profit_factor.toFixed(2)}         color={pfColor(stats!.profit_factor)} />
-            <SummaryCard label="Net PnL"         value={`$${stats!.total_pnl_usd.toFixed(2)}`}  color={pnlColor(stats!.total_pnl_usd)} />
-            <SummaryCard label="Avg Win"         value={`$${stats!.avg_win_usd.toFixed(2)}`}    color={C.green} />
-            <SummaryCard label="Avg Loss"        value={`$${stats!.avg_loss_usd.toFixed(2)}`}   color={C.red} />
+            <SummaryCard label="Win Rate"        value={stats!.win_rate_pct != null ? `${stats!.win_rate_pct.toFixed(1)}%` : "—"}   color={winColor(stats!.win_rate_pct ?? 0)} />
+            <SummaryCard label="Profit Factor"   value={stats!.profit_factor != null ? stats!.profit_factor.toFixed(2) : "—"}        color={pfColor(stats!.profit_factor ?? 0)} />
+            <SummaryCard label="Net PnL"         value={stats!.total_pnl_usd != null ? `$${stats!.total_pnl_usd.toFixed(2)}` : "—"} color={pnlColor(stats!.total_pnl_usd ?? 0)} />
+            <SummaryCard label="Avg Win"         value={stats!.avg_win_usd != null ? `$${stats!.avg_win_usd.toFixed(2)}` : "—"}     color={C.green} />
+            <SummaryCard label="Avg Loss"        value={stats!.avg_loss_usd != null ? `$${stats!.avg_loss_usd.toFixed(2)}` : "—"}   color={C.red} />
           </div>
 
           {/* W/L breakdown */}

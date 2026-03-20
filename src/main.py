@@ -7,13 +7,10 @@ from pathlib import Path
 
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
 
-from src.api.routes import router
 from src.api.routes_v2 import router_v2
-from src.api.websocket import websocket_all_prices, websocket_prices, websocket_signals
 from src.api.websocket_v2 import (
+    all_prices_ws_handler,
     portfolio_ws_handler,
     prices_ws_handler,
     signals_ws_handler,
@@ -124,7 +121,6 @@ app.add_middleware(
 setup_metrics(app)
 
 # REST API routes
-app.include_router(router)
 app.include_router(router_v2)
 
 
@@ -133,23 +129,20 @@ app.include_router(router_v2)
 
 @app.websocket("/ws/prices")
 async def ws_all_prices(websocket: WebSocket) -> None:
-    """WebSocket endpoint for all symbols price updates (sidebar)."""
-    await websocket_all_prices(websocket)
+    """Broadcast all symbol price ticks (sidebar)."""
+    await all_prices_ws_handler(websocket)
 
 
 @app.websocket("/ws/prices/{symbol}")
 async def ws_prices(websocket: WebSocket, symbol: str) -> None:
-    """WebSocket endpoint for real-time price updates."""
-    await websocket_prices(websocket, symbol)
+    """Price ticks for a specific symbol."""
+    await prices_ws_handler(websocket, symbol)
 
 
 @app.websocket("/ws/signals")
 async def ws_signals(websocket: WebSocket) -> None:
-    """WebSocket endpoint for real-time signal updates."""
-    await websocket_signals(websocket)
-
-
-# ── WebSocket v2 Routes ───────────────────────────────────────────────────────
+    """Real-time signal alerts."""
+    await signals_ws_handler(websocket)
 
 
 @app.websocket("/ws/v2/signals")
@@ -168,26 +161,6 @@ async def ws_v2_prices(websocket: WebSocket, symbol: str) -> None:
 async def ws_v2_portfolio(websocket: WebSocket) -> None:
     """WebSocket v2: real-time virtual portfolio updates."""
     await portfolio_ws_handler(websocket)
-
-
-# ── Static Files (Frontend) ──────────────────────────────────────────────────
-
-
-frontend_dir = Path(__file__).parent.parent / "frontend"
-if frontend_dir.exists():
-    app.mount("/assets", StaticFiles(directory=str(frontend_dir / "assets")), name="assets")
-
-    @app.get("/")
-    async def serve_dashboard() -> FileResponse:
-        return FileResponse(str(frontend_dir / "index.html"))
-
-    @app.get("/signals")
-    async def serve_signals() -> FileResponse:
-        return FileResponse(str(frontend_dir / "signals.html"))
-
-    @app.get("/accuracy")
-    async def serve_accuracy() -> FileResponse:
-        return FileResponse(str(frontend_dir / "accuracy.html"))
 
 
 if __name__ == "__main__":

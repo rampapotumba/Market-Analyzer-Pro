@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { api, type Signal, type SignalDetail } from "@/lib/api";
+import { SIGNAL_STATUS } from "@/lib/signalStatus";
 
 const STATUS_TABS = [
   { label: "ALL",       value: undefined },
@@ -56,7 +57,7 @@ function DetailPanel({ detail }: { detail: SignalDetail }) {
   if (!hasLlm) {
     return (
       <tr>
-        <td colSpan={11} style={{ padding: '12px 24px', background: '#0d1117', borderBottom: `1px solid ${C.border}` }}>
+        <td colSpan={12} style={{ padding: '12px 24px', background: '#0d1117', borderBottom: `1px solid ${C.border}` }}>
           <span style={{ fontSize: 12, color: C.muted, fontFamily: 'monospace' }}>
             Claude analysis not available for this signal (score below threshold).
           </span>
@@ -67,7 +68,7 @@ function DetailPanel({ detail }: { detail: SignalDetail }) {
 
   return (
     <tr>
-      <td colSpan={11} style={{ padding: '16px 24px', background: '#0d1117', borderBottom: `1px solid ${C.border}` }}>
+      <td colSpan={12} style={{ padding: '16px 24px', background: '#0d1117', borderBottom: `1px solid ${C.border}` }}>
         <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap' }}>
 
           {/* Score block */}
@@ -125,6 +126,19 @@ function DetailPanel({ detail }: { detail: SignalDetail }) {
         </div>
       </td>
     </tr>
+  );
+}
+
+function StatusBadge({ status }: { status: string }) {
+  const s = SIGNAL_STATUS[status] ?? { color: C.muted, bg: `${C.muted}18`, label: status.toUpperCase() };
+  return (
+    <span style={{
+      display: 'inline-flex', borderRadius: 4, padding: '2px 7px',
+      fontSize: 10, fontWeight: 700, fontFamily: 'monospace',
+      color: s.color, background: s.bg, border: `1px solid ${s.color}40`,
+    }}>
+      {s.label}
+    </span>
   );
 }
 
@@ -195,15 +209,22 @@ function SignalRow({
         <td style={{ padding: '10px 14px', fontSize: 12, color: C.muted }}>
           {signal.regime}
         </td>
+        <td style={{ padding: '10px 14px' }}>
+          <StatusBadge status={signal.status} />
+        </td>
         <td style={{ padding: '10px 14px', fontSize: 11, color: C.muted, fontFamily: 'monospace' }}>
-          {new Date(signal.created_at).toLocaleDateString()}
+          {(() => {
+            const d = new Date(signal.created_at);
+            const pad = (n: number) => String(n).padStart(2, '0');
+            return `${pad(d.getDate())}.${pad(d.getMonth() + 1)} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+          })()}
         </td>
       </tr>
 
       {isExpanded && (
         loadingDetail ? (
           <tr>
-            <td colSpan={11} style={{ padding: '12px 24px', background: '#0d1117', borderBottom: `1px solid ${C.border}` }}>
+            <td colSpan={12} style={{ padding: '12px 24px', background: '#0d1117', borderBottom: `1px solid ${C.border}` }}>
               <span style={{ fontSize: 12, color: C.muted, fontFamily: 'monospace' }}>Loading...</span>
             </td>
           </tr>
@@ -247,7 +268,7 @@ export default function SignalsPage() {
     }
   }
 
-  const HEADERS = ["Symbol", "TF", "Direction", "Score", "Claude", "Entry", "SL", "TP1", "R:R", "Regime", "Date"];
+  const HEADERS = ["Symbol", "TF", "Direction", "Score", "Claude", "Entry", "SL", "TP1", "R:R", "Regime", "Status", "Date"];
 
   return (
     <div style={{ maxWidth: 1280, margin: '0 auto', padding: '24px 16px' }}>
@@ -296,13 +317,13 @@ export default function SignalsPage() {
             <tbody>
               {loading ? (
                 <tr>
-                  <td colSpan={11} style={{ padding: '48px', textAlign: 'center', color: C.muted, fontSize: 13 }}>
+                  <td colSpan={12} style={{ padding: '48px', textAlign: 'center', color: C.muted, fontSize: 13 }}>
                     Loading...
                   </td>
                 </tr>
               ) : signals.length === 0 ? (
                 <tr>
-                  <td colSpan={11} style={{ padding: '48px', textAlign: 'center', color: C.muted, fontSize: 13 }}>
+                  <td colSpan={12} style={{ padding: '48px', textAlign: 'center', color: C.muted, fontSize: 13 }}>
                     No signals found
                   </td>
                 </tr>

@@ -46,6 +46,7 @@ class ConnectionManagerV2:
         self.signal_subs: list[WebSocket] = []
         self.portfolio_subs: list[WebSocket] = []
         self.price_subs: dict[str, list[WebSocket]] = {}
+        self.all_price_subs: list[WebSocket] = []
 
     # ── Connection management ─────────────────────────────────────────────────
 
@@ -77,6 +78,15 @@ class ConnectionManagerV2:
     def disconnect_portfolio(self, ws: WebSocket) -> None:
         if ws in self.portfolio_subs:
             self.portfolio_subs.remove(ws)
+
+    async def connect_all_prices(self, ws: WebSocket) -> None:
+        await ws.accept()
+        self.all_price_subs.append(ws)
+        logger.debug("WS-v2 /ws/prices: new subscriber (%d total)", len(self.all_price_subs))
+
+    def disconnect_all_prices(self, ws: WebSocket) -> None:
+        if ws in self.all_price_subs:
+            self.all_price_subs.remove(ws)
 
     def disconnect_price(self, ws: WebSocket, symbol: str) -> None:
         subs = self.price_subs.get(symbol, [])
@@ -110,18 +120,28 @@ class ConnectionManagerV2:
             self.disconnect_portfolio(ws)
 
     async def broadcast_price(self, symbol: str, tick: dict) -> None:
-        """Push a price tick to subscribers of that symbol."""
-        payload = json.dumps(
-            _json_safe({"type": "price", "symbol": symbol, "data": tick})
-        )
-        dead: list[WebSocket] = []
+        """Push a price tick to per-symbol subscribers and all-price subscribers.
+
+        Payload is the tick dict directly so frontend can read msg.type/msg.price at root.
+        """
+        payload = json.dumps(_json_safe(tick))
+        dead_sym: list[WebSocket] = []
         for ws in list(self.price_subs.get(symbol, [])):
             try:
                 await ws.send_text(payload)
             except Exception:
-                dead.append(ws)
-        for ws in dead:
+                dead_sym.append(ws)
+        for ws in dead_sym:
             self.disconnect_price(ws, symbol)
+
+        dead_all: list[WebSocket] = []
+        for ws in list(self.all_price_subs):
+            try:
+                await ws.send_text(payload)
+            except Exception:
+                dead_all.append(ws)
+        for ws in dead_all:
+            self.disconnect_all_prices(ws)
 
 
 # Module-level singleton
@@ -232,3 +252,22 @@ async def portfolio_ws_handler(websocket: WebSocket) -> None:
     except Exception as exc:
         logger.error("portfolio WS error: %s", exc)
         ws_manager_v2.disconnect_portfolio(websocket)
+
+
+async def all_prices_ws_handler(websocket: WebSocket) -> None:
+    """Stream all symbol price ticks to connected clients (used by sidebar)."""
+    await ws_manager_v2.connect_all_prices(websocket)
+    try:
+        while True:
+            try:
+                msg = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+                if msg == "ping":
+                    await websocket.send_text("pong")
+            except asyncio.TimeoutError:
+                await websocket.send_text(json.dumps({"type": "heartbeat"}))
+
+    except WebSocketDisconnect:
+        ws_manager_v2.disconnect_all_prices(websocket)
+    except Exception as exc:
+        logger.error("all_prices WS error: %s", exc)
+        ws_manager_v2.disconnect_all_prices(websocket)

@@ -104,6 +104,8 @@ async def open_position_for_signal(signal, db) -> bool:
 
         # Apply spread (SIM-02)
         actual_price = _apply_spread(signal.entry_price, signal.direction, market, pip_size)
+        spread_diff = abs(actual_price - signal.entry_price)
+        spread_pips = (spread_diff / pip_size).quantize(Decimal("0.0001")) if pip_size > 0 else Decimal("0")
 
         size_pct = Decimal("2.0")
         if signal.position_size_pct and signal.position_size_pct > 0:
@@ -128,11 +130,32 @@ async def open_position_for_signal(signal, db) -> bool:
             "breakeven_moved":          False,
             "partial_closed":           False,
             "account_balance_at_entry": account_balance_at_entry,
+            "spread_pips_applied":      spread_pips,
         })
         logger.info(
             f"[Simulator] Opened #{signal.id}: {signal.direction} "
             f"{signal.timeframe} @ {actual_price} (spread applied)"
         )
+
+        # Telegram notification
+        try:
+            from src.notifications.telegram import telegram
+            await telegram.send_position_opened(
+                instrument_symbol=instrument.symbol if instrument else "—",
+                instrument_name=instrument.name if instrument else "—",
+                direction=signal.direction,
+                timeframe=signal.timeframe,
+                entry_price=float(actual_price),
+                stop_loss=float(signal.stop_loss) if signal.stop_loss else None,
+                take_profit_1=float(signal.take_profit_1) if signal.take_profit_1 else None,
+                take_profit_2=float(signal.take_profit_2) if signal.take_profit_2 else None,
+                size_pct=float(size_pct),
+                risk_reward=float(signal.risk_reward) if signal.risk_reward else None,
+                spread_pips=float(spread_pips) if spread_pips else None,
+            )
+        except Exception as _tg_exc:
+            logger.warning(f"[Simulator] Telegram open-alert failed: {_tg_exc}")
+
         return True
     except Exception as exc:
         logger.warning(f"[Simulator] Failed to open position #{signal.id}: {exc}")

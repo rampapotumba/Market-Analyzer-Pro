@@ -6,7 +6,7 @@ Create Date: 2026-03-19 00:00:00.000000
 
 Changes:
   DROP (if exists) old backtest_runs / backtest_trades schema (walk-forward optimization)
-  CREATE backtest_runs  — UUID PK, params JSONB, status, summary JSONB
+  CREATE backtest_runs  — UUID PK, params TEXT, status, summary TEXT
   CREATE backtest_trades — SERIAL PK, run_id UUID FK (CASCADE), per-trade fields
 """
 
@@ -28,11 +28,11 @@ def upgrade() -> None:
     op.execute("""
         CREATE TABLE backtest_runs (
             id          VARCHAR(36)  PRIMARY KEY,
-            params      JSONB,
+            params      TEXT,
             status      VARCHAR(16)  NOT NULL DEFAULT 'pending',
             started_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
             completed_at TIMESTAMPTZ,
-            summary     JSONB
+            summary     TEXT
         )
     """)
 

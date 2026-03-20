@@ -3,7 +3,7 @@
 import { useEffect, useState, useCallback } from "react";
 import { Tooltip } from "@/components/Tooltip";
 
-const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+const API = process.env.NEXT_PUBLIC_API_URL ?? "";
 
 const C = {
   bg: '#0d1117',

@@ -2,8 +2,10 @@
 
 import asyncio
 import datetime
+import html
 import json
 import logging
+import re
 from typing import Any
 
 import feedparser
@@ -124,7 +126,9 @@ class RSSNewsCollector(BaseCollector):
                 if not headline:
                     continue
 
-                summary = entry.get("summary", "") or entry.get("description", "") or ""
+                raw_summary = entry.get("summary", "") or entry.get("description", "") or ""
+                summary = html.unescape(re.sub(r"<[^>]+>", " ", raw_summary)).strip()
+                summary = re.sub(r"\s{2,}", " ", summary)
 
                 # Parse published date
                 published_at = None

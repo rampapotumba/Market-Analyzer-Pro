@@ -3,7 +3,6 @@
 import asyncio
 import datetime
 import logging
-from typing import Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -352,25 +351,47 @@ async def job_simulate_trades() -> None:
         logger.error(f"[Scheduler] Simulator tick error: {exc}")
 
 
-async def job_cleanup_system_events() -> None:
-    """Delete system_events older than 3 days (runs daily)."""
+async def job_detect_regimes() -> None:
+    """Detect market regime for all active instruments (runs every 4 hours)."""
     try:
-        from src.database.crud import cleanup_system_events
+        from src.analysis.regime_detector import RegimeDetector
+
+        detector = RegimeDetector()
+        await detector.detect_all()
+        logger.info("[Scheduler] Regime detection completed")
+        await log_event(
+            EventType.SIGNAL_BATCH,
+            "Regime detection completed for all instruments",
+            source="job_detect_regimes",
+        )
+    except Exception as exc:
+        logger.error(f"[Scheduler] Regime detection job error: {exc}")
+        await log_event(EventType.SIGNAL_BATCH, str(exc), level="ERROR", source="job_detect_regimes")
+
+
+async def job_cleanup_system_events() -> None:
+    """Delete system_events older than 3 days and news older than 2 days (runs daily)."""
+    try:
+        from src.database.crud import cleanup_news_events, cleanup_system_events
         from src.database.engine import async_session_factory
 
         async with async_session_factory() as db:
-            deleted = await cleanup_system_events(db, days=3)
+            deleted_events = await cleanup_system_events(db, days=3)
+            deleted_news = await cleanup_news_events(db, days=2)
             await db.commit()
-        logger.info(f"[Scheduler] System events cleanup: {deleted} old records deleted")
-        if deleted:
+
+        logger.info(
+            f"[Scheduler] Cleanup: {deleted_events} system events, {deleted_news} news articles deleted"
+        )
+        if deleted_events or deleted_news:
             await log_event(
                 EventType.CLEANUP,
-                f"Deleted {deleted} system events older than 3 days",
+                f"Deleted {deleted_events} system events (>3d), {deleted_news} news articles (>2d)",
                 source="job_cleanup_system_events",
-                details={"deleted": deleted},
+                details={"deleted_events": deleted_events, "deleted_news": deleted_news},
             )
     except Exception as exc:
-        logger.error(f"[Scheduler] System events cleanup error: {exc}")
+        logger.error(f"[Scheduler] Cleanup job error: {exc}")
 
 
 def start_scheduler() -> None:
@@ -500,6 +521,17 @@ def start_scheduler() -> None:
         next_run_time=now + datetime.timedelta(minutes=2),
     )
 
+    # Regime detection — every 4 hours, starts 6min after boot (after first price collection)
+    scheduler.add_job(
+        job_detect_regimes,
+        trigger=IntervalTrigger(hours=4),
+        id="detect_regimes",
+        name="Detect Market Regimes",
+        replace_existing=True,
+        misfire_grace_time=600,
+        next_run_time=now + datetime.timedelta(minutes=6),
+    )
+
     # System events cleanup — daily, deletes records older than 3 days
     scheduler.add_job(
         job_cleanup_system_events,
@@ -521,13 +553,9 @@ def start_scheduler() -> None:
         f"  • Tracker: every {settings.TRACKER_CHECK_INTERVAL_MINUTES}min\n"
         f"  • Market Context: every 1h (DXY, VIX, TNX, funding rates)\n"
         f"  • COT:     every 7 days (CFTC COT reports)\n"
-        f"  • Calendar: every 12h (FMP economic events, next 14 days)\\n"
+        f"  • Calendar: every 12h (FMP economic events, next 14 days)\n"
+        f"  • Regime:  every 4h (ADX/ATR/VIX regime classification)\n"
         f"  • Simulator: every 1min (live SL/TP monitoring)"
     )
 
 
-def stop_scheduler() -> None:
-    """Gracefully stop the scheduler."""
-    if scheduler.running:
-        scheduler.shutdown(wait=False)
-        logger.info("[Scheduler] APScheduler stopped")
