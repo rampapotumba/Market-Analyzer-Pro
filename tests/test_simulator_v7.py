@@ -5439,8 +5439,8 @@ class TestV721TrendRiderStrategy:
         tp = result["tp_price"]
         atr = result["atr"]
 
-        assert sl == pytest.approx(float(entry - SL_ATR_MULTIPLIER * atr), rel=1e-6)
-        assert tp == pytest.approx(float(entry + TP_ATR_MULTIPLIER * atr), rel=1e-6)
+        assert float(sl) == pytest.approx(float(entry - SL_ATR_MULTIPLIER * atr), rel=1e-6)
+        assert float(tp) == pytest.approx(float(entry + TP_ATR_MULTIPLIER * atr), rel=1e-6)
 
     def test_v7_21_sl_tp_calculation_short(self) -> None:
         """SL = 2×ATR above entry, TP = 3×ATR below entry for SHORT."""
@@ -5464,8 +5464,8 @@ class TestV721TrendRiderStrategy:
         tp = result["tp_price"]
         atr = result["atr"]
 
-        assert sl == pytest.approx(float(entry + SL_ATR_MULTIPLIER * atr), rel=1e-6)
-        assert tp == pytest.approx(float(entry - TP_ATR_MULTIPLIER * atr), rel=1e-6)
+        assert float(sl) == pytest.approx(float(entry + SL_ATR_MULTIPLIER * atr), rel=1e-6)
+        assert float(tp) == pytest.approx(float(entry - TP_ATR_MULTIPLIER * atr), rel=1e-6)
 
     def test_v7_21_no_entry_insufficient_bars(self) -> None:
         """No entry when DataFrame has fewer rows than _MIN_BARS."""
