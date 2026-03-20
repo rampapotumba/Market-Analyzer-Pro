@@ -55,18 +55,30 @@ def _get_signal_strength(composite: float) -> str:
     sell:         -15..-10
     strong_sell:  <= -15
     """
-    if composite >= 15.0:
-        return "STRONG_BUY"
-    elif composite >= 10.0:
-        return "BUY"
-    elif composite >= 7.0:
-        return "WEAK_BUY"
-    elif composite <= -15.0:
-        return "STRONG_SELL"
-    elif composite <= -10.0:
-        return "SELL"
-    elif composite <= -7.0:
-        return "WEAK_SELL"
+    return _get_signal_strength_scaled(composite, scale=1.0)
+
+
+def _get_signal_strength_scaled(composite: float, scale: float = 1.0) -> str:
+    """Map composite score to signal strength bucket with scaled thresholds.
+
+    V6 (TASK-V6-02): when only TA is available (scale=0.45), thresholds
+    are proportionally reduced so the same quality gates apply.
+
+    Examples:
+      scale=1.0 (live):    STRONG_BUY >= 15.0, BUY >= 10.0, WEAK_BUY >= 7.0
+      scale=0.45 (backtest): STRONG_BUY >= 6.75, BUY >= 4.5, WEAK_BUY >= 3.15
+    """
+    abs_score = abs(composite)
+    strong_threshold = 15.0 * scale
+    buy_threshold = 10.0 * scale
+    weak_threshold = 7.0 * scale
+
+    if abs_score >= strong_threshold:
+        return "STRONG_BUY" if composite > 0 else "STRONG_SELL"
+    elif abs_score >= buy_threshold:
+        return "BUY" if composite > 0 else "SELL"
+    elif abs_score >= weak_threshold:
+        return "WEAK_BUY" if composite > 0 else "WEAK_SELL"
     else:
         return "HOLD"
 
@@ -149,6 +161,10 @@ class SignalFilterPipeline:
         d1_rows = context.get("d1_rows", [])
         economic_events = context.get("economic_events", [])
         dxy_rsi = context.get("dxy_rsi")
+        # V6 TASK-V6-02: available_weight for proportional threshold scaling.
+        # Default 1.0 = live mode (all components available).
+        # Backtest passes 0.45 (only TA available).
+        available_weight: float = context.get("available_weight", 1.0)
 
         # Session filter: must run first (cheapest check)
         if self.apply_session_filter and candle_ts is not None:
@@ -158,13 +174,15 @@ class SignalFilterPipeline:
 
         # SIM-25: Score threshold
         if self.apply_score_filter:
-            passed, reason = self.check_score_threshold(composite, market_type, symbol)
+            passed, reason = self.check_score_threshold(
+                composite, market_type, symbol, available_weight=available_weight
+            )
             if not passed:
                 return False, reason
 
         # SIM-31: Signal strength — always-on quality gate (not flag-controlled).
         # Blocks WEAK_BUY, WEAK_SELL, HOLD regardless of other filter flags.
-        passed, reason = self.check_signal_strength(composite, direction)
+        passed, reason = self.check_signal_strength(composite, direction, available_weight=available_weight)
         if not passed:
             return False, reason
 
@@ -213,15 +231,23 @@ class SignalFilterPipeline:
         return True, "all_passed"
 
     def check_score_threshold(
-        self, composite: float, market_type: str, symbol: str
+        self,
+        composite: float,
+        market_type: str,
+        symbol: str,
+        available_weight: float = 1.0,
     ) -> tuple[bool, str]:
-        """SIM-25 + SIM-28: composite score must exceed threshold.
+        """SIM-25 + SIM-28 + V6-TASK-V6-02: composite score must exceed threshold.
 
         Priority (highest to lowest):
           1. instrument_override (INSTRUMENT_OVERRIDES[symbol])
           2. constructor min_composite_score (self.min_composite_score)
           3. market_default (MIN_COMPOSITE_SCORE_CRYPTO for crypto)
           4. global_default (MIN_COMPOSITE_SCORE)
+
+        V6 (TASK-V6-02): effective_threshold = threshold * available_weight.
+        In backtest (only TA, available_weight=0.45): threshold 15 → 6.75.
+        In live (all components, available_weight=1.0): threshold 15 → 15.0.
         """
         from src.config import INSTRUMENT_OVERRIDES, MIN_COMPOSITE_SCORE, MIN_COMPOSITE_SCORE_CRYPTO
 
@@ -233,8 +259,12 @@ class SignalFilterPipeline:
         overrides = INSTRUMENT_OVERRIDES.get(symbol, {})
         if "min_composite_score" in overrides:
             threshold = overrides["min_composite_score"]
-        if abs(composite) < threshold:
-            return False, f"score_below_threshold:{composite:.1f}<{threshold}"
+
+        # V6 TASK-V6-02: proportional scaling
+        effective_threshold = threshold * available_weight
+
+        if abs(composite) < effective_threshold:
+            return False, f"score_below_threshold:{composite:.1f}<{effective_threshold:.2f}"
         return True, "ok"
 
     def check_regime(self, regime: str, symbol: str = "") -> tuple[bool, str]:
@@ -344,17 +374,24 @@ class SignalFilterPipeline:
                 return False, "economic_calendar_block"
         return True, "ok"
 
-    def check_signal_strength(self, composite: float, direction: str) -> tuple[bool, str]:
-        """SIM-31: Signal strength must be BUY/STRONG_BUY or SELL/STRONG_SELL.
+    def check_signal_strength(
+        self,
+        composite: float,
+        direction: str,
+        available_weight: float = 1.0,
+    ) -> tuple[bool, str]:
+        """SIM-31 + V6-TASK-V6-02: Signal strength must be BUY/STRONG_BUY or SELL/STRONG_SELL.
 
         This is NOT flag-controlled — it is a fundamental quality gate that
         always runs regardless of configuration flags.
+
+        V6: uses scaled thresholds when available_weight < 1.0 (backtest mode).
         """
-        strength = _get_signal_strength(composite)
+        strength = _get_signal_strength_scaled(composite, scale=available_weight)
         if strength not in ALLOWED_SIGNAL_STRENGTHS:
             logger.debug(
-                "[SIM-31] Filtered weak signal: %s (score=%.2f, direction=%s)",
-                strength, composite, direction,
+                "[SIM-31] Filtered weak signal: %s (score=%.2f, direction=%s, scale=%.2f)",
+                strength, composite, direction, available_weight,
             )
             return False, f"signal_strength_weak:{strength}"
         return True, "ok"

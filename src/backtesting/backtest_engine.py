@@ -18,6 +18,8 @@ Isolation guarantee: this module NEVER writes to signal_results or virtual_portf
 
 import asyncio
 import datetime
+import hashlib
+import json
 import logging
 import math
 from decimal import Decimal
@@ -59,7 +61,7 @@ WEEKDAY_FILTER = {
 }
 
 
-def get_backtest_progress(run_id: str) -> float | None:
+def get_backtest_progress(run_id: str) -> Optional[float]:
     """Return progress percentage (0–100) for a running backtest, or None if not tracked."""
     return _backtest_progress.get(run_id)
 
@@ -124,18 +126,26 @@ def _get_signal_strength(composite: float) -> str:
     sell:         -15..-10
     strong_sell:  <= -15
     """
-    if composite >= 15.0:
-        return "STRONG_BUY"
-    elif composite >= 10.0:
-        return "BUY"
-    elif composite >= 7.0:
-        return "WEAK_BUY"
-    elif composite <= -15.0:
-        return "STRONG_SELL"
-    elif composite <= -10.0:
-        return "SELL"
-    elif composite <= -7.0:
-        return "WEAK_SELL"
+    return _get_signal_strength_scaled(composite, scale=1.0)
+
+
+def _get_signal_strength_scaled(composite: float, scale: float = 1.0) -> str:
+    """Map composite score to signal strength bucket with scaled thresholds.
+
+    V6 (TASK-V6-02): when only TA is available (scale=0.45), thresholds are
+    proportionally reduced so the same quality gates apply in backtest.
+
+    Examples:
+      scale=1.0 (live):      STRONG_BUY >= 15.0, BUY >= 10.0
+      scale=0.45 (backtest): STRONG_BUY >= 6.75, BUY >= 4.5
+    """
+    abs_score = abs(composite)
+    if abs_score >= 15.0 * scale:
+        return "STRONG_BUY" if composite > 0 else "STRONG_SELL"
+    elif abs_score >= 10.0 * scale:
+        return "BUY" if composite > 0 else "SELL"
+    elif abs_score >= 7.0 * scale:
+        return "WEAK_BUY" if composite > 0 else "WEAK_SELL"
     else:
         return "HOLD"
 
@@ -401,6 +411,23 @@ def _compute_summary(
     mae_values = [float(t.mae or 0) for t in trades if t.mae is not None and t.mae > 0]
     avg_mae_pct_of_sl = sum(mae_values) / len(mae_values) if mae_values else 0.0
 
+    # V6 TASK-V6-01: data_hash — deterministic fingerprint of the trade set
+    _trade_dicts_for_hash = [
+        {
+            "symbol": t.symbol,
+            "direction": t.direction,
+            "entry_price": str(t.entry_price),
+            "exit_price": str(t.exit_price),
+            "pnl_usd": str(t.pnl_usd),
+            "entry_at": t.entry_at.isoformat() if t.entry_at else None,
+            "exit_at": t.exit_at.isoformat() if t.exit_at else None,
+            "exit_reason": t.exit_reason,
+        }
+        for t in sorted(trades, key=lambda x: (x.entry_at or datetime.datetime.min, x.symbol))
+    ]
+    _trade_data_str = json.dumps(_trade_dicts_for_hash, sort_keys=True, default=str)
+    data_hash = hashlib.sha256(_trade_data_str.encode()).hexdigest()[:16]
+
     return {
         "total_trades": total,
         "win_rate_pct": round(win_rate, 2),
@@ -427,6 +454,8 @@ def _compute_summary(
         "mae_exit_count": mae_exit_count,
         "time_exit_count": time_exit_count,
         "avg_mae_pct_of_sl": round(avg_mae_pct_of_sl, 4),
+        # V6 TASK-V6-01: data integrity hash
+        "data_hash": data_hash,
     }
 
 
@@ -786,7 +815,7 @@ class BacktestEngine:
     async def _simulate(
         self,
         params: BacktestParams,
-        run_id: str | None = None,
+        run_id: Optional[str] = None,
     ) -> list[BacktestTradeResult]:
         """Core simulation loop. Returns list of completed trades.
 
@@ -880,7 +909,7 @@ class BacktestEngine:
         account_size: Decimal,
         apply_slippage: bool,
         progress_cb: Any = None,
-        economic_events: list | None = None,
+        economic_events: Optional[list] = None,
         params: Optional[BacktestParams] = None,
     ) -> list[BacktestTradeResult]:
         """Simulate one symbol over all its candles. Returns closed trades.
@@ -1066,6 +1095,8 @@ class BacktestEngine:
                 "d1_rows": [],   # D1 data not available in candle-level loop
                 "economic_events": economic_events or [],
                 "dxy_rsi": None,  # DXY not available in backtest without external data
+                # V6 TASK-V6-02: only TA available in backtest → proportional scaling
+                "available_weight": _TA_WEIGHT,
             }
             passed, reason = pipeline.run_all(filter_context)
             if not passed:

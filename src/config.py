@@ -151,17 +151,31 @@ BLOCKED_REGIMES: list = ["RANGING"]
 INSTRUMENT_OVERRIDES: dict = {
     "BTC/USDT": {
         "sl_atr_multiplier": 3.5,
-        "min_composite_score": 20,
-        "allowed_regimes": ["STRONG_TREND_BULL", "STRONG_TREND_BEAR"],
+        "min_composite_score": 15,  # v6: lowered from 20 (TASK-V6-03)
+        "allowed_regimes": [
+            "STRONG_TREND_BULL", "STRONG_TREND_BEAR",
+            "TREND_BULL", "TREND_BEAR",  # v6: expanded (TASK-V6-03)
+        ],
     },
     "ETH/USDT": {
         "sl_atr_multiplier": 3.5,
-        "min_composite_score": 20,
+        "min_composite_score": 15,  # v6: lowered from 20 (TASK-V6-03)
     },
     "GBPUSD=X": {
-        "min_composite_score": 20,
+        # v6: TASK-V6-04 — override removed; global threshold 15 * 0.45 = 6.75 is sufficient
     },
     "USDCHF=X": {
         "min_composite_score": 18,
     },
+}
+
+# ── v6: Score component weights (TASK-V6-02) ─────────────────────────────────
+# Used for proportional threshold scaling.
+# In backtest (only TA available): available_weight = 0.45
+# In live (all components):        available_weight = 0.45 + 0.25 + 0.20 + 0.10 = 1.0
+SCORE_COMPONENT_WEIGHTS: dict = {
+    "ta": 0.45,
+    "fa": 0.25,
+    "sentiment": 0.20,
+    "geo": 0.10,
 }

@@ -147,13 +147,13 @@ def test_sim25_score_above_threshold_accepted():
 
 
 def test_sim25_crypto_higher_threshold_rejected():
-    """Pipeline: crypto score=17 → blocked (needs 20 for BTC/USDT override)."""
+    """Pipeline: crypto score=6 → blocked (BTC/USDT override threshold=15, live scale=1.0)."""
     from src.signals.filter_pipeline import SignalFilterPipeline
 
     pipeline = SignalFilterPipeline()
-    # BTC/USDT has override min_composite_score=20. 17.1 < 20 → rejected.
-    passed, reason = pipeline.check_score_threshold(17.1, "crypto", "BTC/USDT")
-    assert not passed, "Crypto score 17 should be rejected (BTC/USDT override threshold=20)"
+    # BTC/USDT override min_composite_score=15 (v6: lowered from 20). 6 < 15 → rejected.
+    passed, reason = pipeline.check_score_threshold(6.0, "crypto", "BTC/USDT")
+    assert not passed, "Crypto score 6 should be rejected (BTC/USDT threshold=15)"
     assert "score_below_threshold" in reason
 
 
@@ -238,25 +238,24 @@ def test_sim28_btc_wider_sl():
 
 
 def test_sim28_btc_higher_threshold():
-    """Pipeline: BTC/USDT composite=17 → blocked by score filter (override threshold=20)."""
+    """Pipeline: BTC/USDT composite=6 → blocked by score filter (override threshold=15, v6)."""
     from src.signals.filter_pipeline import SignalFilterPipeline
 
     pipeline = SignalFilterPipeline()
-    # 17.1 < 20 (BTC/USDT instrument override)
-    passed, reason = pipeline.check_score_threshold(17.1, "crypto", "BTC/USDT")
-    assert not passed, "BTC score 17 should be rejected (override threshold=20)"
+    # 6 < 15 (BTC/USDT instrument override, v6: lowered from 20 in TASK-V6-03)
+    passed, reason = pipeline.check_score_threshold(6.0, "crypto", "BTC/USDT")
+    assert not passed, "BTC score 6 should be rejected (override threshold=15)"
     assert "score_below_threshold" in reason
 
 
 def test_sim28_btc_only_strong_trend():
-    """Pipeline: BTC/USDT TREND_BULL regime → blocked (only STRONG_TREND_BULL/BEAR allowed)."""
+    """Pipeline: BTC/USDT TREND_BULL → allowed (v6 TASK-V6-03 expanded allowed_regimes)."""
     from src.signals.filter_pipeline import SignalFilterPipeline
 
     pipeline = SignalFilterPipeline()
-    # Score is fine (46 > 20), but TREND_BULL not in allowed_regimes for BTC/USDT
+    # v6 TASK-V6-03: TREND_BULL is now in allowed_regimes for BTC/USDT
     passed, reason = pipeline.check_regime("TREND_BULL", "BTC/USDT")
-    assert not passed, "BTC TREND_BULL should be blocked (only STRONG_TREND allowed)"
-    assert "regime_not_in_allowed" in reason
+    assert passed, f"BTC TREND_BULL should be allowed (v6 expanded regimes), got: {reason}"
 
 
 def test_sim28_btc_strong_trend_allowed():
@@ -273,14 +272,14 @@ def test_sim28_btc_strong_trend_allowed():
 
 
 def test_sim28_gbpusd_higher_threshold():
-    """Pipeline: GBPUSD score=17 → blocked (override threshold=20)."""
+    """Pipeline: GBPUSD uses global threshold (v6 TASK-V6-04: override removed)."""
     from src.signals.filter_pipeline import SignalFilterPipeline
 
     pipeline = SignalFilterPipeline()
-    # 17.1 < 20 (GBPUSD=X instrument override)
-    passed, reason = pipeline.check_score_threshold(17.1, "forex", "GBPUSD=X")
-    assert not passed, "GBPUSD score 17 should be rejected (override threshold=20)"
-    assert "score_below_threshold" in reason
+    # v6 TASK-V6-04: GBPUSD=X override min_composite_score=20 removed.
+    # Now uses global threshold=15. Score=16 > 15 → passes.
+    passed, reason = pipeline.check_score_threshold(16.0, "forex", "GBPUSD=X")
+    assert passed, f"GBPUSD score 16 should pass global threshold=15 (v6 removed override), got: {reason}"
 
 
 def test_sim28_gbpusd_score_above_override_accepted():
@@ -1190,12 +1189,13 @@ def test_sim42_pipeline_weekday_blocks_friday():
 
 
 def test_sim42_check_score_threshold_uses_instrument_override():
-    """check_score_threshold uses INSTRUMENT_OVERRIDES for GBPUSD."""
+    """check_score_threshold uses INSTRUMENT_OVERRIDES for USDCHF=X (override=18)."""
     from src.signals.filter_pipeline import SignalFilterPipeline
 
     pipeline = SignalFilterPipeline()
-    # GBPUSD=X override is min_composite_score=20; score=16 < 20 → blocked
-    passed, reason = pipeline.check_score_threshold(16.0, "forex", "GBPUSD=X")
+    # USDCHF=X override is min_composite_score=18; score=16 < 18 → blocked
+    # (Note: GBPUSD=X override was removed in v6 TASK-V6-04)
+    passed, reason = pipeline.check_score_threshold(16.0, "forex", "USDCHF=X")
     assert not passed
     assert "score_below_threshold" in reason
 
