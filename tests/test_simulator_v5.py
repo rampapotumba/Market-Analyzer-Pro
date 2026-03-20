@@ -147,11 +147,11 @@ def test_sim25_score_above_threshold_accepted():
 
 
 def test_sim25_crypto_higher_threshold_rejected():
-    """Pipeline: crypto score=6 → blocked (BTC/USDT override threshold=15, live scale=1.0)."""
+    """Pipeline: crypto score=6 → blocked (BTC/USDT override threshold=25, v6-CAL-05)."""
     from src.signals.filter_pipeline import SignalFilterPipeline
 
     pipeline = SignalFilterPipeline()
-    # BTC/USDT override min_composite_score=15 (v6: lowered from 20). 6 < 15 → rejected.
+    # BTC/USDT override min_composite_score=25 (v6-CAL-05: raised from 20). 6 < 25 → rejected.
     passed, reason = pipeline.check_score_threshold(6.0, "crypto", "BTC/USDT")
     assert not passed, "Crypto score 6 should be rejected (BTC/USDT threshold=15)"
     assert "score_below_threshold" in reason
@@ -238,13 +238,13 @@ def test_sim28_btc_wider_sl():
 
 
 def test_sim28_btc_higher_threshold():
-    """Pipeline: BTC/USDT composite=6 → blocked by score filter (override threshold=15, v6)."""
+    """Pipeline: BTC/USDT composite=6 → blocked by score filter (override threshold=25, v6-CAL-05)."""
     from src.signals.filter_pipeline import SignalFilterPipeline
 
     pipeline = SignalFilterPipeline()
-    # 6 < 15 (BTC/USDT instrument override, v6: lowered from 20 in TASK-V6-03)
+    # 6 < 25 (BTC/USDT instrument override, v6-CAL-05: raised to 25)
     passed, reason = pipeline.check_score_threshold(6.0, "crypto", "BTC/USDT")
-    assert not passed, "BTC score 6 should be rejected (override threshold=15)"
+    assert not passed, "BTC score 6 should be rejected (override threshold=25)"
     assert "score_below_threshold" in reason
 
 

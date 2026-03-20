@@ -13,6 +13,8 @@ from typing import Optional
 
 import pandas as pd
 
+from src.config import WEAK_WEEKDAY_SCORE_MULTIPLIER, WEAK_WEEKDAYS
+
 logger = logging.getLogger(__name__)
 
 # SIM-31: Allowed signal strengths (weak signals filtered out).
@@ -190,7 +192,6 @@ class SignalFilterPipeline:
         # V6-CAL-09: Compute weekday multiplier for Monday/Tuesday forex penalty
         weekday_multiplier = 1.0
         if candle_ts is not None and market_type == "forex":
-            from src.config import WEAK_WEEKDAY_SCORE_MULTIPLIER, WEAK_WEEKDAYS
             if candle_ts.weekday() in WEAK_WEEKDAYS:
                 weekday_multiplier = WEAK_WEEKDAY_SCORE_MULTIPLIER
 
@@ -396,9 +397,9 @@ class SignalFilterPipeline:
         """SIM-30 + V6-TASK-V6-08: RSI and MACD alignment.
 
         LONG:  RSI > 50 AND MACD line > Signal line
-        SHORT: RSI < SHORT_RSI_THRESHOLD (40) AND MACD line < Signal line
+        SHORT: RSI < SHORT_RSI_THRESHOLD (30) AND MACD line < Signal line
 
-        V6 (TASK-V6-08): SHORT uses stricter RSI threshold (< 40 instead of < 50)
+        V6 (TASK-V6-08): SHORT uses stricter RSI threshold (< 30 instead of < 50)
         to filter out weak bearish signals that caused -$72.18 PnL.
         """
         from src.config import SHORT_RSI_THRESHOLD

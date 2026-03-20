@@ -97,6 +97,10 @@ _COOLDOWN_MINUTES: dict[str, int] = {
     "H1": 60, "H4": 240, "D1": 1440,
 }
 
+# SIM-35: Maximum candles before time-based exit (only when unrealized PnL <= 0).
+# Mirrors TIME_EXIT_CANDLES in config.py.
+_TIME_EXIT_CANDLES: dict[str, int] = {"H1": 24, "H4": 20, "D1": 10}
+
 # EU/NA forex pairs blocked during Asian low-liquidity session (00:00–06:59 UTC)
 # mirrors SignalEngine._FOREX_PAIRS_EU_NA + _is_low_liquidity_session
 _FOREX_PAIRS_EU_NA: frozenset[str] = frozenset({
@@ -1195,6 +1199,7 @@ class BacktestEngine:
                     market_type=market_type,
                     apply_slippage=apply_slippage,
                     candles_since_entry=candles_since_entry,
+                    account_size=account_size,
                 )
                 if closed:
                     trades.append(closed)
@@ -1380,6 +1385,7 @@ class BacktestEngine:
                 mfe=Decimal(str(round(open_trade["mfe"], 8))),
                 mae=Decimal(str(round(open_trade["mae"], 8))),
                 regime=open_trade.get("regime"),
+                sl_price=open_trade["stop_loss"],
             ))
 
         # V6 TASK-V6-10: return filter stats alongside trades
@@ -1392,6 +1398,7 @@ class BacktestEngine:
         market_type: str,
         apply_slippage: bool,
         candles_since_entry: int = 0,
+        account_size: Decimal = Decimal("1000"),
     ) -> Optional[BacktestTradeResult]:
         """
         SIM-09 logic: check SL and TP by candle high/low.
@@ -1439,8 +1446,7 @@ class BacktestEngine:
         # V6-CAL-03: H1 сокращен с 48 до 24 — 61.6% trades выходили по time_exit,
         # сидя 2 дня без прогресса. 1 день достаточен для H1 сигналов.
         if exit_reason is None:
-            _time_exit_candles: dict[str, int] = {"H1": 24, "H4": 20, "D1": 10}
-            max_candles = _time_exit_candles.get(timeframe, 24)
+            max_candles = _TIME_EXIT_CANDLES.get(timeframe, 24)
             if candles_since_entry >= max_candles:
                 # Compute unrealized PnL at candle close
                 if direction == "LONG":
@@ -1474,7 +1480,7 @@ class BacktestEngine:
         pnl_pips, pnl_usd = _compute_pnl(
             direction, entry, exit_price,
             Decimal(str(open_trade["position_pct"])),
-            Decimal("1000"),  # account size for P&L pct calculation
+            account_size,
             market_type,
         )
 
