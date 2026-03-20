@@ -2412,3 +2412,259 @@ class TestV712ComputeSummaryByRegime:
         assert set(by_r.keys()) >= {"STRONG_TREND_BULL", "VOLATILE"}
         assert by_r["STRONG_TREND_BULL"]["trades"] == 2
         assert by_r["VOLATILE"]["trades"] == 1
+
+
+# ── TASK-V7-13: Statistical significance tests ────────────────────────────────
+
+
+def _make_trade(
+    pnl_usd: float,
+    result: str = "win",
+    exit_reason: str = "tp_hit",
+) -> "Any":
+    """Create a minimal BacktestTradeResult for statistical tests."""
+    from src.backtesting.backtest_params import BacktestTradeResult
+
+    return BacktestTradeResult(
+        symbol="EURUSD=X",
+        timeframe="H1",
+        direction="LONG",
+        entry_price=Decimal("1.10000"),
+        exit_price=Decimal("1.11000"),
+        exit_reason=exit_reason,
+        pnl_usd=Decimal(str(pnl_usd)),
+        result=result,
+    )
+
+
+def _make_winning_trades(n: int, pnl: float = 10.0) -> list:
+    return [_make_trade(pnl, result="win", exit_reason="tp_hit") for _ in range(n)]
+
+
+def _make_losing_trades(n: int, pnl: float = -8.0) -> list:
+    return [_make_trade(pnl, result="loss", exit_reason="sl_hit") for _ in range(n)]
+
+
+class TestV713StatisticalTests:
+    """TASK-V7-13: Statistical significance tests added to backtest summary."""
+
+    # ── Import helpers ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _fn():
+        from src.backtesting.backtest_engine import _compute_statistical_tests
+        return _compute_statistical_tests
+
+    # ── Insufficient data edge cases ──────────────────────────────────────────
+
+    def test_v7_13_zero_trades_returns_insufficient(self) -> None:
+        """0 trades → INSUFFICIENT_DATA verdict."""
+        fn = self._fn()
+        result = fn([])
+        assert result["verdict"] == "INSUFFICIENT_DATA"
+        assert result["min_trades"] == 10
+
+    def test_v7_13_nine_trades_returns_insufficient(self) -> None:
+        """9 trades (< 10) → INSUFFICIENT_DATA verdict."""
+        fn = self._fn()
+        trades = _make_winning_trades(9)
+        result = fn(trades)
+        assert result["verdict"] == "INSUFFICIENT_DATA"
+        assert result["min_trades"] == 10
+
+    def test_v7_13_exactly_ten_trades_computes(self) -> None:
+        """Exactly 10 trades does not return INSUFFICIENT_DATA."""
+        fn = self._fn()
+        trades = _make_winning_trades(5) + _make_losing_trades(5)
+        result = fn(trades)
+        assert result["verdict"] != "INSUFFICIENT_DATA"
+        assert "t_stat" in result
+        assert "p_value" in result
+
+    # ── Result structure ──────────────────────────────────────────────────────
+
+    def test_v7_13_result_contains_all_required_keys(self) -> None:
+        """Summary dict contains all required keys for >= 10 trades."""
+        fn = self._fn()
+        trades = _make_winning_trades(15) + _make_losing_trades(10)
+        result = fn(trades)
+
+        required = {
+            "n_trades", "t_stat", "p_value",
+            "pf_ci_5th", "pf_ci_95th",
+            "sharpe", "sortino",
+            "max_consecutive_losses",
+            "verdict",
+        }
+        assert required.issubset(result.keys())
+
+    def test_v7_13_n_trades_matches_input(self) -> None:
+        """n_trades equals len(trades)."""
+        fn = self._fn()
+        trades = _make_winning_trades(12) + _make_losing_trades(8)
+        result = fn(trades)
+        assert result["n_trades"] == 20
+
+    # ── t-stat direction ──────────────────────────────────────────────────────
+
+    def test_v7_13_positive_returns_give_positive_t_stat(self) -> None:
+        """Consistently profitable trades → t_stat > 0."""
+        fn = self._fn()
+        trades = _make_winning_trades(20, pnl=15.0) + _make_losing_trades(5, pnl=-5.0)
+        result = fn(trades)
+        assert result["t_stat"] > 0, f"Expected positive t_stat, got {result['t_stat']}"
+
+    def test_v7_13_negative_returns_give_negative_t_stat(self) -> None:
+        """Consistently losing trades → t_stat < 0."""
+        fn = self._fn()
+        trades = _make_losing_trades(20, pnl=-15.0) + _make_winning_trades(5, pnl=3.0)
+        result = fn(trades)
+        assert result["t_stat"] < 0, f"Expected negative t_stat, got {result['t_stat']}"
+
+    # ── All wins / all losses ─────────────────────────────────────────────────
+
+    def test_v7_13_all_wins_no_crash(self) -> None:
+        """All winning trades — no crash, verdict computed."""
+        fn = self._fn()
+        trades = _make_winning_trades(15, pnl=10.0)
+        result = fn(trades)
+        # PF bootstrap: no losses in population → pf_ci values may be None
+        assert result["verdict"] in {"SIGNIFICANT", "NOT_SIGNIFICANT"}
+        assert result["max_consecutive_losses"] == 0
+
+    def test_v7_13_all_losses_no_crash(self) -> None:
+        """All losing trades — no crash, verdict is NOT_SIGNIFICANT."""
+        fn = self._fn()
+        trades = _make_losing_trades(15, pnl=-10.0)
+        result = fn(trades)
+        assert result["verdict"] == "NOT_SIGNIFICANT"
+        assert result["max_consecutive_losses"] == 15
+
+    # ── Max consecutive losses ────────────────────────────────────────────────
+
+    def test_v7_13_max_consecutive_losses_correct(self) -> None:
+        """Max consecutive losses is computed correctly."""
+        fn = self._fn()
+        # Pattern: win, loss, loss, loss, win, loss, loss
+        trades = [
+            _make_trade(10.0, result="win"),
+            _make_trade(-5.0, result="loss"),
+            _make_trade(-5.0, result="loss"),
+            _make_trade(-5.0, result="loss"),
+            _make_trade(10.0, result="win"),
+            _make_trade(-5.0, result="loss"),
+            _make_trade(-5.0, result="loss"),
+            _make_trade(10.0, result="win"),
+            _make_trade(10.0, result="win"),
+            _make_trade(10.0, result="win"),
+        ]
+        result = fn(trades)
+        assert result["max_consecutive_losses"] == 3
+
+    # ── Sharpe / Sortino direction ────────────────────────────────────────────
+
+    def test_v7_13_high_winrate_gives_positive_sharpe(self) -> None:
+        """80%+ win rate with good R:R → positive Sharpe."""
+        fn = self._fn()
+        trades = _make_winning_trades(16, pnl=10.0) + _make_losing_trades(4, pnl=-5.0)
+        result = fn(trades)
+        assert result["sharpe"] > 0
+
+    def test_v7_13_all_losses_sortino_zero_or_negative(self) -> None:
+        """All-loss scenario → sortino <= 0."""
+        fn = self._fn()
+        trades = _make_losing_trades(15, pnl=-10.0)
+        result = fn(trades)
+        assert result["sortino"] <= 0
+
+    # ── Bootstrap CI ─────────────────────────────────────────────────────────
+
+    def test_v7_13_bootstrap_ci_5th_below_95th(self) -> None:
+        """Bootstrap CI: pf_ci_5th <= pf_ci_95th for mixed trades."""
+        fn = self._fn()
+        trades = _make_winning_trades(12) + _make_losing_trades(8)
+        result = fn(trades)
+        if result["pf_ci_5th"] is not None and result["pf_ci_95th"] is not None:
+            assert result["pf_ci_5th"] <= result["pf_ci_95th"]
+
+    # ── Verdict: SIGNIFICANT ──────────────────────────────────────────────────
+
+    def test_v7_13_strong_edge_gives_significant_verdict(self) -> None:
+        """Very strong and consistent edge (high win rate, big R:R) → SIGNIFICANT."""
+        fn = self._fn()
+        # 30 wins at +20 each, 5 losses at -5 each — very strong edge
+        trades = _make_winning_trades(30, pnl=20.0) + _make_losing_trades(5, pnl=-5.0)
+        result = fn(trades)
+        # With t_stat >> 0 and consistent profitability, should be SIGNIFICANT
+        # (p_value < 0.05, pf_5th > 1.0, sharpe > 0.5)
+        assert result["verdict"] == "SIGNIFICANT", (
+            f"Expected SIGNIFICANT but got {result['verdict']}. "
+            f"p={result['p_value']}, pf5={result['pf_ci_5th']}, sharpe={result['sharpe']}"
+        )
+
+    def test_v7_13_breakeven_gives_not_significant_verdict(self) -> None:
+        """Breakeven trades (equal wins and losses) → NOT_SIGNIFICANT."""
+        fn = self._fn()
+        trades = _make_winning_trades(10, pnl=10.0) + _make_losing_trades(10, pnl=-10.0)
+        result = fn(trades)
+        assert result["verdict"] == "NOT_SIGNIFICANT"
+
+    # ── Integration: summary contains statistical_tests key ──────────────────
+
+    def test_v7_13_summary_contains_statistical_tests_key(self) -> None:
+        """_compute_summary output includes 'statistical_tests' key."""
+        from decimal import Decimal
+
+        from src.backtesting.backtest_engine import _compute_summary
+        from src.backtesting.backtest_params import BacktestTradeResult
+
+        import datetime
+
+        trades = []
+        for i in range(15):
+            pnl = 10.0 if i < 10 else -5.0
+            res = "win" if i < 10 else "loss"
+            reason = "tp_hit" if i < 10 else "sl_hit"
+            trades.append(BacktestTradeResult(
+                symbol="EURUSD=X",
+                timeframe="H1",
+                direction="LONG",
+                entry_price=Decimal("1.10000"),
+                exit_price=Decimal("1.11000"),
+                exit_reason=reason,
+                pnl_usd=Decimal(str(pnl)),
+                result=res,
+                entry_at=datetime.datetime(2024, 1, 2, 10, 0),
+                exit_at=datetime.datetime(2024, 1, 2, 11, 0),
+                duration_minutes=60,
+            ))
+
+        summary = _compute_summary(trades, Decimal("1000"))
+        assert "statistical_tests" in summary
+        st = summary["statistical_tests"]
+        assert st["verdict"] in {"SIGNIFICANT", "NOT_SIGNIFICANT", "INSUFFICIENT_DATA"}
+
+    def test_v7_13_summary_statistical_tests_insufficient_when_few_real_trades(self) -> None:
+        """summary['statistical_tests'] is INSUFFICIENT_DATA when all trades are end_of_data."""
+        from decimal import Decimal
+
+        from src.backtesting.backtest_engine import _compute_summary
+        from src.backtesting.backtest_params import BacktestTradeResult
+
+        # All trades are end_of_data — metric_trades will be empty
+        trades = [
+            BacktestTradeResult(
+                symbol="EURUSD=X",
+                timeframe="H1",
+                direction="LONG",
+                entry_price=Decimal("1.10000"),
+                exit_price=Decimal("1.11000"),
+                exit_reason="end_of_data",
+                pnl_usd=Decimal("5.0"),
+                result="win",
+            )
+            for _ in range(5)
+        ]
+        summary = _compute_summary(trades, Decimal("1000"))
+        st = summary["statistical_tests"]
+        assert st["verdict"] == "INSUFFICIENT_DATA"

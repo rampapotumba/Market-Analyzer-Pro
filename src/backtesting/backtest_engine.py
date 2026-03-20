@@ -250,6 +250,195 @@ def _compute_pnl(
     return pnl_pips.quantize(Decimal("0.0001")), pnl_usd.quantize(Decimal("0.0001"))
 
 
+_STAT_MIN_TRADES = 10
+_STAT_BOOTSTRAP_RESAMPLES = 10_000
+_STAT_ANNUALIZATION_FACTOR = 252
+_STAT_P_VALUE_THRESHOLD = 0.05
+_STAT_PF_5TH_THRESHOLD = 1.0
+_STAT_SHARPE_THRESHOLD = 0.5
+
+try:
+    from scipy import stats as _scipy_stats  # type: ignore[import]
+    _SCIPY_AVAILABLE = True
+except ImportError:
+    _SCIPY_AVAILABLE = False
+
+
+def _ttest_1samp_pvalue(returns: "np.ndarray") -> float:
+    """Compute two-tailed t-test p-value for H0: mean = 0.
+
+    Uses scipy if available; otherwise falls back to a pure numpy
+    implementation based on the t-statistic and the Student CDF approximation
+    via the regularised incomplete beta function.
+    """
+    n = len(returns)
+    if n < 2:
+        return float("nan")
+
+    if _SCIPY_AVAILABLE:
+        _result = _scipy_stats.ttest_1samp(returns, popmean=0.0)
+        return float(_result.pvalue)
+
+    mean = np.mean(returns)
+    std = np.std(returns, ddof=1)
+    if std == 0:
+        return 0.0 if mean != 0 else 1.0
+    t_stat = mean / (std / np.sqrt(n))
+    df = n - 1
+    # Regularised incomplete beta function for two-tailed p-value
+    # p = betainc(df/2, 0.5, df/(df + t^2)) via math.lgamma identities.
+    # We use the continued-fraction / series from Abramowitz & Stegun §26.5.
+    x = df / (df + t_stat ** 2)
+    # betainc(a, b, x) via numpy for older scipy-free environments
+    # numpy does not expose betainc directly; use the lgamma-based formula.
+    import math
+    a, b = df / 2.0, 0.5
+    # Compute regularised incomplete beta via continued fraction (Lentz method).
+    # For t-distribution two-tailed: p = betainc(df/2, 0.5, df/(df+t^2))
+    # This converges rapidly for most practical t-stat values.
+    def _betainc(a: float, b: float, x: float) -> float:
+        if x <= 0.0:
+            return 0.0
+        if x >= 1.0:
+            return 1.0
+        # Use the continued fraction representation (Numerical Recipes)
+        lbeta_ab = math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b)
+        front = math.exp(math.log(x) * a + math.log(1.0 - x) * b - lbeta_ab) / a
+        # Lentz continued fraction
+        tiny = 1e-300
+        fp_min = tiny
+        c = 1.0
+        d = 1.0 - (a + b) * x / (a + 1.0)
+        if abs(d) < fp_min:
+            d = fp_min
+        d = 1.0 / d
+        result = d
+        for m in range(1, 200):
+            # Even step
+            m2 = 2 * m
+            aa = m * (b - m) * x / ((a + m2 - 1) * (a + m2))
+            d = 1.0 + aa * d
+            if abs(d) < fp_min:
+                d = fp_min
+            c = 1.0 + aa / c
+            if abs(c) < fp_min:
+                c = fp_min
+            d = 1.0 / d
+            result *= d * c
+            # Odd step
+            aa = -(a + m) * (a + b + m) * x / ((a + m2) * (a + m2 + 1))
+            d = 1.0 + aa * d
+            if abs(d) < fp_min:
+                d = fp_min
+            c = 1.0 + aa / c
+            if abs(c) < fp_min:
+                c = fp_min
+            d = 1.0 / d
+            delta = d * c
+            result *= delta
+            if abs(delta - 1.0) < 3e-7:
+                break
+        return front * result
+
+    p_val = _betainc(a, b, x)
+    return float(min(2.0 * min(p_val, 1.0 - p_val), 1.0))
+
+
+def _compute_statistical_tests(trades: list[BacktestTradeResult]) -> dict[str, Any]:
+    """Compute statistical significance tests for a set of backtest trades.
+
+    Returns a dict with keys:
+      - n_trades         — number of trades used
+      - t_stat           — one-sample t-statistic (H0: mean return = 0)
+      - p_value          — two-tailed p-value
+      - pf_ci_5th        — 5th percentile of bootstrapped PF distribution
+      - pf_ci_95th       — 95th percentile of bootstrapped PF distribution
+      - sharpe           — annualised Sharpe ratio
+      - sortino          — annualised Sortino ratio
+      - max_consecutive_losses — longest run of consecutive losses
+      - verdict          — "SIGNIFICANT" / "NOT_SIGNIFICANT" / "INSUFFICIENT_DATA"
+
+    Edge case: if len(trades) < 10, returns {"verdict": "INSUFFICIENT_DATA", "min_trades": 10}.
+    """
+    n = len(trades)
+    if n < _STAT_MIN_TRADES:
+        return {"verdict": "INSUFFICIENT_DATA", "min_trades": _STAT_MIN_TRADES}
+
+    returns = np.array([float(t.pnl_usd or 0.0) for t in trades], dtype=np.float64)
+
+    # ── t-test: H0 = mean return = 0 ─────────────────────────────────────────
+    t_stat = float(np.mean(returns) / (np.std(returns, ddof=1) / np.sqrt(n))
+                   if np.std(returns, ddof=1) > 0 else 0.0)
+    p_value = _ttest_1samp_pvalue(returns)
+
+    # ── Bootstrap PF confidence interval ─────────────────────────────────────
+    rng = np.random.default_rng(seed=42)
+    pf_samples: list[float] = []
+    for _ in range(_STAT_BOOTSTRAP_RESAMPLES):
+        sample = rng.choice(returns, size=n, replace=True)
+        gross_win = float(np.sum(sample[sample > 0]))
+        gross_loss = float(abs(np.sum(sample[sample < 0])))
+        if gross_loss > 0:
+            pf_samples.append(gross_win / gross_loss)
+        # When no losses in sample, we skip — PF undefined for that resample.
+    pf_arr = np.array(pf_samples, dtype=np.float64)
+    if len(pf_arr) > 0:
+        pf_5th = float(np.percentile(pf_arr, 5))
+        pf_95th = float(np.percentile(pf_arr, 95))
+    else:
+        pf_5th = float("nan")
+        pf_95th = float("nan")
+
+    # ── Sharpe ratio (annualised, 252 trading days) ───────────────────────────
+    std_ret = float(np.std(returns, ddof=1))
+    mean_ret = float(np.mean(returns))
+    sharpe = (
+        (mean_ret / std_ret) * np.sqrt(_STAT_ANNUALIZATION_FACTOR)
+        if std_ret > 0 else 0.0
+    )
+
+    # ── Sortino ratio (downside deviation only) ───────────────────────────────
+    downside = returns[returns < 0]
+    downside_std = float(np.std(downside, ddof=1)) if len(downside) >= 2 else 0.0
+    sortino = (
+        (mean_ret / downside_std) * np.sqrt(_STAT_ANNUALIZATION_FACTOR)
+        if downside_std > 0 else 0.0
+    )
+
+    # ── Max consecutive losses ────────────────────────────────────────────────
+    max_consec_losses = 0
+    current_run = 0
+    for t in trades:
+        if t.result == "loss":
+            current_run += 1
+            if current_run > max_consec_losses:
+                max_consec_losses = current_run
+        else:
+            current_run = 0
+
+    # ── Composite verdict ─────────────────────────────────────────────────────
+    pf_5th_ok = (not math.isnan(pf_5th)) and pf_5th > _STAT_PF_5TH_THRESHOLD
+    significant = (
+        (not math.isnan(p_value))
+        and p_value < _STAT_P_VALUE_THRESHOLD
+        and pf_5th_ok
+        and sharpe > _STAT_SHARPE_THRESHOLD
+    )
+    verdict = "SIGNIFICANT" if significant else "NOT_SIGNIFICANT"
+
+    return {
+        "n_trades": n,
+        "t_stat": round(t_stat, 4),
+        "p_value": round(p_value, 6) if not math.isnan(p_value) else None,
+        "pf_ci_5th": round(pf_5th, 4) if not math.isnan(pf_5th) else None,
+        "pf_ci_95th": round(pf_95th, 4) if not math.isnan(pf_95th) else None,
+        "sharpe": round(float(sharpe), 4),
+        "sortino": round(float(sortino), 4),
+        "max_consecutive_losses": max_consec_losses,
+        "verdict": verdict,
+    }
+
+
 def _compute_summary(
     trades: list[BacktestTradeResult],
     account_size: Decimal,
@@ -700,6 +889,9 @@ def _compute_summary(
         "overall": overall_viability,
         "blocking_factors": blocking_factors,
     }
+
+    # TASK-V7-13: Statistical significance tests
+    result["statistical_tests"] = _compute_statistical_tests(metric_trades)
 
     return result
 
