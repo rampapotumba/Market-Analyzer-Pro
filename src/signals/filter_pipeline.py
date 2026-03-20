@@ -187,12 +187,20 @@ class SignalFilterPipeline:
             if not passed:
                 return False, reason
 
+        # V6-CAL-09: Compute weekday multiplier for Monday/Tuesday forex penalty
+        weekday_multiplier = 1.0
+        if candle_ts is not None and market_type == "forex":
+            from src.config import WEAK_WEEKDAY_SCORE_MULTIPLIER, WEAK_WEEKDAYS
+            if candle_ts.weekday() in WEAK_WEEKDAYS:
+                weekday_multiplier = WEAK_WEEKDAY_SCORE_MULTIPLIER
+
         # SIM-25: Score threshold (V6-08: direction passed for asymmetric SHORT threshold)
         if self.apply_score_filter:
             passed, reason = self.check_score_threshold(
                 composite, market_type, symbol,
                 available_weight=available_weight,
                 direction=direction,
+                weekday_multiplier=weekday_multiplier,
             )
             passed, reason = _check_and_count("score_threshold", passed, reason)
             if not passed:
@@ -276,8 +284,9 @@ class SignalFilterPipeline:
         symbol: str,
         available_weight: float = 1.0,
         direction: str = "LONG",
+        weekday_multiplier: float = 1.0,
     ) -> tuple[bool, str]:
-        """SIM-25 + SIM-28 + V6-TASK-V6-02 + V6-TASK-V6-08: composite score must exceed threshold.
+        """SIM-25 + SIM-28 + V6-TASK-V6-02 + V6-TASK-V6-08 + V6-CAL-01 + V6-CAL-09.
 
         Priority (highest to lowest):
           1. instrument_override (INSTRUMENT_OVERRIDES[symbol])
@@ -286,13 +295,15 @@ class SignalFilterPipeline:
           4. global_default (MIN_COMPOSITE_SCORE)
 
         V6 (TASK-V6-02): effective_threshold = threshold * available_weight.
-        In backtest (only TA, available_weight=0.45): threshold 15 → 6.75.
-        In live (all components, available_weight=1.0): threshold 15 → 15.0.
+        V6-CAL-01: effective_weight = max(available_weight, AVAILABLE_WEIGHT_FLOOR).
+          In backtest (only TA, available_weight=0.45): threshold 15 → 15*0.65=9.75.
+          In live (all components, available_weight=1.0): threshold 15 → 15.0 (unchanged).
 
-        V6 (TASK-V6-08): SHORT signals require SHORT_SCORE_MULTIPLIER (×1.2) higher threshold.
-        SHORT WR was 36.84%, so we demand stronger conviction before going short.
+        V6-CAL-04: SHORT signals require SHORT_SCORE_MULTIPLIER (×2.0) higher threshold.
+        V6-CAL-09: forex Monday/Tuesday signals get weekday_multiplier (×1.5).
         """
         from src.config import (
+            AVAILABLE_WEIGHT_FLOOR,
             INSTRUMENT_OVERRIDES,
             MIN_COMPOSITE_SCORE,
             MIN_COMPOSITE_SCORE_CRYPTO,
@@ -308,12 +319,17 @@ class SignalFilterPipeline:
         if "min_composite_score" in overrides:
             threshold = overrides["min_composite_score"]
 
-        # V6 TASK-V6-02: proportional scaling
-        effective_threshold = threshold * available_weight
+        # V6-CAL-01: apply floor to available_weight to prevent over-dilution in backtest
+        effective_weight = max(available_weight, AVAILABLE_WEIGHT_FLOOR)
+        effective_threshold = threshold * effective_weight
 
-        # V6 TASK-V6-08: asymmetric threshold — SHORT requires stricter conviction
+        # V6-CAL-04: asymmetric threshold — SHORT requires stricter conviction
         if direction == "SHORT":
             effective_threshold *= SHORT_SCORE_MULTIPLIER
+
+        # V6-CAL-09: Monday/Tuesday forex penalty
+        if weekday_multiplier != 1.0:
+            effective_threshold *= weekday_multiplier
 
         if abs(composite) < effective_threshold:
             return False, f"score_below_threshold:{composite:.1f}<{effective_threshold:.2f}"
@@ -501,14 +517,17 @@ class SignalFilterPipeline:
         direction: str,
         available_weight: float = 1.0,
     ) -> tuple[bool, str]:
-        """SIM-31 + V6-TASK-V6-02: Signal strength must be BUY/STRONG_BUY or SELL/STRONG_SELL.
+        """SIM-31 + V6-TASK-V6-02 + V6-CAL-01: Signal strength gate.
 
-        This is NOT flag-controlled — it is a fundamental quality gate that
-        always runs regardless of configuration flags.
+        Must be BUY/STRONG_BUY or SELL/STRONG_SELL.
+        This is NOT flag-controlled — it is a fundamental quality gate.
 
         V6: uses scaled thresholds when available_weight < 1.0 (backtest mode).
+        V6-CAL-01: applies AVAILABLE_WEIGHT_FLOOR to prevent over-dilution.
         """
-        strength = _get_signal_strength_scaled(composite, scale=available_weight)
+        from src.config import AVAILABLE_WEIGHT_FLOOR
+        effective_weight = max(available_weight, AVAILABLE_WEIGHT_FLOOR)
+        strength = _get_signal_strength_scaled(composite, scale=effective_weight)
         if strength not in ALLOWED_SIGNAL_STRENGTHS:
             logger.debug(
                 "[SIM-31] Filtered weak signal: %s (score=%.2f, direction=%s, scale=%.2f)",

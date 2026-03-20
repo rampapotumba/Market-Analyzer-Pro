@@ -249,37 +249,44 @@ def test_sim28_btc_higher_threshold():
 
 
 def test_sim28_btc_only_strong_trend():
-    """Pipeline: BTC/USDT TREND_BULL → allowed (v6 TASK-V6-03 expanded allowed_regimes)."""
+    """Pipeline: BTC/USDT TREND_BULL → blocked (CAL-05 restricted to STRONG_TREND_BULL only).
+
+    Note: v6-CAL-05 reverted the v6-03 expansion and tightened BTC to STRONG_TREND_BULL only.
+    """
     from src.signals.filter_pipeline import SignalFilterPipeline
 
     pipeline = SignalFilterPipeline()
-    # v6 TASK-V6-03: TREND_BULL is now in allowed_regimes for BTC/USDT
+    # v6-CAL-05: TREND_BULL is NOT in allowed_regimes for BTC/USDT (only STRONG_TREND_BULL)
     passed, reason = pipeline.check_regime("TREND_BULL", "BTC/USDT")
-    assert passed, f"BTC TREND_BULL should be allowed (v6 expanded regimes), got: {reason}"
+    assert not passed, f"BTC TREND_BULL should be blocked (CAL-05 tightened to STRONG_TREND_BULL), got pass"
 
 
 def test_sim28_btc_strong_trend_allowed():
-    """Pipeline: BTC/USDT STRONG_TREND_BULL + score > 20 → both filters pass."""
+    """Pipeline: BTC/USDT STRONG_TREND_BULL + score > 25 → both filters pass."""
     from src.signals.filter_pipeline import SignalFilterPipeline
 
     pipeline = SignalFilterPipeline()
-    # Score check: 46.35 > 20 (override threshold)
+    # Score check: 46.35 > 25 (CAL-05 raised override threshold to 25)
     score_passed, _ = pipeline.check_score_threshold(46.35, "crypto", "BTC/USDT")
-    assert score_passed, "BTC score 46 should pass score threshold"
+    assert score_passed, "BTC score 46 should pass score threshold (>= 25)"
     # Regime check: STRONG_TREND_BULL is in allowed_regimes
     regime_passed, _ = pipeline.check_regime("STRONG_TREND_BULL", "BTC/USDT")
     assert regime_passed, "BTC STRONG_TREND_BULL should pass regime filter"
 
 
 def test_sim28_gbpusd_higher_threshold():
-    """Pipeline: GBPUSD uses global threshold (v6 TASK-V6-04: override removed)."""
+    """Pipeline: GBPUSD uses min_composite_score=20 (CAL-06 restored override).
+
+    Note: v6-CAL-06 added min_composite_score=20 for GBPUSD to address -$43 PnL.
+    Score=21 > 20 → passes in live mode.
+    """
     from src.signals.filter_pipeline import SignalFilterPipeline
 
     pipeline = SignalFilterPipeline()
-    # v6 TASK-V6-04: GBPUSD=X override min_composite_score=20 removed.
-    # Now uses global threshold=15. Score=16 > 15 → passes.
-    passed, reason = pipeline.check_score_threshold(16.0, "forex", "GBPUSD=X")
-    assert passed, f"GBPUSD score 16 should pass global threshold=15 (v6 removed override), got: {reason}"
+    # v6-CAL-06: GBPUSD=X has override min_composite_score=20.
+    # Score=21 > 20 → passes live mode (available_weight=1.0).
+    passed, reason = pipeline.check_score_threshold(21.0, "forex", "GBPUSD=X")
+    assert passed, f"GBPUSD score 21 should pass threshold=20 (CAL-06 override), got: {reason}"
 
 
 def test_sim28_gbpusd_score_above_override_accepted():

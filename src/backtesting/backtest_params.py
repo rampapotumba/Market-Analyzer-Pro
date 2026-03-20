@@ -89,6 +89,7 @@ class BacktestTradeResult(BaseModel):
     mfe: Optional[Decimal] = None
     mae: Optional[Decimal] = None
     regime: Optional[str] = None            # SIM-44: market regime at entry
+    sl_price: Optional[Decimal] = None      # V6-CAL-07: SL level for MAE % calculation
 
 
 class BacktestResult(BaseModel):

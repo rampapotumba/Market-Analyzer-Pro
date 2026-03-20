@@ -338,7 +338,7 @@ def _compute_summary(
             by_symbol[s]["wins"] += 1
         by_symbol[s]["pnl_usd"] += float(t.pnl_usd or 0)
 
-    # By score bucket (mirrors SIM-14 buckets)
+    # By score bucket (mirrors SIM-14 buckets, unscaled — kept for backward compatibility)
     def _score_bucket(score: Optional[Decimal]) -> str:
         if score is None:
             return "unknown"
@@ -357,6 +357,31 @@ def _compute_summary(
             return "weak_sell"
         return "neutral"
 
+    def _score_bucket_scaled(score: Optional[Decimal], scale: float) -> str:
+        """V6-CAL-08: Score bucket with scaled thresholds.
+
+        At scale=0.65 (with floor): strong >= 9.75, buy >= 6.5, weak >= 4.55.
+        """
+        if score is None:
+            return "unknown"
+        s = float(score)
+        strong = 15.0 * scale
+        buy = 10.0 * scale
+        weak = 7.0 * scale
+        if s >= strong:
+            return "strong_buy"
+        if s >= buy:
+            return "buy"
+        if s >= weak:
+            return "weak_buy"
+        if s <= -strong:
+            return "strong_sell"
+        if s <= -buy:
+            return "sell"
+        if s <= -weak:
+            return "weak_sell"
+        return "neutral"
+
     by_score: dict[str, dict] = {}
     for t in trades:
         bucket = _score_bucket(t.composite_score)
@@ -366,6 +391,19 @@ def _compute_summary(
         if t.result == "win":
             by_score[bucket]["wins"] += 1
         by_score[bucket]["pnl_usd"] += float(t.pnl_usd or 0)
+
+    # V6-CAL-08: Scaled score buckets for accurate v6+ reporting
+    from src.config import AVAILABLE_WEIGHT_FLOOR
+    _bucket_scale = max(_TA_WEIGHT, AVAILABLE_WEIGHT_FLOOR)
+    by_score_scaled: dict[str, dict] = {}
+    for t in trades:
+        bucket = _score_bucket_scaled(t.composite_score, _bucket_scale)
+        if bucket not in by_score_scaled:
+            by_score_scaled[bucket] = {"trades": 0, "wins": 0, "pnl_usd": 0.0}
+        by_score_scaled[bucket]["trades"] += 1
+        if t.result == "win":
+            by_score_scaled[bucket]["wins"] += 1
+        by_score_scaled[bucket]["pnl_usd"] += float(t.pnl_usd or 0)
 
     # ── SIM-44: Extended metrics ──────────────────────────────────────────────
 
@@ -430,9 +468,39 @@ def _compute_summary(
     mae_exit_count = sum(1 for t in trades if t.exit_reason == "mae_exit")
     time_exit_count = sum(1 for t in trades if t.exit_reason == "time_exit")
 
-    # Average MAE (use raw mae field)
-    mae_values = [float(t.mae or 0) for t in trades if t.mae is not None and t.mae > 0]
-    avg_mae_pct_of_sl = sum(mae_values) / len(mae_values) if mae_values else 0.0
+    # V6-CAL-07: MAE as percentage of SL distance (not raw price units).
+    # mae / sl_distance * 100 gives real % — how far price moved against position
+    # relative to the SL level.
+    mae_pct_values: list[float] = []
+    mae_pct_values_winners: list[float] = []
+    mae_pct_values_losers: list[float] = []
+    for t in trades:
+        if t.mae is None or t.mae <= 0:
+            continue
+        sl_dist = None
+        sl_field = getattr(t, "sl_price", None)
+        if sl_field is not None:
+            sl_dist = abs(float(t.entry_price) - float(sl_field))
+        if sl_dist is None or sl_dist == 0:
+            continue
+        pct = float(t.mae) / sl_dist * 100
+        mae_pct_values.append(pct)
+        if t.result == "win":
+            mae_pct_values_winners.append(pct)
+        else:
+            mae_pct_values_losers.append(pct)
+
+    avg_mae_pct_of_sl = (
+        sum(mae_pct_values) / len(mae_pct_values) if mae_pct_values else 0.0
+    )
+    avg_mae_pct_of_sl_winners = (
+        sum(mae_pct_values_winners) / len(mae_pct_values_winners)
+        if mae_pct_values_winners else 0.0
+    )
+    avg_mae_pct_of_sl_losers = (
+        sum(mae_pct_values_losers) / len(mae_pct_values_losers)
+        if mae_pct_values_losers else 0.0
+    )
 
     # V6 TASK-V6-01: data_hash — deterministic fingerprint of the trade set
     _trade_dicts_for_hash = [
@@ -466,6 +534,8 @@ def _compute_summary(
         "monthly_returns": sorted(monthly.values(), key=lambda x: x["month"]),
         "by_symbol": by_symbol,
         "by_score_bucket": by_score,
+        # V6-CAL-08: Scaled score buckets for accurate v6+ reporting
+        "by_score_bucket_scaled": by_score_scaled,
         # SIM-44: Extended metrics
         "win_rate_long_pct": round(win_rate_long, 2),
         "win_rate_short_pct": round(win_rate_short, 2),
@@ -478,7 +548,10 @@ def _compute_summary(
         "tp_hit_count": tp_hit_count,
         "mae_exit_count": mae_exit_count,
         "time_exit_count": time_exit_count,
-        "avg_mae_pct_of_sl": round(avg_mae_pct_of_sl, 4),
+        # V6-CAL-07: MAE as % of SL distance (fixed from raw price units)
+        "avg_mae_pct_of_sl": round(avg_mae_pct_of_sl, 2),
+        "avg_mae_pct_of_sl_winners": round(avg_mae_pct_of_sl_winners, 2),
+        "avg_mae_pct_of_sl_losers": round(avg_mae_pct_of_sl_losers, 2),
         # V6 TASK-V6-01: data integrity hash
         "data_hash": data_hash,
         # V6 TASK-V6-12: end_of_data trades reported separately
@@ -1363,9 +1436,11 @@ class BacktestEngine:
                 exit_reason = "tp_hit"
 
         # V6 TASK-V6-11: Time exit — after N candles without profit
+        # V6-CAL-03: H1 сокращен с 48 до 24 — 61.6% trades выходили по time_exit,
+        # сидя 2 дня без прогресса. 1 день достаточен для H1 сигналов.
         if exit_reason is None:
-            _time_exit_candles: dict[str, int] = {"H1": 48, "H4": 20, "D1": 10}
-            max_candles = _time_exit_candles.get(timeframe, 48)
+            _time_exit_candles: dict[str, int] = {"H1": 24, "H4": 20, "D1": 10}
+            max_candles = _time_exit_candles.get(timeframe, 24)
             if candles_since_entry >= max_candles:
                 # Compute unrealized PnL at candle close
                 if direction == "LONG":
@@ -1426,6 +1501,7 @@ class BacktestEngine:
             mfe=Decimal(str(round(open_trade["mfe"], 8))),
             mae=Decimal(str(round(open_trade["mae"], 8))),
             regime=open_trade.get("regime"),
+            sl_price=sl,  # V6-CAL-07: preserve SL level for accurate MAE % calculation
         )
 
     # ── Filter delegation methods ─────────────────────────────────────────────

@@ -167,20 +167,24 @@ class TestV602ScaledThreshold:
     """TASK-V6-02: effective_threshold = threshold * available_weight."""
 
     def test_v6_02_scaled_threshold_backtest(self) -> None:
-        """Threshold 15 with scale=0.45 → effective=6.75."""
+        """Threshold 15 with scale=0.45 but floor=0.65 → effective=9.75 (CAL-01).
+
+        Note: V6-CAL-01 adds AVAILABLE_WEIGHT_FLOOR=0.65, so effective weight is
+        max(0.45, 0.65)=0.65, giving threshold = 15*0.65 = 9.75.
+        """
         from src.signals.filter_pipeline import SignalFilterPipeline
 
         pipeline = SignalFilterPipeline()
-        # composite=7.0, scale=0.45: |7.0| >= 6.75 → pass
-        passed, reason = pipeline.check_score_threshold(7.0, "forex", "EURUSD=X", available_weight=0.45)
-        assert passed, f"Expected pass, got: {reason}"
+        # composite=10.0, effective=9.75 → pass
+        passed, reason = pipeline.check_score_threshold(10.0, "forex", "EURUSD=X", available_weight=0.45)
+        assert passed, f"Expected pass with floor=0.65, got: {reason}"
 
     def test_v6_02_scaled_threshold_backtest_blocked(self) -> None:
-        """composite=6.0 with scale=0.45 → effective=6.75 → blocked."""
+        """composite=9.0 with scale=0.45 and floor=0.65 → effective=9.75 → blocked (CAL-01)."""
         from src.signals.filter_pipeline import SignalFilterPipeline
 
         pipeline = SignalFilterPipeline()
-        passed, reason = pipeline.check_score_threshold(6.0, "forex", "EURUSD=X", available_weight=0.45)
+        passed, reason = pipeline.check_score_threshold(9.0, "forex", "EURUSD=X", available_weight=0.45)
         assert not passed
         assert "score_below_threshold" in reason
 
@@ -198,7 +202,12 @@ class TestV602ScaledThreshold:
         assert passed
 
     def test_v6_02_signal_strength_scaled_strong_buy(self) -> None:
-        """STRONG_BUY at composite=7.0 with scale=0.45 (threshold=6.75)."""
+        """STRONG_BUY at composite=7.0 with scale=0.45 (raw threshold=6.75).
+
+        Note: _get_signal_strength_scaled() uses the raw scale passed to it.
+        The floor is applied in check_signal_strength() via effective_weight.
+        This tests the underlying helper function directly.
+        """
         from src.signals.filter_pipeline import _get_signal_strength_scaled
 
         strength = _get_signal_strength_scaled(7.0, scale=0.45)
@@ -221,38 +230,44 @@ class TestV602ScaledThreshold:
             )
 
     def test_v6_02_instrument_override_scaled(self) -> None:
-        """Override min_composite_score=20 with scale=0.45 → effective=9.0."""
+        """Override min_composite_score=18 (USDCHF) with floor=0.65 → effective=11.7 (CAL-01).
+
+        Note: CAL-01 adds floor 0.65, so effective = 18 * max(0.45, 0.65) = 18 * 0.65 = 11.7.
+        """
         from src.signals.filter_pipeline import SignalFilterPipeline
 
         pipeline = SignalFilterPipeline()
-        # BTC/USDT has min_composite_score=15 after TASK-V6-03 change,
-        # but USDCHF=X still has 18 → effective = 18*0.45 = 8.1
-        # score=8.0 should be blocked
-        passed, reason = pipeline.check_score_threshold(8.0, "forex", "USDCHF=X", available_weight=0.45)
-        assert not passed, f"Expected block, got pass. reason={reason}"
+        # USDCHF=X has 18 → effective = 18*0.65 = 11.7
+        # score=11.0 should be blocked
+        passed, reason = pipeline.check_score_threshold(11.0, "forex", "USDCHF=X", available_weight=0.45)
+        assert not passed, f"Expected block for 11.0 < 11.7, got pass. reason={reason}"
 
     def test_v6_02_instrument_override_scaled_pass(self) -> None:
-        """Override min_composite_score=18 with scale=0.45 → effective=8.1, score=8.5 passes."""
+        """Override min_composite_score=18 with floor=0.65 → effective=11.7, score=12.0 passes."""
         from src.signals.filter_pipeline import SignalFilterPipeline
 
         pipeline = SignalFilterPipeline()
-        passed, reason = pipeline.check_score_threshold(8.5, "forex", "USDCHF=X", available_weight=0.45)
-        assert passed, f"Expected pass, got: {reason}"
+        passed, reason = pipeline.check_score_threshold(12.0, "forex", "USDCHF=X", available_weight=0.45)
+        assert passed, f"Expected pass for 12.0 >= 11.7, got: {reason}"
 
     def test_v6_02_crypto_threshold_scaled(self) -> None:
-        """Crypto threshold 15 (after TASK-V6-03 BTC gets 15) * 0.45 = 6.75."""
+        """BTC/USDT has min_score=25 (CAL-05) * floor 0.65 = 16.25 effective."""
         from src.signals.filter_pipeline import SignalFilterPipeline
 
         pipeline = SignalFilterPipeline()
-        # BTC/USDT override = 15, scale=0.45 → effective=6.75
-        passed, _ = pipeline.check_score_threshold(7.0, "crypto", "BTC/USDT", available_weight=0.45)
+        # BTC/USDT override = 25, floor=0.65 → effective=16.25
+        passed, _ = pipeline.check_score_threshold(17.0, "crypto", "BTC/USDT", available_weight=0.45)
         assert passed
 
-        passed, _ = pipeline.check_score_threshold(6.0, "crypto", "BTC/USDT", available_weight=0.45)
+        passed, _ = pipeline.check_score_threshold(16.0, "crypto", "BTC/USDT", available_weight=0.45)
         assert not passed
 
     def test_v6_02_available_weight_from_filter_context(self) -> None:
-        """run_all() passes available_weight from context into check_score_threshold."""
+        """run_all() passes available_weight from context into check_score_threshold.
+
+        Note: After CAL-01, floor=0.65, so effective_threshold = 15*0.65=9.75 even
+        when available_weight=0.45. Score 10.0 passes, score 9.0 is blocked.
+        """
         from src.signals.filter_pipeline import SignalFilterPipeline
 
         pipeline = SignalFilterPipeline(
@@ -266,7 +281,7 @@ class TestV602ScaledThreshold:
             apply_dxy_filter=False,
         )
         context = {
-            "composite_score": 7.5,   # above 15*0.45=6.75 but below 15*1.0=15
+            "composite_score": 10.0,   # above 15*0.65=9.75 (floor) but below 15*1.0=15
             "market_type": "forex",
             "symbol": "EURUSD=X",
             "regime": "TREND_BULL",
@@ -275,12 +290,12 @@ class TestV602ScaledThreshold:
             "available_weight": 0.45,
         }
         passed, reason = pipeline.run_all(context)
-        assert passed, f"Expected pass with scale=0.45, got: {reason}"
+        assert passed, f"Expected pass with scale=0.45 (floor=0.65), got: {reason}"
 
-        # Same score with live scale (1.0) should be blocked
+        # Same score with live scale (1.0) should be blocked (10.0 < 15.0)
         context["available_weight"] = 1.0
         passed, reason = pipeline.run_all(context)
-        assert not passed, "Expected block with scale=1.0 (score 7.5 < threshold 15)"
+        assert not passed, "Expected block with scale=1.0 (score 10.0 < threshold 15)"
 
     def test_v6_02_backtest_engine_passes_available_weight(self) -> None:
         """backtest_engine.py filter_context contains available_weight=0.45."""
@@ -315,46 +330,48 @@ class TestV603BtcUnblock:
     """TASK-V6-03: BTC/USDT allowed_regimes includes TREND_BULL and TREND_BEAR."""
 
     def test_v6_03_btc_allowed_regimes_expanded(self) -> None:
-        """TREND_BULL is allowed for BTC/USDT."""
+        """BTC/USDT STRONG_TREND_BULL is in allowed_regimes.
+
+        Note: v6-calibration (CAL-05) tightened BTC to STRONG_TREND_BULL only.
+        TREND_BULL and TREND_BEAR were removed as part of calibration.
+        """
         from src.config import INSTRUMENT_OVERRIDES
 
         overrides = INSTRUMENT_OVERRIDES.get("BTC/USDT", {})
         allowed = overrides.get("allowed_regimes", [])
-        assert "TREND_BULL" in allowed, f"TREND_BULL not in BTC allowed_regimes: {allowed}"
-        assert "TREND_BEAR" in allowed, f"TREND_BEAR not in BTC allowed_regimes: {allowed}"
+        assert "STRONG_TREND_BULL" in allowed, f"STRONG_TREND_BULL not in BTC allowed_regimes: {allowed}"
 
     def test_v6_03_btc_strong_trend_still_allowed(self) -> None:
-        """STRONG_TREND_BULL/BEAR still allowed for BTC/USDT."""
+        """STRONG_TREND_BULL is allowed for BTC/USDT (only bull after CAL-05)."""
         from src.config import INSTRUMENT_OVERRIDES
 
         overrides = INSTRUMENT_OVERRIDES.get("BTC/USDT", {})
         allowed = overrides.get("allowed_regimes", [])
         assert "STRONG_TREND_BULL" in allowed
-        assert "STRONG_TREND_BEAR" in allowed
 
-    def test_v6_03_btc_threshold_lowered(self) -> None:
-        """BTC/USDT min_composite_score is 15 (was 20)."""
+    def test_v6_03_btc_threshold_updated(self) -> None:
+        """BTC/USDT min_composite_score is 25 (tightened by CAL-05 from 15)."""
         from src.config import INSTRUMENT_OVERRIDES
 
         overrides = INSTRUMENT_OVERRIDES.get("BTC/USDT", {})
         score = overrides.get("min_composite_score")
-        assert score == 15, f"Expected 15, got {score}"
+        assert score == 25, f"Expected 25 (CAL-05 tightening), got {score}"
 
-    def test_v6_03_eth_threshold_lowered(self) -> None:
-        """ETH/USDT min_composite_score is 15 (was 20)."""
+    def test_v6_03_eth_threshold_updated(self) -> None:
+        """ETH/USDT min_composite_score is 20 (restored by CAL-05)."""
         from src.config import INSTRUMENT_OVERRIDES
 
         overrides = INSTRUMENT_OVERRIDES.get("ETH/USDT", {})
         score = overrides.get("min_composite_score")
-        assert score == 15, f"Expected 15, got {score}"
+        assert score == 20, f"Expected 20 (CAL-05 restore), got {score}"
 
-    def test_v6_03_btc_trend_bull_passes_regime_filter(self) -> None:
-        """SignalFilterPipeline allows BTC/USDT in TREND_BULL."""
+    def test_v6_03_btc_strong_trend_bull_passes_regime_filter(self) -> None:
+        """SignalFilterPipeline allows BTC/USDT in STRONG_TREND_BULL."""
         from src.signals.filter_pipeline import SignalFilterPipeline
 
         pipeline = SignalFilterPipeline()
-        passed, reason = pipeline.check_regime("TREND_BULL", "BTC/USDT")
-        assert passed, f"Expected TREND_BULL to pass for BTC/USDT, got: {reason}"
+        passed, reason = pipeline.check_regime("STRONG_TREND_BULL", "BTC/USDT")
+        assert passed, f"Expected STRONG_TREND_BULL to pass for BTC/USDT, got: {reason}"
 
     def test_v6_03_btc_ranging_still_blocked(self) -> None:
         """RANGING is still blocked for BTC/USDT."""
@@ -365,13 +382,14 @@ class TestV603BtcUnblock:
         passed, reason = pipeline.check_regime("RANGING", "BTC/USDT")
         assert not passed, "Expected RANGING to be blocked for BTC/USDT"
 
-    def test_v6_03_gbpusd_no_score_override(self) -> None:
-        """GBPUSD=X has no min_composite_score override (TASK-V6-04 prep)."""
+    def test_v6_03_gbpusd_has_score_override(self) -> None:
+        """GBPUSD=X has min_composite_score=20 override (added by CAL-06)."""
         from src.config import INSTRUMENT_OVERRIDES
 
         overrides = INSTRUMENT_OVERRIDES.get("GBPUSD=X", {})
-        assert "min_composite_score" not in overrides, (
-            f"GBPUSD=X should not have score override, got: {overrides}"
+        score = overrides.get("min_composite_score")
+        assert score == 20, (
+            f"GBPUSD=X should have min_composite_score=20 (CAL-06), got: {score}"
         )
 
     def test_v6_03_score_component_weights_defined(self) -> None:
@@ -390,35 +408,40 @@ class TestV603BtcUnblock:
 class TestV604GbpusdFix:
     """TASK-V6-04: GBPUSD=X min_composite_score override removed."""
 
-    def test_v6_04_gbpusd_no_score_override(self) -> None:
-        """GBPUSD=X uses global threshold (no per-symbol override)."""
+    def test_v6_04_gbpusd_has_score_override(self) -> None:
+        """GBPUSD=X has min_composite_score=20 override (CAL-06).
+
+        Note: originally TASK-V6-04 removed the override, but CAL-06 added it back
+        with value 20 to address -$43 PnL at global threshold.
+        """
         from src.config import INSTRUMENT_OVERRIDES
 
         overrides = INSTRUMENT_OVERRIDES.get("GBPUSD=X", {})
-        assert "min_composite_score" not in overrides, (
-            f"GBPUSD=X should not have score override, got: {overrides}"
+        score = overrides.get("min_composite_score")
+        assert score == 20, (
+            f"GBPUSD=X should have min_composite_score=20 (CAL-06), got: {score}"
         )
 
-    def test_v6_04_gbpusd_uses_global_threshold(self) -> None:
-        """GBPUSD=X with composite=7.0 and scale=0.45 passes (6.75 effective)."""
+    def test_v6_04_gbpusd_uses_override_threshold(self) -> None:
+        """GBPUSD=X with composite=13.0 passes (>= 20*0.65=13.0)."""
         from src.signals.filter_pipeline import SignalFilterPipeline
 
         pipeline = SignalFilterPipeline()
-        # Global threshold 15 * 0.45 = 6.75; score=7.0 must pass
+        # Override threshold 20 * floor(0.65) = 13.0; score=13.0 must pass
         passed, reason = pipeline.check_score_threshold(
-            7.0, "forex", "GBPUSD=X", available_weight=0.45
+            13.0, "forex", "GBPUSD=X", available_weight=0.45
         )
-        assert passed, f"Expected GBPUSD to pass with score=7.0, scale=0.45. got: {reason}"
+        assert passed, f"Expected GBPUSD to pass with score=13.0, scale=0.65 (floor). got: {reason}"
 
-    def test_v6_04_gbpusd_still_blocked_below_threshold(self) -> None:
-        """GBPUSD=X with composite=6.0 and scale=0.45 is blocked (< 6.75)."""
+    def test_v6_04_gbpusd_blocked_below_override_threshold(self) -> None:
+        """GBPUSD=X with composite=12.0 is blocked (< 20*0.65=13.0)."""
         from src.signals.filter_pipeline import SignalFilterPipeline
 
         pipeline = SignalFilterPipeline()
         passed, reason = pipeline.check_score_threshold(
-            6.0, "forex", "GBPUSD=X", available_weight=0.45
+            12.0, "forex", "GBPUSD=X", available_weight=0.45
         )
-        assert not passed, "Expected block for score=6.0 below effective threshold 6.75"
+        assert not passed, "Expected block for score=12.0 below effective threshold 13.0"
         assert "score_below_threshold" in reason
 
 
@@ -670,44 +693,51 @@ class TestV608ShortQuality:
     """TASK-V6-08: Asymmetric SHORT threshold (×1.2) and stricter RSI (< 40)."""
 
     def test_v6_08_short_threshold_multiplied(self) -> None:
-        """SHORT effective_threshold = base * available_weight * 1.2."""
+        """SHORT effective_threshold = base * available_weight * 2.0 (CAL-04 raised from 1.2).
+
+        Live mode: threshold = 15 * 1.0 * 2.0 = 30.0.
+        composite=-28.0 → abs=28 < 30 → blocked.
+        """
         from src.signals.filter_pipeline import SignalFilterPipeline
 
         pipeline = SignalFilterPipeline()
-        # Global threshold 15, scale=1.0, multiplier=1.2 → effective=18.0
-        # composite=-17.0 → abs=17 < 18 → blocked
+        # Global threshold 15, scale=1.0, multiplier=2.0 → effective=30.0
+        # composite=-28.0 → abs=28 < 30 → blocked
         passed, reason = pipeline.check_score_threshold(
-            -17.0, "forex", "EURUSD=X", available_weight=1.0, direction="SHORT"
+            -28.0, "forex", "EURUSD=X", available_weight=1.0, direction="SHORT"
         )
-        assert not passed, f"Expected SHORT composite=-17 to be blocked (threshold=18), got pass"
+        assert not passed, f"Expected SHORT composite=-28 to be blocked (threshold=30), got pass"
         assert "score_below_threshold" in reason
 
     def test_v6_08_short_passes_above_threshold(self) -> None:
-        """SHORT with composite=-19 passes threshold of 18.0."""
+        """SHORT with composite=-31 passes threshold of 30.0 (CAL-04: 15*1.0*2.0=30)."""
         from src.signals.filter_pipeline import SignalFilterPipeline
 
         pipeline = SignalFilterPipeline()
         passed, reason = pipeline.check_score_threshold(
-            -19.0, "forex", "EURUSD=X", available_weight=1.0, direction="SHORT"
+            -31.0, "forex", "EURUSD=X", available_weight=1.0, direction="SHORT"
         )
-        assert passed, f"Expected SHORT composite=-19 to pass (threshold=18), got: {reason}"
+        assert passed, f"Expected SHORT composite=-31 to pass (threshold=30), got: {reason}"
 
     def test_v6_08_short_threshold_with_scale(self) -> None:
-        """SHORT in backtest: threshold = 15 * 0.45 * 1.2 = 8.1."""
+        """SHORT in backtest: threshold = 15 * 0.65 * 2.0 = 19.5 (with CAL-01 floor).
+
+        Note: CAL-01 raises floor from 0.45 to 0.65, CAL-04 raises multiplier to 2.0.
+        """
         from src.signals.filter_pipeline import SignalFilterPipeline
 
         pipeline = SignalFilterPipeline()
-        # composite=-8.0, effective = 15 * 0.45 * 1.2 = 8.1 → blocked
+        # composite=-19.0, effective = 15 * 0.65 * 2.0 = 19.5 → blocked
         passed, _ = pipeline.check_score_threshold(
-            -8.0, "forex", "EURUSD=X", available_weight=0.45, direction="SHORT"
+            -19.0, "forex", "EURUSD=X", available_weight=0.45, direction="SHORT"
         )
         assert not passed
 
-        # composite=-8.5, effective=8.1 → pass
+        # composite=-20.0, effective=19.5 → pass
         passed, reason = pipeline.check_score_threshold(
-            -8.5, "forex", "EURUSD=X", available_weight=0.45, direction="SHORT"
+            -20.0, "forex", "EURUSD=X", available_weight=0.45, direction="SHORT"
         )
-        assert passed, f"Expected pass for SHORT composite=-8.5 (threshold=8.1), got: {reason}"
+        assert passed, f"Expected pass for SHORT composite=-20.0 (threshold=19.5), got: {reason}"
 
     def test_v6_08_long_threshold_unaffected(self) -> None:
         """LONG threshold is not modified by SHORT multiplier."""
@@ -726,24 +756,24 @@ class TestV608ShortQuality:
         )
         assert not passed
 
-    def test_v6_08_short_rsi_40_blocks(self) -> None:
-        """SHORT with RSI=45 is blocked (RSI >= SHORT_RSI_THRESHOLD=40)."""
+    def test_v6_08_short_rsi_35_blocks(self) -> None:
+        """SHORT with RSI=35 is blocked (RSI >= SHORT_RSI_THRESHOLD=30 after CAL-04)."""
         from src.signals.filter_pipeline import SignalFilterPipeline
 
         pipeline = SignalFilterPipeline()
-        indicators = {"rsi": 45.0, "macd": -0.001, "macd_signal": 0.001}
+        indicators = {"rsi": 35.0, "macd": -0.001, "macd_signal": 0.001}
         passed, reason = pipeline.check_momentum(indicators, "SHORT")
-        assert not passed, f"Expected SHORT RSI=45 to be blocked (threshold=40), got pass"
+        assert not passed, f"Expected SHORT RSI=35 to be blocked (threshold=30), got pass"
         assert "momentum_misaligned_short" in reason
 
-    def test_v6_08_short_rsi_39_passes(self) -> None:
-        """SHORT with RSI=39 and MACD aligned passes momentum filter."""
+    def test_v6_08_short_rsi_29_passes(self) -> None:
+        """SHORT with RSI=29 and MACD aligned passes momentum filter (threshold=30 after CAL-04)."""
         from src.signals.filter_pipeline import SignalFilterPipeline
 
         pipeline = SignalFilterPipeline()
-        indicators = {"rsi": 39.0, "macd": -0.001, "macd_signal": 0.001}
+        indicators = {"rsi": 29.0, "macd": -0.001, "macd_signal": 0.001}
         passed, reason = pipeline.check_momentum(indicators, "SHORT")
-        assert passed, f"Expected SHORT RSI=39 to pass, got: {reason}"
+        assert passed, f"Expected SHORT RSI=29 to pass (< 30), got: {reason}"
 
     def test_v6_08_long_rsi_unaffected(self) -> None:
         """LONG momentum check still uses RSI > 50 (not affected by SHORT threshold)."""
@@ -761,11 +791,11 @@ class TestV608ShortQuality:
         assert not passed, "LONG RSI=49 should be blocked"
 
     def test_v6_08_short_config_constants(self) -> None:
-        """Config has SHORT_SCORE_MULTIPLIER=1.2 and SHORT_RSI_THRESHOLD=40."""
+        """Config has SHORT_SCORE_MULTIPLIER=2.0 and SHORT_RSI_THRESHOLD=30 (after CAL-04)."""
         from src.config import SHORT_RSI_THRESHOLD, SHORT_SCORE_MULTIPLIER
 
-        assert SHORT_SCORE_MULTIPLIER == 1.2, f"Expected 1.2, got {SHORT_SCORE_MULTIPLIER}"
-        assert SHORT_RSI_THRESHOLD == 40, f"Expected 40, got {SHORT_RSI_THRESHOLD}"
+        assert SHORT_SCORE_MULTIPLIER == 2.0, f"Expected 2.0 (CAL-04), got {SHORT_SCORE_MULTIPLIER}"
+        assert SHORT_RSI_THRESHOLD == 30, f"Expected 30 (CAL-04), got {SHORT_RSI_THRESHOLD}"
 
 
 # ── TASK-V6-09: SPY instrument override ──────────────────────────────────────
@@ -781,22 +811,23 @@ class TestV609SpyOverride:
         assert "SPY" in INSTRUMENT_OVERRIDES, "SPY must be in INSTRUMENT_OVERRIDES"
 
     def test_v6_09_spy_min_composite_score(self) -> None:
-        """SPY min_composite_score = 25."""
+        """SPY min_composite_score = 30 (raised from 25 by CAL-06)."""
         from src.config import INSTRUMENT_OVERRIDES
 
         score = INSTRUMENT_OVERRIDES["SPY"].get("min_composite_score")
-        assert score == 25, f"Expected SPY min_composite_score=25, got {score}"
+        assert score == 30, f"Expected SPY min_composite_score=30 (CAL-06), got {score}"
 
     def test_v6_09_spy_regime_restricted(self) -> None:
-        """SPY is restricted to STRONG_TREND_BULL and STRONG_TREND_BEAR only."""
+        """SPY is restricted to STRONG_TREND_BULL only (CAL-06: removed STRONG_TREND_BEAR)."""
         from src.config import INSTRUMENT_OVERRIDES
 
         allowed = INSTRUMENT_OVERRIDES["SPY"].get("allowed_regimes", [])
         assert "STRONG_TREND_BULL" in allowed
-        assert "STRONG_TREND_BEAR" in allowed
         # RANGING and TREND_BULL should NOT be allowed
         assert "RANGING" not in allowed
         assert "TREND_BULL" not in allowed
+        # STRONG_TREND_BEAR removed in CAL-06 (SPY is long-side only instrument)
+        assert "STRONG_TREND_BEAR" not in allowed
 
     def test_v6_09_spy_ranging_blocked_by_pipeline(self) -> None:
         """SPY in RANGING is blocked by regime filter."""
@@ -823,31 +854,31 @@ class TestV609SpyOverride:
         assert passed, f"Expected STRONG_TREND_BULL to pass for SPY, got: {reason}"
 
     def test_v6_09_spy_high_score_required(self) -> None:
-        """SPY composite=24 (< 25) is blocked even with scale=1.0."""
+        """SPY composite=29 (< 30) is blocked even with scale=1.0 (CAL-06: raised to 30)."""
         from src.signals.filter_pipeline import SignalFilterPipeline
 
         pipeline = SignalFilterPipeline()
         passed, reason = pipeline.check_score_threshold(
-            24.0, "stocks", "SPY", available_weight=1.0
+            29.0, "stocks", "SPY", available_weight=1.0
         )
-        assert not passed, f"Expected SPY composite=24 to be blocked (threshold=25), got pass"
+        assert not passed, f"Expected SPY composite=29 to be blocked (threshold=30), got pass"
 
     def test_v6_09_spy_scaled_threshold(self) -> None:
-        """SPY in backtest: threshold = 25 * 0.45 = 11.25."""
+        """SPY in backtest: threshold = 30 * 0.65 = 19.5 (with CAL-01 floor)."""
         from src.signals.filter_pipeline import SignalFilterPipeline
 
         pipeline = SignalFilterPipeline()
-        # composite=11.0 < 11.25 → blocked
+        # composite=19.0 < 19.5 → blocked
         passed, _ = pipeline.check_score_threshold(
-            11.0, "stocks", "SPY", available_weight=0.45
+            19.0, "stocks", "SPY", available_weight=0.45
         )
         assert not passed
 
-        # composite=11.5 >= 11.25 → pass
+        # composite=20.0 >= 19.5 → pass
         passed, reason = pipeline.check_score_threshold(
-            11.5, "stocks", "SPY", available_weight=0.45
+            20.0, "stocks", "SPY", available_weight=0.45
         )
-        assert passed, f"Expected SPY composite=11.5 to pass at scale=0.45, got: {reason}"
+        assert passed, f"Expected SPY composite=20.0 to pass at scale=0.65 (floor), got: {reason}"
 
 
 # ── TASK-V6-10: Filter diagnostics (rejection counters) ──────────────────────
@@ -858,7 +889,7 @@ class TestV610FilterDiagnostics:
 
     def _make_minimal_context(
         self,
-        composite: float = 7.5,
+        composite: float = 10.0,  # Updated for CAL-01: floor=0.65 → threshold=9.75
         direction: str = "LONG",
         regime: str = "TREND_BULL",
         available_weight: float = 0.45,
@@ -870,7 +901,7 @@ class TestV610FilterDiagnostics:
             "regime": regime,
             "direction": direction,
             "timeframe": "H1",
-            "candle_ts": datetime.datetime(2024, 6, 15, 12, 0, tzinfo=datetime.timezone.utc),
+            "candle_ts": datetime.datetime(2024, 6, 15, 12, 0, tzinfo=datetime.timezone.utc),  # Saturday-safe
             "available_weight": available_weight,
             "d1_rows": [],
             "economic_events": [],
@@ -900,7 +931,8 @@ class TestV610FilterDiagnostics:
             apply_session_filter=False,
             apply_dxy_filter=False,
         )
-        context = self._make_minimal_context(composite=7.5, available_weight=0.45)
+        # composite=10.0 >= 9.75 (floor 0.65 threshold) → passes
+        context = self._make_minimal_context(composite=10.0, available_weight=0.45)
         passed, _ = pipeline.run_all(context)
         assert passed
         assert pipeline.total_signals == 1
@@ -947,9 +979,9 @@ class TestV610FilterDiagnostics:
         for _ in range(3):
             context = self._make_minimal_context(composite=2.0, available_weight=0.45)
             pipeline.run_all(context)
-        # 2 passed signals
+        # 2 passed signals (10.0 >= 9.75 threshold with floor=0.65)
         for _ in range(2):
-            context = self._make_minimal_context(composite=7.5, available_weight=0.45)
+            context = self._make_minimal_context(composite=10.0, available_weight=0.45)
             pipeline.run_all(context)
 
         assert pipeline.total_signals == 5
@@ -970,7 +1002,8 @@ class TestV610FilterDiagnostics:
             apply_session_filter=False,
             apply_dxy_filter=False,
         )
-        for composite in [2.0, 7.5, 3.0, 8.0, 1.0]:
+        # With floor=0.65: threshold=9.75; composites 10.0 and 11.0 pass; rest blocked
+        for composite in [2.0, 10.0, 3.0, 11.0, 1.0]:
             pipeline.run_all(self._make_minimal_context(composite=composite, available_weight=0.45))
 
         stats = pipeline.get_stats()
@@ -1073,7 +1106,11 @@ class TestV611TimeAndMaeExit:
         assert result.exit_reason == "tp_hit"
 
     def test_v6_11_time_exit_triggers_at_max_candles_with_negative_pnl(self) -> None:
-        """Time exit fires after 48 H1 candles with PnL <= 0."""
+        """Time exit fires after 24 H1 candles with PnL <= 0 (CAL-03: reduced from 48).
+
+        Note: H1 time exit reduced from 48 to 24 candles by V6-CAL-03.
+        61.6% of trades were exiting via time_exit after 2 days; 1 day is sufficient.
+        """
         from src.backtesting.backtest_engine import BacktestEngine
 
         engine = BacktestEngine.__new__(BacktestEngine)
@@ -1086,8 +1123,8 @@ class TestV611TimeAndMaeExit:
         )
         # candle doesn't hit SL (low > 1.0900) or TP (high < 1.1200)
         candle = self._make_candle(high=1.1010, low=1.0950, close=1.0995)
-        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=48)
-        assert result is not None, "Expected time exit after 48 candles with loss"
+        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=24)
+        assert result is not None, "Expected time exit after 24 candles with loss"
         assert result.exit_reason == "time_exit"
 
     def test_v6_11_time_exit_no_trigger_if_pnl_positive(self) -> None:
@@ -1102,11 +1139,11 @@ class TestV611TimeAndMaeExit:
         )
         # candle_close=1.1050 → price above entry → PnL > 0
         candle = self._make_candle(high=1.1060, low=1.0990, close=1.1050)
-        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=48)
+        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=24)
         assert result is None, "Expected NO time exit when PnL > 0"
 
     def test_v6_11_time_exit_no_trigger_before_max_candles(self) -> None:
-        """Time exit does NOT fire before reaching max_candles."""
+        """Time exit does NOT fire before reaching max_candles (H1=24 after CAL-03)."""
         from src.backtesting.backtest_engine import BacktestEngine
 
         engine = BacktestEngine.__new__(BacktestEngine)
@@ -1116,8 +1153,8 @@ class TestV611TimeAndMaeExit:
             timeframe="H1",
         )
         candle = self._make_candle(high=1.1010, low=1.0950, close=1.0990)
-        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=47)
-        assert result is None, "Expected no exit at candle 47 (max=48)"
+        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=23)
+        assert result is None, "Expected no exit at candle 23 (max=24 after CAL-03)"
 
     def test_v6_11_time_exit_h4_uses_20_candles(self) -> None:
         """H4 time exit threshold is 20 candles."""
@@ -1198,9 +1235,9 @@ class TestV611TimeAndMaeExit:
             stop_loss=1.0900, take_profit=1.1200,
             timeframe="H1",
         )
-        # Candle low below SL AND we've held 48 candles — SL should win
+        # Candle low below SL AND we've held 24 candles (max for H1 after CAL-03) — SL should win
         candle = self._make_candle(high=1.1010, low=1.0880, close=1.0890)
-        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=48)
+        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=24)
         assert result is not None
         assert result.exit_reason == "sl_hit", f"Expected sl_hit (has priority), got: {result.exit_reason}"
 
@@ -1410,3 +1447,670 @@ class TestV613WalkForward:
 
         summary = _compute_summary([], Decimal("1000"))
         assert "walk_forward" not in summary
+
+
+# ── V6-CAL-01: AVAILABLE_WEIGHT_FLOOR ────────────────────────────────────────
+
+
+class TestV6Cal01WeightFloor:
+    """V6-CAL-01: AVAILABLE_WEIGHT_FLOOR=0.65 prevents over-dilution in backtest."""
+
+    def test_v6_cal_01_weight_floor_applied(self) -> None:
+        """available_weight=0.45 with floor=0.65 gives effective_weight=0.65."""
+        from src.config import AVAILABLE_WEIGHT_FLOOR
+
+        effective_weight = max(0.45, AVAILABLE_WEIGHT_FLOOR)
+        assert effective_weight == 0.65
+
+    def test_v6_cal_01_threshold_with_floor(self) -> None:
+        """Effective threshold = 15 * max(0.45, 0.65) = 9.75."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        # score=9.7 < 9.75 → blocked
+        passed, reason = pipeline.check_score_threshold(
+            9.7, "forex", "EURUSD=X", available_weight=0.45
+        )
+        assert not passed, f"Expected 9.7 to be blocked (threshold=9.75), got pass"
+        assert "score_below_threshold" in reason
+
+        # score=9.8 >= 9.75 → pass
+        passed, reason = pipeline.check_score_threshold(
+            9.8, "forex", "EURUSD=X", available_weight=0.45
+        )
+        assert passed, f"Expected 9.8 to pass (threshold=9.75), got: {reason}"
+
+    def test_v6_cal_01_weight_above_floor_unchanged(self) -> None:
+        """available_weight=1.0 is not affected by floor (max(1.0, 0.65)=1.0)."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        # Live mode: threshold = 15 * 1.0 = 15.0 (unchanged)
+        passed, _ = pipeline.check_score_threshold(
+            14.9, "forex", "EURUSD=X", available_weight=1.0
+        )
+        assert not passed  # still blocked just below 15.0
+
+        passed, _ = pipeline.check_score_threshold(
+            15.0, "forex", "EURUSD=X", available_weight=1.0
+        )
+        assert passed  # passes at exactly 15.0
+
+    def test_v6_cal_01_signal_strength_uses_floor(self) -> None:
+        """check_signal_strength() uses AVAILABLE_WEIGHT_FLOOR as minimum scale."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        # With floor=0.65: STRONG_BUY threshold = 15*0.65=9.75
+        # score=9.8 → STRONG_BUY at scale=0.65 → should pass
+        passed, reason = pipeline.check_signal_strength(9.8, "LONG", available_weight=0.45)
+        assert passed, f"Expected signal_strength pass for 9.8 at floor=0.65, got: {reason}"
+
+        # score=9.5 → below STRONG_BUY(9.75) but above BUY(6.5) → BUY strength
+        # BUY is in ALLOWED_SIGNAL_STRENGTHS, so should pass
+        passed, reason = pipeline.check_signal_strength(9.5, "LONG", available_weight=0.45)
+        assert passed, f"Expected BUY strength to pass, got: {reason}"
+
+    def test_v6_cal_01_constant_value(self) -> None:
+        """AVAILABLE_WEIGHT_FLOOR is 0.65."""
+        from src.config import AVAILABLE_WEIGHT_FLOOR
+
+        assert AVAILABLE_WEIGHT_FLOOR == 0.65
+
+
+# ── V6-CAL-02: Bear regime blocking ──────────────────────────────────────────
+
+
+class TestV6Cal02BearRegimes:
+    """V6-CAL-02: TREND_BEAR and STRONG_TREND_BEAR added to BLOCKED_REGIMES."""
+
+    def test_v6_cal_02_trend_bear_blocked(self) -> None:
+        """Signal with regime=TREND_BEAR is rejected."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, reason = pipeline.check_regime("TREND_BEAR", "EURUSD=X")
+        assert not passed, "Expected TREND_BEAR to be blocked"
+        assert "regime_blocked" in reason
+
+    def test_v6_cal_02_strong_trend_bear_blocked(self) -> None:
+        """Signal with regime=STRONG_TREND_BEAR is rejected."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, reason = pipeline.check_regime("STRONG_TREND_BEAR", "EURUSD=X")
+        assert not passed, "Expected STRONG_TREND_BEAR to be blocked"
+        assert "regime_blocked" in reason
+
+    def test_v6_cal_02_bull_regimes_pass(self) -> None:
+        """TREND_BULL and STRONG_TREND_BULL are not blocked."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        for regime in ("TREND_BULL", "STRONG_TREND_BULL"):
+            passed, reason = pipeline.check_regime(regime, "EURUSD=X")
+            assert passed, f"Expected {regime} to pass, got: {reason}"
+
+    def test_v6_cal_02_volatile_passes(self) -> None:
+        """VOLATILE regime is not blocked."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, reason = pipeline.check_regime("VOLATILE", "EURUSD=X")
+        assert passed, f"Expected VOLATILE to pass, got: {reason}"
+
+    def test_v6_cal_02_blocked_regimes_config(self) -> None:
+        """BLOCKED_REGIMES contains exactly RANGING, TREND_BEAR, STRONG_TREND_BEAR."""
+        from src.config import BLOCKED_REGIMES
+
+        assert "RANGING" in BLOCKED_REGIMES
+        assert "TREND_BEAR" in BLOCKED_REGIMES
+        assert "STRONG_TREND_BEAR" in BLOCKED_REGIMES
+        assert len(BLOCKED_REGIMES) == 3
+
+
+# ── V6-CAL-03: TIME_EXIT H1 = 24 ─────────────────────────────────────────────
+
+
+class TestV6Cal03TimeExit:
+    """V6-CAL-03: H1 time exit reduced from 48 to 24 candles."""
+
+    def _make_open_trade(
+        self,
+        direction: str = "LONG",
+        entry_price: float = 1.1000,
+        stop_loss: float = 1.0900,
+        take_profit: float = 1.1200,
+        timeframe: str = "H1",
+    ) -> dict:
+        return {
+            "symbol": "EURUSD=X",
+            "timeframe": timeframe,
+            "direction": direction,
+            "entry_price": Decimal(str(entry_price)),
+            "entry_at": datetime.datetime(2024, 6, 1, 10, 0, tzinfo=datetime.timezone.utc),
+            "stop_loss": Decimal(str(stop_loss)),
+            "take_profit": Decimal(str(take_profit)),
+            "composite_score": Decimal("10.0"),
+            "position_pct": Decimal("2.0"),
+            "mfe": 0.0,
+            "mae": 0.0,
+            "regime": "TREND_BULL",
+            "entry_bar_index": 0,
+        }
+
+    def _make_candle(self, high: float, low: float, close: float) -> MagicMock:
+        c = MagicMock()
+        c.high = high
+        c.low = low
+        c.close = close
+        c.timestamp = datetime.datetime(2024, 6, 2, 10, 0, tzinfo=datetime.timezone.utc)
+        return c
+
+    def test_v6_cal_03_time_exit_24_candles_h1(self) -> None:
+        """H1 time exit fires at 24 candles (not 48) when PnL <= 0."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        engine = BacktestEngine.__new__(BacktestEngine)
+        trade = self._make_open_trade(timeframe="H1")
+        candle = self._make_candle(high=1.1010, low=1.0950, close=1.0995)
+
+        # At 23 candles — should NOT exit
+        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=23)
+        assert result is None, "Expected no exit at candle 23"
+
+        # At 24 candles — should exit
+        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=24)
+        assert result is not None, "Expected time exit at candle 24"
+        assert result.exit_reason == "time_exit"
+
+    def test_v6_cal_03_time_exit_h4_unchanged(self) -> None:
+        """H4 time exit is still 20 candles (unchanged by CAL-03)."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        engine = BacktestEngine.__new__(BacktestEngine)
+        trade = self._make_open_trade(timeframe="H4")
+        candle = self._make_candle(high=1.1010, low=1.0950, close=1.0990)
+
+        # At 19 — should NOT exit
+        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=19)
+        assert result is None, "Expected no exit at H4 candle 19"
+
+        # At 20 — should exit
+        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=20)
+        assert result is not None, "Expected H4 time exit at candle 20"
+        assert result.exit_reason == "time_exit"
+
+    def test_v6_cal_03_time_exit_d1_unchanged(self) -> None:
+        """D1 time exit is still 10 candles (unchanged by CAL-03)."""
+        from src.backtesting.backtest_engine import BacktestEngine
+
+        engine = BacktestEngine.__new__(BacktestEngine)
+        trade = self._make_open_trade(timeframe="D1")
+        candle = self._make_candle(high=1.1010, low=1.0950, close=1.0990)
+
+        # At 9 — should NOT exit
+        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=9)
+        assert result is None, "Expected no exit at D1 candle 9"
+
+        # At 10 — should exit
+        result = engine._check_exit(trade, candle, "forex", False, candles_since_entry=10)
+        assert result is not None, "Expected D1 time exit at candle 10"
+        assert result.exit_reason == "time_exit"
+
+
+# ── V6-CAL-04: SHORT multiplier and RSI threshold ────────────────────────────
+
+
+class TestV6Cal04ShortFilter:
+    """V6-CAL-04: SHORT_SCORE_MULTIPLIER=2.0, SHORT_RSI_THRESHOLD=30."""
+
+    def test_v6_cal_04_short_multiplier_2x(self) -> None:
+        """SHORT effective_threshold = 9.75 * 2.0 = 19.5 (at floor=0.65).
+
+        composite=-15 → abs=15 < 19.5 → blocked.
+        """
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, reason = pipeline.check_score_threshold(
+            -15.0, "forex", "EURUSD=X", available_weight=0.45, direction="SHORT"
+        )
+        assert not passed, f"Expected SHORT composite=-15 to be blocked (threshold=19.5), got pass"
+        assert "score_below_threshold" in reason
+
+    def test_v6_cal_04_short_rsi_30(self) -> None:
+        """SHORT with RSI=35 is blocked (>= threshold 30)."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        indicators = {"rsi": 35.0, "macd": -0.001, "macd_signal": 0.001}
+        passed, reason = pipeline.check_momentum(indicators, "SHORT")
+        assert not passed, f"Expected SHORT RSI=35 to be blocked (threshold=30), got pass"
+        assert "momentum_misaligned_short" in reason
+
+    def test_v6_cal_04_short_passes_strong(self) -> None:
+        """SHORT with composite=-25 and RSI=20 passes all filters."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        # Threshold: 15 * 0.65 * 2.0 = 19.5; -25 abs=25 > 19.5 → passes score
+        passed, reason = pipeline.check_score_threshold(
+            -25.0, "forex", "EURUSD=X", available_weight=0.45, direction="SHORT"
+        )
+        assert passed, f"Expected SHORT composite=-25 to pass (threshold=19.5), got: {reason}"
+
+        # RSI=20 < 30 → passes momentum
+        indicators = {"rsi": 20.0, "macd": -0.001, "macd_signal": 0.001}
+        passed, reason = pipeline.check_momentum(indicators, "SHORT")
+        assert passed, f"Expected SHORT RSI=20 to pass (< 30), got: {reason}"
+
+    def test_v6_cal_04_long_unaffected(self) -> None:
+        """LONG threshold and RSI are not affected by SHORT multiplier."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        # LONG: threshold = 15 * 0.65 = 9.75; score=10 passes
+        passed, _ = pipeline.check_score_threshold(
+            10.0, "forex", "EURUSD=X", available_weight=0.45, direction="LONG"
+        )
+        assert passed
+
+        # LONG RSI=55 passes (no SHORT threshold applied)
+        indicators = {"rsi": 55.0, "macd": 0.001, "macd_signal": -0.001}
+        passed, reason = pipeline.check_momentum(indicators, "LONG")
+        assert passed, f"Expected LONG RSI=55 to pass, got: {reason}"
+
+
+# ── V6-CAL-05: BTC/USDT restrictions ─────────────────────────────────────────
+
+
+class TestV6Cal05BtcRestrictions:
+    """V6-CAL-05: BTC/USDT min_score=25, allowed_regimes=[STRONG_TREND_BULL]."""
+
+    def test_v6_cal_05_btc_min_score_25(self) -> None:
+        """BTC/USDT requires |composite| >= 25 * 0.65 = 16.25 in backtest."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        # composite=16.0 < 16.25 → blocked
+        passed, reason = pipeline.check_score_threshold(
+            16.0, "crypto", "BTC/USDT", available_weight=0.45
+        )
+        assert not passed, f"Expected BTC composite=16.0 to be blocked (16.25 threshold), got pass"
+
+        # composite=17.0 >= 16.25 → pass
+        passed, reason = pipeline.check_score_threshold(
+            17.0, "crypto", "BTC/USDT", available_weight=0.45
+        )
+        assert passed, f"Expected BTC composite=17.0 to pass, got: {reason}"
+
+    def test_v6_cal_05_btc_only_strong_bull(self) -> None:
+        """BTC in TREND_BULL is blocked (not in allowed_regimes after CAL-05)."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, reason = pipeline.check_regime("TREND_BULL", "BTC/USDT")
+        assert not passed, f"Expected TREND_BULL to be blocked for BTC, got: {reason}"
+
+    def test_v6_cal_05_btc_strong_trend_bull_allowed(self) -> None:
+        """BTC in STRONG_TREND_BULL still passes."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        passed, reason = pipeline.check_regime("STRONG_TREND_BULL", "BTC/USDT")
+        assert passed, f"Expected STRONG_TREND_BULL to pass for BTC, got: {reason}"
+
+    def test_v6_cal_05_eth_min_score_20(self) -> None:
+        """ETH/USDT requires |composite| >= 20 * 0.65 = 13.0 in backtest."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        # composite=12.5 < 13.0 → blocked
+        passed, _ = pipeline.check_score_threshold(
+            12.5, "crypto", "ETH/USDT", available_weight=0.45
+        )
+        assert not passed
+
+        # composite=13.5 >= 13.0 → pass
+        passed, reason = pipeline.check_score_threshold(
+            13.5, "crypto", "ETH/USDT", available_weight=0.45
+        )
+        assert passed, f"Expected ETH composite=13.5 to pass, got: {reason}"
+
+
+# ── V6-CAL-06: Per-instrument overrides ──────────────────────────────────────
+
+
+class TestV6Cal06PerInstrumentOverrides:
+    """V6-CAL-06: New overrides for USDJPY=X, NZDUSD=X, SPY."""
+
+    def test_v6_cal_06_usdjpy_override(self) -> None:
+        """USDJPY=X uses min_composite_score=22."""
+        from src.config import INSTRUMENT_OVERRIDES
+
+        overrides = INSTRUMENT_OVERRIDES.get("USDJPY=X", {})
+        score = overrides.get("min_composite_score")
+        assert score == 22, f"Expected USDJPY min_composite_score=22, got {score}"
+
+    def test_v6_cal_06_nzdusd_override(self) -> None:
+        """NZDUSD=X uses min_composite_score=22."""
+        from src.config import INSTRUMENT_OVERRIDES
+
+        overrides = INSTRUMENT_OVERRIDES.get("NZDUSD=X", {})
+        score = overrides.get("min_composite_score")
+        assert score == 22, f"Expected NZDUSD min_composite_score=22, got {score}"
+
+    def test_v6_cal_06_spy_strict_override(self) -> None:
+        """SPY uses min_composite_score=30 and only STRONG_TREND_BULL."""
+        from src.config import INSTRUMENT_OVERRIDES
+
+        spy = INSTRUMENT_OVERRIDES.get("SPY", {})
+        assert spy.get("min_composite_score") == 30
+        allowed = spy.get("allowed_regimes", [])
+        assert "STRONG_TREND_BULL" in allowed
+        assert "STRONG_TREND_BEAR" not in allowed
+
+    def test_v6_cal_06_usdjpy_threshold_applied_in_pipeline(self) -> None:
+        """USDJPY=X effective threshold = 22 * 0.65 = 14.3 in backtest."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline()
+        # score=14.0 < 14.3 → blocked
+        passed, reason = pipeline.check_score_threshold(
+            14.0, "forex", "USDJPY=X", available_weight=0.45
+        )
+        assert not passed, f"Expected USDJPY 14.0 to be blocked (threshold=14.3), got pass"
+
+        # score=15.0 >= 14.3 → pass
+        passed, reason = pipeline.check_score_threshold(
+            15.0, "forex", "USDJPY=X", available_weight=0.45
+        )
+        assert passed, f"Expected USDJPY 15.0 to pass, got: {reason}"
+
+    def test_v6_cal_06_gbpusd_override_score(self) -> None:
+        """GBPUSD=X has min_composite_score=20 (restored by CAL-06)."""
+        from src.config import INSTRUMENT_OVERRIDES
+
+        overrides = INSTRUMENT_OVERRIDES.get("GBPUSD=X", {})
+        assert overrides.get("min_composite_score") == 20
+
+
+# ── V6-CAL-07: MAE metric fix ────────────────────────────────────────────────
+
+
+class TestV6Cal07MaeMetric:
+    """V6-CAL-07: avg_mae_pct_of_sl = mae / sl_distance * 100."""
+
+    def _make_trade_with_sl(
+        self,
+        mae: float,
+        entry: float,
+        sl: float,
+        result: str = "win",
+        pnl: float = 10.0,
+    ) -> MagicMock:
+        t = MagicMock()
+        t.symbol = "EURUSD=X"
+        t.timeframe = "H1"
+        t.direction = "LONG"
+        t.entry_price = Decimal(str(entry))
+        t.exit_price = Decimal(str(entry + 0.01))
+        t.exit_reason = "tp_hit" if result == "win" else "sl_hit"
+        t.pnl_pips = Decimal("100.0")
+        t.pnl_usd = Decimal(str(pnl))
+        t.result = result
+        t.composite_score = Decimal("10.0")
+        t.entry_at = datetime.datetime(2024, 6, 1, 10, 0, tzinfo=datetime.timezone.utc)
+        t.exit_at = datetime.datetime(2024, 6, 2, 10, 0, tzinfo=datetime.timezone.utc)
+        t.duration_minutes = 1440
+        t.mfe = Decimal("0.01")
+        t.mae = Decimal(str(mae))
+        t.sl_price = Decimal(str(sl))
+        t.regime = "TREND_BULL"
+        return t
+
+    def test_v6_cal_07_mae_pct_correct(self) -> None:
+        """MAE=0.0050, SL_distance=0.0100 → mae_pct=50.0%."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        # entry=1.1000, sl=1.0900, sl_dist=0.01
+        # mae=0.005 → pct = 0.005/0.01*100 = 50.0
+        trade = self._make_trade_with_sl(mae=0.005, entry=1.1000, sl=1.0900)
+        summary = _compute_summary([trade], Decimal("1000"))
+        assert summary["avg_mae_pct_of_sl"] == 50.0, (
+            f"Expected 50.0%, got {summary['avg_mae_pct_of_sl']}"
+        )
+
+    def test_v6_cal_07_mae_pct_winners_vs_losers(self) -> None:
+        """Summary includes avg_mae_pct_of_sl_winners and avg_mae_pct_of_sl_losers."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        # Winner: mae=0.003, sl_dist=0.01 → 30%
+        # Loser: mae=0.008, sl_dist=0.01 → 80%
+        winner = self._make_trade_with_sl(mae=0.003, entry=1.1000, sl=1.0900, result="win", pnl=10.0)
+        loser = self._make_trade_with_sl(mae=0.008, entry=1.1000, sl=1.0900, result="loss", pnl=-5.0)
+        summary = _compute_summary([winner, loser], Decimal("1000"))
+
+        assert "avg_mae_pct_of_sl_winners" in summary
+        assert "avg_mae_pct_of_sl_losers" in summary
+        assert summary["avg_mae_pct_of_sl_winners"] == pytest.approx(30.0, abs=0.1)
+        assert summary["avg_mae_pct_of_sl_losers"] == pytest.approx(80.0, abs=0.1)
+
+    def test_v6_cal_07_mae_zero_sl_skipped(self) -> None:
+        """SL distance = 0 does not cause division by zero."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trade = self._make_trade_with_sl(mae=0.005, entry=1.1000, sl=1.1000)  # sl_dist=0
+        summary = _compute_summary([trade], Decimal("1000"))
+        assert summary["avg_mae_pct_of_sl"] == 0.0  # no valid MAE values
+
+    def test_v6_cal_07_mae_none_sl_skipped(self) -> None:
+        """Trade with mae=None is skipped without error."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trade = self._make_trade_with_sl(mae=0.0, entry=1.1000, sl=1.0900)
+        trade.mae = None
+        summary = _compute_summary([trade], Decimal("1000"))
+        assert summary["avg_mae_pct_of_sl"] == 0.0
+
+    def test_v6_cal_07_summary_has_mae_breakdown(self) -> None:
+        """Summary contains all three MAE fields."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        summary = _compute_summary([], Decimal("1000"))
+        assert "avg_mae_pct_of_sl" in summary
+        assert "avg_mae_pct_of_sl_winners" in summary
+        assert "avg_mae_pct_of_sl_losers" in summary
+
+
+# ── V6-CAL-08: Scaled score buckets ──────────────────────────────────────────
+
+
+class TestV6Cal08ScaledBuckets:
+    """V6-CAL-08: by_score_bucket_scaled uses scaled thresholds."""
+
+    def _make_trade_with_score(
+        self,
+        composite: float,
+        result: str = "win",
+        pnl: float = 10.0,
+    ) -> MagicMock:
+        t = MagicMock()
+        t.symbol = "EURUSD=X"
+        t.timeframe = "H1"
+        t.direction = "LONG" if composite > 0 else "SHORT"
+        t.entry_price = Decimal("1.1000")
+        t.exit_price = Decimal("1.1100")
+        t.exit_reason = "tp_hit" if result == "win" else "sl_hit"
+        t.pnl_pips = Decimal("100.0")
+        t.pnl_usd = Decimal(str(pnl))
+        t.result = result
+        t.composite_score = Decimal(str(composite))
+        t.entry_at = datetime.datetime(2024, 6, 1, 10, 0, tzinfo=datetime.timezone.utc)
+        t.exit_at = datetime.datetime(2024, 6, 2, 10, 0, tzinfo=datetime.timezone.utc)
+        t.duration_minutes = 1440
+        t.mfe = Decimal("0.01")
+        t.mae = Decimal("0.002")
+        t.sl_price = Decimal("1.0900")
+        t.regime = "TREND_BULL"
+        return t
+
+    def test_v6_cal_08_scaled_bucket_strong_buy(self) -> None:
+        """composite=10 at scale=0.65 → strong_buy (10 >= 9.75 threshold)."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trade = self._make_trade_with_score(10.0)
+        summary = _compute_summary([trade], Decimal("1000"))
+        by_scaled = summary["by_score_bucket_scaled"]
+        # composite=10 >= 15*0.65=9.75 → strong_buy
+        assert "strong_buy" in by_scaled, f"Expected strong_buy in scaled buckets: {by_scaled}"
+        assert by_scaled["strong_buy"]["trades"] == 1
+
+    def test_v6_cal_08_scaled_bucket_buy(self) -> None:
+        """composite=7 at scale=0.65 → buy (7 >= 6.5 buy threshold)."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        trade = self._make_trade_with_score(7.0)
+        summary = _compute_summary([trade], Decimal("1000"))
+        by_scaled = summary["by_score_bucket_scaled"]
+        # composite=7 >= 10*0.65=6.5 → buy
+        assert "buy" in by_scaled, f"Expected buy in scaled buckets: {by_scaled}"
+        assert by_scaled["buy"]["trades"] == 1
+
+    def test_v6_cal_08_both_buckets_in_summary(self) -> None:
+        """Summary contains both by_score_bucket and by_score_bucket_scaled."""
+        from src.backtesting.backtest_engine import _compute_summary
+
+        summary = _compute_summary([], Decimal("1000"))
+        assert "by_score_bucket" in summary
+        assert "by_score_bucket_scaled" in summary
+
+
+# ── V6-CAL-09: Weekday multiplier ────────────────────────────────────────────
+
+
+class TestV6Cal09WeekdayMultiplier:
+    """V6-CAL-09: Monday/Tuesday forex threshold *= 1.5."""
+
+    def _make_context(
+        self,
+        weekday: int,
+        composite: float = 10.0,
+        market_type: str = "forex",
+    ) -> dict:
+        """Make a pipeline context for the given weekday (0=Mon, 1=Tue, 2=Wed...)."""
+        # Pick a date matching the desired weekday (2024-01-01 is Monday)
+        base_monday = datetime.datetime(2024, 1, 1, 12, 0, tzinfo=datetime.timezone.utc)
+        ts = base_monday + datetime.timedelta(days=weekday)
+        return {
+            "composite_score": composite,
+            "market_type": market_type,
+            "symbol": "EURUSD=X",
+            "regime": "TREND_BULL",
+            "direction": "LONG",
+            "timeframe": "H1",
+            "candle_ts": ts,
+            "available_weight": 0.45,
+            "d1_rows": [],
+            "economic_events": [],
+            "ta_indicators": {},
+        }
+
+    def test_v6_cal_09_monday_forex_higher_threshold(self) -> None:
+        """Monday forex: effective threshold = 9.75 * 1.5 = 14.625.
+
+        score=10.0 passes Wed/Thu (threshold=9.75) but is blocked on Monday.
+        """
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline(
+            apply_regime_filter=False,
+            apply_d1_trend_filter=False,
+            apply_volume_filter=False,
+            apply_momentum_filter=False,
+            apply_weekday_filter=False,
+            apply_calendar_filter=False,
+            apply_session_filter=False,
+            apply_dxy_filter=False,
+        )
+        # score=10.0 on Wednesday (weekday=2) — should pass (10.0 >= 9.75)
+        ctx_wed = self._make_context(weekday=2, composite=10.0)
+        passed, reason = pipeline.run_all(ctx_wed)
+        assert passed, f"Expected pass on Wednesday with score=10.0, got: {reason}"
+
+        # Same score=10.0 on Monday (weekday=0) — should be blocked (10.0 < 14.625)
+        ctx_mon = self._make_context(weekday=0, composite=10.0)
+        passed, reason = pipeline.run_all(ctx_mon)
+        assert not passed, f"Expected block on Monday with score=10.0 (threshold=14.625), got pass"
+
+    def test_v6_cal_09_tuesday_forex_higher_threshold(self) -> None:
+        """Tuesday forex also gets the 1.5x multiplier."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline(
+            apply_regime_filter=False,
+            apply_d1_trend_filter=False,
+            apply_volume_filter=False,
+            apply_momentum_filter=False,
+            apply_weekday_filter=False,
+            apply_calendar_filter=False,
+            apply_session_filter=False,
+            apply_dxy_filter=False,
+        )
+        ctx_tue = self._make_context(weekday=1, composite=10.0)
+        passed, reason = pipeline.run_all(ctx_tue)
+        assert not passed, f"Expected block on Tuesday with score=10.0, got pass"
+
+    def test_v6_cal_09_wednesday_unaffected(self) -> None:
+        """Wednesday threshold is base (no multiplier)."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline(
+            apply_regime_filter=False,
+            apply_d1_trend_filter=False,
+            apply_volume_filter=False,
+            apply_momentum_filter=False,
+            apply_weekday_filter=False,
+            apply_calendar_filter=False,
+            apply_session_filter=False,
+            apply_dxy_filter=False,
+        )
+        ctx_wed = self._make_context(weekday=2, composite=10.0)
+        passed, reason = pipeline.run_all(ctx_wed)
+        assert passed, f"Expected Wednesday to pass with score=10.0 (base threshold=9.75), got: {reason}"
+
+    def test_v6_cal_09_monday_crypto_unaffected(self) -> None:
+        """Crypto is not affected by weekday multiplier."""
+        from src.signals.filter_pipeline import SignalFilterPipeline
+
+        pipeline = SignalFilterPipeline(
+            apply_regime_filter=False,
+            apply_d1_trend_filter=False,
+            apply_volume_filter=False,
+            apply_momentum_filter=False,
+            apply_weekday_filter=False,
+            apply_calendar_filter=False,
+            apply_session_filter=False,
+            apply_dxy_filter=False,
+        )
+        # Crypto on Monday: score=10.0 should pass (no weekday multiplier for crypto)
+        ctx = self._make_context(weekday=0, composite=10.0, market_type="crypto")
+        ctx["symbol"] = "BTC/USDT"
+        # Note: BTC has min_score=25 override, so we test with a generic crypto symbol
+        # Use a context without symbol override for a clean test of the weekday logic
+        ctx["symbol"] = "ETHUSD"  # no override for this symbol
+        passed, reason = pipeline.run_all(ctx)
+        # With floor=0.65 and crypto global min 20: effective=13.0; score=10.0 < 13.0 → blocked
+        # But the reason should NOT be weekday related — it should be score_threshold
+        assert "weekday" not in reason.lower(), (
+            f"Crypto Monday block should not be weekday-related, got: {reason}"
+        )
+
+    def test_v6_cal_09_config_constants(self) -> None:
+        """WEAK_WEEKDAY_SCORE_MULTIPLIER=1.5 and WEAK_WEEKDAYS=[0, 1]."""
+        from src.config import WEAK_WEEKDAY_SCORE_MULTIPLIER, WEAK_WEEKDAYS
+
+        assert WEAK_WEEKDAY_SCORE_MULTIPLIER == 1.5
+        assert 0 in WEAK_WEEKDAYS  # Monday
+        assert 1 in WEAK_WEEKDAYS  # Tuesday

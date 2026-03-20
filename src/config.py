@@ -146,40 +146,50 @@ settings = Settings()
 MIN_COMPOSITE_SCORE: int = 15          # global threshold (raised from 10)
 MIN_COMPOSITE_SCORE_CRYPTO: int = 20   # for market == "crypto"
 
-BLOCKED_REGIMES: list = ["RANGING"]
+# V6-CAL: TREND_BEAR и STRONG_TREND_BEAR добавлены —
+# 219 trades при 11% WR, -$922 PnL в v6 backtest.
+BLOCKED_REGIMES: list = ["RANGING", "TREND_BEAR", "STRONG_TREND_BEAR"]
 
 INSTRUMENT_OVERRIDES: dict = {
+    # V6-CAL-05: Ужесточение — 102 trades, 9.8% WR, -$135 при relaxed settings.
+    # min_score 25 (строже v5), только STRONG_TREND_BULL (bear заблокированы глобально).
     "BTC/USDT": {
         "sl_atr_multiplier": 3.5,
-        "min_composite_score": 15,  # v6: lowered from 20 (TASK-V6-03)
-        "allowed_regimes": [
-            "STRONG_TREND_BULL", "STRONG_TREND_BEAR",
-            "TREND_BULL", "TREND_BEAR",  # v6: expanded (TASK-V6-03)
-        ],
+        "min_composite_score": 25,
+        "allowed_regimes": ["STRONG_TREND_BULL"],
     },
+    # V6-CAL-05: ETH/USDT — восстановить min_score 20 (как в v5).
     "ETH/USDT": {
         "sl_atr_multiplier": 3.5,
-        "min_composite_score": 15,  # v6: lowered from 20 (TASK-V6-03)
+        "min_composite_score": 20,
     },
+    # V6-CAL-06: Восстановить GBPUSD override — -$43 при global threshold.
     "GBPUSD=X": {
-        # v6: TASK-V6-04 — override removed; global threshold 15 * 0.45 = 6.75 is sufficient
+        "min_composite_score": 20,
     },
     "USDCHF=X": {
         "min_composite_score": 18,
     },
-    # V6 TASK-V6-09: SPY is consistently unprofitable (16.7% WR, -$114); apply strict
-    # regime + score gating. If still losing after tuning, exclude from default symbols.
+    # V6-CAL-06: Новые overrides для убыточных инструментов.
+    # USDJPY: -$75 при global threshold, 12.9% WR.
+    "USDJPY=X": {
+        "min_composite_score": 22,
+    },
+    # NZDUSD: -$140, 16.7% WR, worst avg loss.
+    "NZDUSD=X": {
+        "min_composite_score": 22,
+    },
+    # V6-CAL-06 + V6-CAL-05: SPY ужесточено до 30, только STRONG_TREND_BULL.
     "SPY": {
-        "min_composite_score": 25,
-        "allowed_regimes": ["STRONG_TREND_BULL", "STRONG_TREND_BEAR"],
+        "min_composite_score": 30,
+        "allowed_regimes": ["STRONG_TREND_BULL"],
     },
 }
 
-# ── v6: SHORT signal quality (TASK-V6-08) ────────────────────────────────────
-# SHORT signals require stricter threshold (×1.2) and stronger momentum (RSI < 40).
-# Rationale: SHORT WR 36.84%, PnL -$72.18 — asymmetric penalty vs LONG.
-SHORT_SCORE_MULTIPLIER: float = 1.2   # SHORT effective_threshold *= 1.2
-SHORT_RSI_THRESHOLD: int = 40         # SHORT: RSI must be < 40 (not just < 50)
+# ── v6: SHORT signal quality (TASK-V6-08, V6-CAL-04) ─────────────────────────
+# V6-CAL-04: SHORT WR 12.04%, "sell" bucket -$1,202. Требуем 2x conviction и RSI < 30.
+SHORT_SCORE_MULTIPLIER: float = 2.0   # SHORT effective_threshold *= 2.0
+SHORT_RSI_THRESHOLD: int = 30         # SHORT: RSI must be < 30 (deeply oversold)
 
 # ── v6: Score component weights (TASK-V6-02) ─────────────────────────────────
 # Used for proportional threshold scaling.
@@ -191,3 +201,13 @@ SCORE_COMPONENT_WEIGHTS: dict = {
     "sentiment": 0.20,
     "geo": 0.10,
 }
+
+# V6-CAL-01: Floor для available_weight — предотвращает чрезмерное снижение
+# порога в backtest (только TA). Без floor: 15*0.45=6.75 (слишком низко).
+# С floor 0.65: effective = 15*0.65 = 9.75.
+AVAILABLE_WEIGHT_FLOOR: float = 0.65
+
+# V6-CAL-09: Monday и Tuesday score penalty для forex.
+# Mon: -$373, Tue: -$365 в v6 backtest. Требуем 1.5x conviction.
+WEAK_WEEKDAY_SCORE_MULTIPLIER: float = 1.5
+WEAK_WEEKDAYS: list = [0, 1]  # 0=Monday, 1=Tuesday
