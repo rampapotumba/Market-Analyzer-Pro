@@ -6,10 +6,11 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-# Maps forex pair symbol → (base_bank, quote_bank).
-# base_bank rate minus quote_bank rate gives the interest rate differential.
-# Positive differential → base currency has higher rates → bearish for pair
-# (e.g. FED > ECB means USD stronger than EUR → EURUSD bearish).
+# Maps forex pair symbol → (usd_bank, foreign_bank).
+# For all major pairs, FED is always one side. The tuple order is always
+# (FED, foreign_bank) so that `differential = FED_rate - foreign_rate`.
+# Sign correction for USD-as-quote pairs (EURUSD, GBPUSD, etc.) is applied
+# in _analyze_rate_differential() via the _usd_as_quote set.
 _PAIR_BANK_MAP: dict[str, tuple[str, str]] = {
     "EURUSD=X": ("FED", "ECB"),
     "GBPUSD=X": ("FED", "BOE"),

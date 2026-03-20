@@ -55,7 +55,7 @@ _COUNTRY_PRIMARY_QUERY: dict[str, str] = {
     ),
     "EU": (
         "theme:EUROZONE OR theme:ECON_INFLATION OR theme:POLITICAL_TURMOIL "
-        "domain:ecb.europa.eu OR sourcecountry:EI OR sourcecountry:GM lang:English"
+        "OR domain:ecb.europa.eu OR sourcecountry:EI OR sourcecountry:GM lang:English"
     ),
     "UK": (
         "theme:POLITICAL_TURMOIL OR theme:ECON_INFLATION OR theme:ECON_BREXIT "

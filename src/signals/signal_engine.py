@@ -688,7 +688,7 @@ class SignalEngine:
                 from src.database.crud import get_latest_funding_rate
                 latest_fr = await get_latest_funding_rate(db, instrument.id)
                 if latest_fr is not None:
-                    fr_raw = latest_fr.funding_rate if hasattr(latest_fr, "funding_rate") else latest_fr
+                    fr_raw = latest_fr  # get_latest_funding_rate returns Optional[Decimal]
                     fr_value = float(fr_raw)
                     fr_adj = _get_funding_rate_adjustment(fr_value, direction, market_type)
                     if fr_adj != 0:

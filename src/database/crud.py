@@ -1076,15 +1076,11 @@ async def get_latest_social_sentiment(
 ) -> Optional[SocialSentiment]:
     """Return the most recent social_sentiment row for this instrument.
 
-    Queries rows with source='combined' (written by SocialCollector) ordered
-    by timestamp DESC, limit 1.  Returns None if no row exists.
+    Ordered by timestamp DESC, limit 1.  Returns None if no row exists.
     """
     result = await session.execute(
         select(SocialSentiment)
-        .where(
-            SocialSentiment.instrument_id == instrument_id,
-            SocialSentiment.source == "combined",
-        )
+        .where(SocialSentiment.instrument_id == instrument_id)
         .order_by(SocialSentiment.timestamp.desc())
         .limit(1)
     )

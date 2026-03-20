@@ -238,8 +238,8 @@ class CentralBankRate(Base):
     bank: Mapped[str] = mapped_column(String(16), nullable=False)   # FED/ECB/BOJ/BOE/RBA/BOC/SNB/RBNZ
     currency: Mapped[str] = mapped_column(String(8), nullable=False)  # USD/EUR/JPY/…
     rate: Mapped[Decimal] = mapped_column(Numeric(8, 4), nullable=False)  # % e.g. 5.25
-    effective_date: Mapped[datetime.date] = mapped_column(DateTime(timezone=True), nullable=False)
-    next_meeting_date: Mapped[Optional[datetime.date]] = mapped_column(DateTime(timezone=True))
+    effective_date: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    next_meeting_date: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True))
     bias: Mapped[Optional[str]] = mapped_column(String(16))  # hawkish/neutral/dovish
     source: Mapped[Optional[str]] = mapped_column(String(64))
     collected_at: Mapped[datetime.datetime] = mapped_column(
